@@ -55,6 +55,12 @@ class GridWorld:
             device=device, dtype=torch.long
         )
 
+        # Direction deltas tensor [4, 2] for attacks/give (cached for reuse)
+        self.dir_deltas_4 = torch.tensor(
+            [[-1, 0], [1, 0], [0, -1], [0, 1]],
+            device=device, dtype=torch.long
+        )
+
         # State tensors (initialized in reset)
         self.agent_positions: torch.Tensor = None  # [n_agents, 2] (row, col)
         self.agent_hp: torch.Tensor = None         # [n_agents]
@@ -67,13 +73,20 @@ class GridWorld:
         self.step_count = 0
 
     def _update_occupancy(self) -> None:
-        """Update occupancy grid from agent positions. O(n) but simple."""
+        """Update occupancy grid from agent positions - FULLY VECTORIZED."""
         self.occupancy.fill_(-1)
         alive_mask = self.agent_alive
+
+        if not alive_mask.any():
+            return
+
         alive_indices = torch.where(alive_mask)[0]
-        for idx in alive_indices:
-            r, c = self.agent_positions[idx]
-            self.occupancy[r, c] = idx
+        alive_positions = self.agent_positions[alive_indices]
+        rows = alive_positions[:, 0]
+        cols = alive_positions[:, 1]
+
+        # Advanced indexing: write all at once
+        self.occupancy[rows, cols] = alive_indices
 
     def reset(self) -> Dict[str, torch.Tensor]:
         """Reset environment and return initial observations for all agents."""
@@ -121,6 +134,8 @@ class GridWorld:
         """
         Execute one environment step with tensor inputs.
 
+        Reward = HP_delta (HP_after - HP_before) + death_penalty
+
         Args:
             move_actions: [n_agents] int tensor of movement actions
             interact_actions: [n_agents] int tensor of interaction actions
@@ -129,7 +144,9 @@ class GridWorld:
             observations, rewards, dones, infos
         """
         self.step_count += 1
-        rewards = torch.zeros(self.n_agents, device=self.device)
+
+        # === HP-BASED REWARD: Track HP at start ===
+        hp_before = self.agent_hp.clone()
 
         # Clear signals from last step
         self.signals.zero_()
@@ -142,24 +159,21 @@ class GridWorld:
         self._apply_hp_decay()
 
         # 3. Process interactions (attack, give food, signal)
-        interaction_rewards = self._resolve_interactions(interact_actions)
-        rewards += interaction_rewards
+        self._resolve_interactions(interact_actions)
 
         # 4. Process food eating (agents on food cells)
-        # Pass interact_actions so rich food requires COOPERATE action
-        food_rewards = self._process_food_eating(interact_actions)
-        rewards += food_rewards
-
-        # 5. Survival reward for staying alive
-        rewards += self.config.r_survival * self.agent_alive.float()
+        self._process_food_eating(interact_actions)
 
         # 5. Spawn new food
         self._spawn_food()
 
-        # 6. Check deaths (HP <= 0) and apply death penalty
+        # 6. Check deaths (HP <= 0)
         death_rewards = self._check_deaths()
-        rewards += death_rewards
         self._update_occupancy()
+
+        # === HP-BASED REWARD: Compute delta + death penalty ===
+        hp_after = self.agent_hp.clone()
+        rewards = (hp_after - hp_before) + death_rewards
 
         # Build outputs
         observations = self._get_all_observations()
@@ -195,222 +209,263 @@ class GridWorld:
         return adjacent
 
     def _resolve_movement(self, move_actions: torch.Tensor) -> None:
-        """Apply Heavyweight Rule for movement resolution - vectorized."""
+        """
+        Fully vectorized movement resolution using the Heavyweight Rule.
+        No loops, no .item() calls.
+        """
+        n = self.n_agents
+        gs = self.grid_size
+
         # Only process alive agents
         alive_mask = self.agent_alive
 
         # Compute intended destinations for all agents
         intended = self.agent_positions + self.direction_deltas[move_actions]
-        intended = intended.clamp(0, self.grid_size - 1)
+        intended = intended.clamp(0, gs - 1)
 
         # Dead agents stay in place
         intended = torch.where(alive_mask.unsqueeze(1), intended, self.agent_positions)
 
         # Convert to flat indices for conflict detection
-        flat_intended = intended[:, 0] * self.grid_size + intended[:, 1]
-        flat_current = self.agent_positions[:, 0] * self.grid_size + self.agent_positions[:, 1]
+        flat_intended = intended[:, 0] * gs + intended[:, 1]
+        flat_current = self.agent_positions[:, 0] * gs + self.agent_positions[:, 1]
 
-        # Find unique destinations and count agents wanting each
-        unique_dests, inverse_indices = torch.unique(flat_intended, return_inverse=True)
+        # Identify staying vs moving agents
+        is_staying = (flat_intended == flat_current)
 
-        # For each unique destination, find all agents wanting it
-        new_positions = self.agent_positions.clone()
+        # Get occupant at each agent's intended destination
+        dest_rows = intended[:, 0]
+        dest_cols = intended[:, 1]
+        occupant_at_dest = self.occupancy[dest_rows, dest_cols]  # [n_agents]
 
-        for dest_idx, dest in enumerate(unique_dests):
-            # Agents wanting this destination
-            wanting = (inverse_indices == dest_idx) & alive_mask
+        # Check if occupant exists and is staying
+        has_occupant = occupant_at_dest >= 0
+        safe_occupant_idx = occupant_at_dest.clamp(min=0)
+        occupant_is_staying = is_staying[safe_occupant_idx] & has_occupant
 
-            if wanting.sum() == 0:
-                continue
+        # Agent cannot block itself
+        agent_ids = torch.arange(n, device=self.device)
+        is_self_occupant = (occupant_at_dest == agent_ids)
 
-            wanting_indices = torch.where(wanting)[0]
+        # Blocked = has occupant AND occupant is staying AND it's not self
+        blocked_by_stationary = has_occupant & occupant_is_staying & ~is_self_occupant
 
-            # Check if destination is occupied by stationary agent not in wanting group
-            dest_row = dest // self.grid_size
-            dest_col = dest % self.grid_size
-            occupant = self.occupancy[dest_row, dest_col].item()
+        # Valid contender = alive AND not blocked
+        valid_contender = alive_mask & ~blocked_by_stationary
 
-            if occupant >= 0 and not wanting[occupant]:
-                # Blocked by stationary agent - no one moves
-                continue
+        # Add random noise for tiebreaking (small relative to HP)
+        tiebreaker = torch.rand(n, device=self.device) * 0.001
+        hp_with_tiebreak = self.agent_hp + tiebreaker
 
-            if len(wanting_indices) == 1:
-                # Uncontested - agent moves
-                new_positions[wanting_indices[0]] = torch.tensor(
-                    [dest_row, dest_col], device=self.device
-                )
-            else:
-                # Contested - highest HP wins
-                hps = self.agent_hp[wanting_indices]
-                max_hp = hps.max()
-                winners = wanting_indices[hps == max_hp]
+        # Set HP to -inf for non-contenders so they can't win
+        hp_contest = torch.where(
+            valid_contender,
+            hp_with_tiebreak,
+            torch.full((n,), float('-inf'), device=self.device)
+        )
 
-                # Random tiebreaker
-                winner_idx = torch.randint(len(winners), (1,), device=self.device)
-                winner = winners[winner_idx]
-                new_positions[winner] = torch.tensor(
-                    [dest_row, dest_col], device=self.device
-                )
+        # Find max HP per destination using scatter_reduce
+        max_hp_per_dest = torch.full((gs * gs,), float('-inf'), device=self.device)
+        max_hp_per_dest.scatter_reduce_(
+            0, flat_intended, hp_contest, reduce='amax', include_self=True
+        )
 
-        self.agent_positions = new_positions
+        # An agent wins if their hp_contest equals max at their destination
+        max_hp_at_my_dest = max_hp_per_dest[flat_intended]
+        is_winner = valid_contender & (hp_contest == max_hp_at_my_dest)
 
-    def _resolve_interactions(self, interact_actions: torch.Tensor) -> torch.Tensor:
+        # Apply movement: winners move, others stay
+        self.agent_positions = torch.where(
+            is_winner.unsqueeze(1),
+            intended,
+            self.agent_positions
+        )
+
+    def _resolve_interactions(self, interact_actions: torch.Tensor) -> None:
         """Process attack, give food, and signal actions with direction targeting."""
-        rewards = torch.zeros(self.n_agents, device=self.device)
-
         # Signal actions (action 8)
         signal_mask = (interact_actions == INTERACT_SIGNAL) & self.agent_alive
         self.signals = signal_mask
 
         # Attack actions (0-3: UP, DOWN, LEFT, RIGHT)
         attack_mask = (interact_actions <= ATTACK_RIGHT) & self.agent_alive
-        attack_rewards = self._resolve_attacks(interact_actions, attack_mask)
-        rewards += attack_rewards
+        self._resolve_attacks(interact_actions, attack_mask)
 
         # Give food actions (4-7: UP, DOWN, LEFT, RIGHT)
         give_mask = ((interact_actions >= GIVE_UP) & (interact_actions <= GIVE_RIGHT)) & self.agent_alive
-        give_rewards = self._resolve_give_food(interact_actions, give_mask)
-        rewards += give_rewards
+        self._resolve_give_food(interact_actions, give_mask)
 
-        return rewards
-
-    def _resolve_attacks(self, interact_actions: torch.Tensor, attack_mask: torch.Tensor) -> torch.Tensor:
+    def _resolve_attacks(self, interact_actions: torch.Tensor, attack_mask: torch.Tensor) -> None:
         """
-        Resolve attacks with direction targeting and defense tracking.
+        Resolve attacks with direction targeting and defense tracking - FULLY VECTORIZED.
 
         Each attacker targets ONE cell in their chosen direction.
         Defense: if C attacks A who is attacking B, C defended B.
         Attack costs 5% of max HP regardless of whether it hits.
         """
-        rewards = torch.zeros(self.n_agents, device=self.device)
-        damage_matrix = torch.zeros((self.n_agents, self.n_agents), device=self.device)
+        # Early exit if no attackers
+        if not attack_mask.any():
+            return
 
-        # Track who is attacking whom for defense calculation
-        # attack_target[attacker_id] = target_id or -1 if no target
-        attack_target = torch.full((self.n_agents,), -1, device=self.device, dtype=torch.long)
-
-        # Attack cost: 5% of max HP
+        # === STEP 1: Apply attack cost to ALL attackers at once ===
         attack_cost = self.config.max_hp * 0.05
+        self.agent_hp = self.agent_hp - attack_cost * attack_mask.float()
 
-        for attacker in torch.where(attack_mask)[0]:
-            # Attacker pays 5% HP cost regardless of hit/miss
-            self.agent_hp[attacker] -= attack_cost
+        # === STEP 2: Compute target positions for ALL agents ===
+        attack_dirs = interact_actions.clamp(0, 3)
+        deltas = self.dir_deltas_4[attack_dirs]  # [n_agents, 2]
+        target_positions = self.agent_positions + deltas
+        target_rows = target_positions[:, 0]
+        target_cols = target_positions[:, 1]
 
-            # Get direction from action (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT)
-            direction = interact_actions[attacker].item()
-            delta_row, delta_col = INTERACT_DIR_DELTAS[direction]
+        # === STEP 4: Check bounds ===
+        in_bounds = (
+            (target_rows >= 0) & (target_rows < self.grid_size) &
+            (target_cols >= 0) & (target_cols < self.grid_size)
+        )
+        valid_attack = attack_mask & in_bounds
 
-            # Compute target position
-            attacker_pos = self.agent_positions[attacker]
-            target_row = attacker_pos[0] + delta_row
-            target_col = attacker_pos[1] + delta_col
+        # Clamp for safe indexing
+        safe_rows = target_rows.clamp(0, self.grid_size - 1)
+        safe_cols = target_cols.clamp(0, self.grid_size - 1)
 
-            # Check bounds
-            if target_row < 0 or target_row >= self.grid_size:
-                continue
-            if target_col < 0 or target_col >= self.grid_size:
-                continue
+        # === STEP 5: Look up targets from occupancy grid ===
+        target_ids = self.occupancy[safe_rows, safe_cols]  # [n_agents]
 
-            # Check if there's an agent at target position
-            target_id = self.occupancy[target_row, target_col].item()
-            if target_id == -1 or not self.agent_alive[target_id]:
-                continue
+        # Valid hit: in bounds, attacking, target exists, target alive
+        has_target = target_ids >= 0
+        valid_target_ids = target_ids.clamp(min=0)
+        target_alive = self.agent_alive[valid_target_ids] & has_target
+        valid_hit = valid_attack & has_target & target_alive
 
-            # Calculate and apply damage
-            damage = self.agent_hp[attacker] / 2
-            self.agent_hp[target_id] -= damage
-            damage_matrix[attacker, target_id] = damage
-            attack_target[attacker] = target_id
+        # === STEP 6: Compute damage ===
+        damage = (self.agent_hp / 2) * valid_hit.float()
 
-        # Update ledger with damage dealt
+        # === STEP 7: Build damage matrix and apply damage ===
+        damage_matrix = torch.zeros((self.n_agents, self.n_agents), device=self.device)
+        hit_indices = torch.where(valid_hit)[0]
+
+        if hit_indices.numel() > 0:
+            hit_targets = target_ids[hit_indices]
+            hit_damage = damage[hit_indices]
+
+            # Set damage matrix entries
+            damage_matrix[hit_indices, hit_targets] = hit_damage
+
+            # Aggregate damage per target using scatter_add
+            damage_per_target = torch.zeros(self.n_agents, device=self.device)
+            damage_per_target.scatter_add_(0, hit_targets, hit_damage)
+            self.agent_hp = self.agent_hp - damage_per_target
+
+        # === STEP 8: Update ledger ===
         self.ledger.tensor[:, :, Ledger.DAMAGE_DEALT] += damage_matrix
 
-        # === Defense Tracking ===
-        # If C attacks A, and A is attacking B, then C defended B
-        for attacker_c in torch.where(attack_mask)[0]:
-            target_a = attack_target[attacker_c].item()
-            if target_a == -1:
-                continue
+        # === STEP 9: Defense tracking (vectorized where possible) ===
+        # attack_target[i] = target agent id if i hit someone, else -1
+        attack_target = torch.where(valid_hit, target_ids,
+                                    torch.full_like(target_ids, -1))
 
-            # Check if A (the person C attacked) was attacking someone B
-            victim_b = attack_target[target_a].item()
-            if victim_b == -1:
-                continue
+        if hit_indices.numel() > 0:
+            # C = attackers who hit someone
+            c_indices = hit_indices
+            a_indices = attack_target[c_indices]  # who C attacked
 
-            # C defended B by attacking A
-            damage_c_dealt = damage_matrix[attacker_c, target_a].item()
-            if damage_c_dealt > 0:
-                self.ledger.record_defense(attacker_c.item(), victim_b, damage_c_dealt)
+            # Check if A was attacking someone B
+            a_was_hitting = valid_hit[a_indices]
+            b_indices = attack_target[a_indices]
 
-        # Rewards: attacker gets 50% of damage dealt
-        damage_dealt = damage_matrix.sum(dim=1)
-        rewards += damage_dealt * self.config.r_attack_mult
+            # Defense: C attacked A, A was attacking B
+            defense_mask = a_was_hitting & (b_indices >= 0)
 
-        # Penalty for receiving damage
-        damage_received = damage_matrix.sum(dim=0)
-        rewards += damage_received * self.config.r_damage_taken
+            if defense_mask.any():
+                defense_c = c_indices[defense_mask]
+                defense_b = b_indices[defense_mask]
+                defense_damage = damage[defense_c]
 
-        return rewards
+                # Update defense scores (vectorized with scatter_add_)
+                n = self.n_agents
+                flat_idx = defense_c * n + defense_b
+                ledger_flat = self.ledger.tensor[:, :, Ledger.DEFENSE_SCORE].view(-1)
+                ledger_flat.scatter_add_(0, flat_idx, defense_damage)
 
-    def _resolve_give_food(self, interact_actions: torch.Tensor, give_mask: torch.Tensor) -> torch.Tensor:
+    def _resolve_give_food(self, interact_actions: torch.Tensor, give_mask: torch.Tensor) -> None:
         """
-        Resolve food giving with direction targeting and HP transfer.
+        Resolve food giving with direction targeting and HP transfer - FULLY VECTORIZED.
 
         Giver LOSES HP regardless of whether there's a valid target (costs HP to the void).
         Target GAINS HP if present.
         If giver HP < food_value, transfers all remaining HP.
         """
-        rewards = torch.zeros(self.n_agents, device=self.device)
         food_value = self.config.poor_food_value
 
-        for giver in torch.where(give_mask)[0]:
-            # Calculate cost amount = min(food_value, giver's HP)
-            cost_amount = min(food_value, self.agent_hp[giver].item())
-            if cost_amount <= 0:
-                continue
+        # Early exit if no givers
+        if not give_mask.any():
+            return
 
-            # Giver ALWAYS pays the cost (even to void)
-            self.agent_hp[giver] -= cost_amount
+        # === STEP 1: Compute cost amount for each giver ===
+        # cost = min(food_value, giver_hp), but only for givers
+        cost_amount = torch.minimum(
+            torch.full((self.n_agents,), food_value, device=self.device),
+            self.agent_hp
+        ) * give_mask.float()
 
-            # Get direction from action (4=UP, 5=DOWN, 6=LEFT, 7=RIGHT -> direction 0-3)
-            direction = interact_actions[giver].item() - GIVE_UP  # Convert 4-7 to 0-3
-            delta_row, delta_col = INTERACT_DIR_DELTAS[direction]
+        # Valid givers have HP to give
+        valid_giver = give_mask & (cost_amount > 0)
 
-            # Compute target position
-            giver_pos = self.agent_positions[giver]
-            target_row = giver_pos[0] + delta_row
-            target_col = giver_pos[1] + delta_col
+        # === STEP 2: Deduct cost from all givers (even to void) ===
+        self.agent_hp = self.agent_hp - cost_amount
 
-            # Check bounds - if out of bounds, HP is lost to void
-            if target_row < 0 or target_row >= self.grid_size:
-                continue
-            if target_col < 0 or target_col >= self.grid_size:
-                continue
+        # === STEP 3: Compute target positions ===
+        give_dirs = (interact_actions - GIVE_UP).clamp(0, 3)
+        deltas = self.dir_deltas_4[give_dirs]
+        target_positions = self.agent_positions + deltas
+        target_rows = target_positions[:, 0]
+        target_cols = target_positions[:, 1]
 
-            # Check if there's an agent at target position - if not, HP is lost to void
-            target_id = self.occupancy[target_row, target_col].item()
-            if target_id == -1 or not self.agent_alive[target_id]:
-                continue
+        # === STEP 4: Check bounds ===
+        in_bounds = (
+            (target_rows >= 0) & (target_rows < self.grid_size) &
+            (target_cols >= 0) & (target_cols < self.grid_size)
+        )
 
-            # Target receives the HP
-            self.agent_hp[target_id] = (self.agent_hp[target_id] + cost_amount).clamp(max=self.config.max_hp)
+        # Clamp for safe indexing
+        safe_rows = target_rows.clamp(0, self.grid_size - 1)
+        safe_cols = target_cols.clamp(0, self.grid_size - 1)
 
-            # Update ledger
-            self.ledger.tensor[giver, target_id, Ledger.FOOD_GIVEN] += cost_amount
+        # === STEP 5: Look up targets ===
+        target_ids = self.occupancy[safe_rows, safe_cols]
 
-            # Reward for sharing
-            rewards[giver] = self.config.r_food_share
+        has_target = target_ids >= 0
+        valid_target_ids = target_ids.clamp(min=0)
+        target_alive = self.agent_alive[valid_target_ids] & has_target
+        valid_transfer = valid_giver & in_bounds & has_target & target_alive
 
-        return rewards
+        # === STEP 6: Transfer HP to targets ===
+        transfer_indices = torch.where(valid_transfer)[0]
 
-    def _process_food_eating(self, interact_actions: torch.Tensor) -> torch.Tensor:
+        if transfer_indices.numel() > 0:
+            transfer_targets = target_ids[transfer_indices]
+            transfer_values = cost_amount[transfer_indices]
+
+            # Aggregate HP gains per target using scatter_add
+            hp_gain = torch.zeros(self.n_agents, device=self.device)
+            hp_gain.scatter_add_(0, transfer_targets, transfer_values)
+
+            # Add HP (clamped to max)
+            self.agent_hp = (self.agent_hp + hp_gain).clamp(max=self.config.max_hp)
+
+            # === STEP 7: Update ledger ===
+            # Flatten index for scatter_add on 2D ledger slice
+            flat_indices = transfer_indices * self.n_agents + transfer_targets
+            ledger_food = self.ledger.tensor[:, :, Ledger.FOOD_GIVEN].view(-1)
+            ledger_food.scatter_add_(0, flat_indices, transfer_values)
+
+    def _process_food_eating(self, interact_actions: torch.Tensor) -> None:
         """Process agents eating food on their cells.
 
         Poor food: eaten automatically by stepping on it
         Rich food: requires 2+ adjacent agents who both chose COOPERATE action
         """
-        rewards = torch.zeros(self.n_agents, device=self.device)
-
         # Get agent positions
         rows = self.agent_positions[:, 0]
         cols = self.agent_positions[:, 1]
@@ -425,56 +480,61 @@ class GridWorld:
             self.agent_hp
         )
 
-        # Rewards for poor food
-        rewards = rewards + on_poor.float() * self.config.r_small
-
         # Remove eaten poor food
         poor_food_flat = self.poor_food.view(-1)
         eat_indices = rows[on_poor] * self.grid_size + cols[on_poor]
         poor_food_flat[eat_indices] = False
 
-        # Rich food - requires 2+ adjacent agents who BOTH chose COOPERATE
+        # Rich food - requires 2+ adjacent agents who BOTH chose COOPERATE (vectorized)
         coop_mask = (interact_actions == INTERACT_COOPERATE) & self.agent_alive
-        rich_food_positions = torch.where(self.rich_food)
-        for i in range(len(rich_food_positions[0])):
-            food_row = rich_food_positions[0][i]
-            food_col = rich_food_positions[1][i]
+        self._process_rich_food_vectorized(coop_mask)
 
-            # Find agents on or adjacent to this food who chose COOPERATE
-            cooperators = self._get_rich_food_cooperators(food_row, food_col, coop_mask)
+    def _process_rich_food_vectorized(self, coop_mask: torch.Tensor) -> None:
+        """
+        Fully vectorized rich food cooperation resolution.
+        No loops, no .item() calls.
+        """
+        # Get all rich food positions [F, 2]
+        rich_food_coords = torch.nonzero(self.rich_food, as_tuple=False)
+        n_food = rich_food_coords.size(0)
 
-            if cooperators is not None and len(cooperators) >= 2:
-                # All cooperators get the reward
-                for coop_id in cooperators:
-                    self.agent_hp[coop_id] = (
-                        self.agent_hp[coop_id] + self.config.rich_food_value
-                    ).clamp(max=self.config.max_hp)
-                    rewards[coop_id] += self.config.r_large
+        # Early exit if no rich food or fewer than 2 cooperators
+        if n_food == 0 or coop_mask.sum() < 2:
+            return
 
-                # Record cooperation in ledger (all pairs)
-                for i_idx, a in enumerate(cooperators):
-                    for b in cooperators[i_idx + 1:]:
-                        self.ledger.record_cooperation(a.item(), b.item())
+        # Compute distance matrix [N, F] - Manhattan distance
+        agent_pos = self.agent_positions.float()  # [N, 2]
+        food_pos = rich_food_coords.float()       # [F, 2]
+        diff = agent_pos.unsqueeze(1) - food_pos.unsqueeze(0)  # [N, F, 2]
+        manhattan_dist = diff.abs().sum(dim=-1)  # [N, F]
 
-                # Remove the food
-                self.rich_food[food_row, food_col] = False
+        # Eligibility: within range AND chose cooperate
+        within_range = manhattan_dist <= 1  # [N, F]
+        eligible = within_range & coop_mask.unsqueeze(1)  # [N, F]
 
-        return rewards
+        # Find consumed foods (2+ cooperators)
+        cooperators_per_food = eligible.sum(dim=0)  # [F]
+        consumed_mask = cooperators_per_food >= 2   # [F] bool
 
-    def _get_rich_food_cooperators(self, food_row: torch.Tensor, food_col: torch.Tensor,
-                                    coop_mask: torch.Tensor) -> torch.Tensor:
-        """Get agents on or adjacent to rich food cell who chose COOPERATE action."""
-        food_pos = torch.tensor([food_row, food_col], device=self.device).float()
+        if not consumed_mask.any():
+            return
 
-        # Distance from each agent to food
-        agent_pos = self.agent_positions.float()
-        dist = (agent_pos - food_pos).abs().sum(dim=1)
+        # HP update: count consumed foods each agent participated in
+        foods_per_agent = eligible.float() @ consumed_mask.float()  # [N]
+        hp_gain = foods_per_agent * self.config.rich_food_value
+        self.agent_hp = (self.agent_hp + hp_gain).clamp(max=self.config.max_hp)
 
-        # On or adjacent = distance <= 1, AND chose COOPERATE
-        near = (dist <= 1) & coop_mask
+        # Ledger update: cooperation pairs via outer product
+        consumed_food_indices = torch.where(consumed_mask)[0]  # [C]
+        eligible_consumed = eligible[:, consumed_food_indices].float()  # [N, C]
+        coop_pairs = eligible_consumed @ eligible_consumed.T  # [N, N]
+        coop_pairs.fill_diagonal_(0)  # No self-cooperation
+        self.ledger.tensor[:, :, Ledger.COOP_COUNT] += coop_pairs
 
-        cooperators = torch.where(near)[0]
-        return cooperators if len(cooperators) >= 2 else None
+        # Remove consumed food
+        consumed_rows = rich_food_coords[consumed_food_indices, 0]
+        consumed_cols = rich_food_coords[consumed_food_indices, 1]
+        self.rich_food[consumed_rows, consumed_cols] = False
 
     def _apply_hp_decay(self) -> None:
         """Apply HP decay to all alive agents - fully vectorized."""
@@ -523,66 +583,69 @@ class GridWorld:
 
     def _get_all_spatial_obs(self) -> torch.Tensor:
         """
-        Get spatial observations for ALL agents at once.
+        Get spatial observations for ALL agents at once - FULLY VECTORIZED.
+        Uses unfold for efficient window extraction + F.one_hot for agent IDs.
         Returns [n_agents, vision_size, vision_size, channels]
         """
         vs = self.config.vision_size
         half = vs // 2
         n = self.n_agents
-
-        # Pad grids for boundary handling
+        gs = self.grid_size
         pad = half
 
-        # Create padded versions of grids
+        # === STEP 1: Pad all grids ===
         padded_poor = F.pad(self.poor_food.float().unsqueeze(0).unsqueeze(0),
                            (pad, pad, pad, pad), value=0).squeeze()
         padded_rich = F.pad(self.rich_food.float().unsqueeze(0).unsqueeze(0),
                            (pad, pad, pad, pad), value=0).squeeze()
-        padded_occ = F.pad(self.occupancy.float().unsqueeze(0).unsqueeze(0),
-                          (pad, pad, pad, pad), value=-1).squeeze()
+        # Add 1 to occupancy so -1 becomes 0 (for safe one_hot indexing)
+        padded_occ = F.pad((self.occupancy + 1).float().unsqueeze(0).unsqueeze(0),
+                          (pad, pad, pad, pad), value=0).squeeze()
 
-        # Prepare output tensor (5 + n_agents channels: Empty, PoorFood, RichFood, AgentPresent, AgentHP, + one-hot AgentID)
-        n_channels = 5 + self.n_agents
+        # === STEP 2: Use unfold to extract ALL windows at once ===
+        # unfold extracts sliding windows: [H, W] -> [H-vs+1, W-vs+1, vs, vs]
+        poor_windows = padded_poor.unfold(0, vs, 1).unfold(1, vs, 1)  # [gs, gs, vs, vs]
+        rich_windows = padded_rich.unfold(0, vs, 1).unfold(1, vs, 1)
+        occ_windows = padded_occ.unfold(0, vs, 1).unfold(1, vs, 1)
+
+        # === STEP 3: Index into windows at agent positions ===
+        rows = self.agent_positions[:, 0]
+        cols = self.agent_positions[:, 1]
+
+        # Extract windows for each agent: [n_agents, vs, vs]
+        agent_poor = poor_windows[rows, cols]
+        agent_rich = rich_windows[rows, cols]
+        agent_occ = occ_windows[rows, cols]  # values are (agent_id + 1), 0 means empty
+
+        # Restore to original agent_id (-1 for empty, but we'll use 0+ for indexing)
+        agent_occ_ids = agent_occ.long() - 1  # [n_agents, vs, vs], -1 = empty
+
+        # === STEP 4: Build observation channels ===
+        # Channels: 0=Empty, 1=Poor food, 2=Rich food, 3=Agent health, 4+=One-hot agent ID
+        n_channels = 4 + self.n_agents
         obs = torch.zeros((n, vs, vs, n_channels), device=self.device)
 
-        # Agent positions offset by padding
-        positions = self.agent_positions + pad
+        # Channel 1: Poor food
+        obs[:, :, :, 1] = agent_poor
 
-        # Extract windows for each agent
-        for i in range(n):
-            r, c = positions[i]
-            r_start = r - half
-            r_end = r_start + vs
-            c_start = c - half
-            c_end = c_start + vs
+        # Channel 2: Rich food
+        obs[:, :, :, 2] = agent_rich
 
-            window_poor = padded_poor[r_start:r_end, c_start:c_end]
-            window_rich = padded_rich[r_start:r_end, c_start:c_end]
-            window_occ = padded_occ[r_start:r_end, c_start:c_end]
+        # === STEP 5: One-hot Agent ID channels (4 to 4+n_agents) - VECTORIZED ===
+        # F.one_hot on clamped IDs, then mask out empty cells
+        agent_present = (agent_occ_ids >= 0)
+        safe_ids_for_onehot = agent_occ_ids.clamp(min=0)
+        one_hot = F.one_hot(safe_ids_for_onehot, num_classes=self.n_agents).float()
+        # Zero out one-hot for empty cells
+        one_hot = one_hot * agent_present.unsqueeze(-1).float()
+        obs[:, :, :, 4:4+self.n_agents] = one_hot
 
-            # Channel 1: Poor food
-            obs[i, :, :, 1] = window_poor
+        # Channel 3: Agent health (normalized) - only where agent present
+        hp_values = self.agent_hp[safe_ids_for_onehot] / self.config.max_hp
+        obs[:, :, :, 3] = torch.where(agent_present, hp_values, torch.zeros_like(hp_values))
 
-            # Channel 2: Rich food
-            obs[i, :, :, 2] = window_rich
-
-            # Channel 3: Agent present
-            agent_present = (window_occ >= 0)
-            obs[i, :, :, 3] = agent_present.float()
-
-            # Channel 4: Agent health (normalized)
-            agent_ids = window_occ.long().clamp(min=0)
-            hp_values = self.agent_hp[agent_ids] / self.config.max_hp
-            obs[i, :, :, 4] = torch.where(agent_present, hp_values, torch.zeros_like(hp_values))
-
-            # Channels 5 to 5+n_agents: One-hot Agent ID
-            # For each position, set channel 5+agent_id to 1 if that agent is there
-            for agent_id in range(self.n_agents):
-                is_this_agent = (window_occ == agent_id)
-                obs[i, :, :, 5 + agent_id] = is_this_agent.float()
-
-            # Channel 0: Empty (not food and not agent)
-            obs[i, :, :, 0] = (~(window_poor.bool() | window_rich.bool() | agent_present)).float()
+        # Channel 0: Empty (not food and not agent)
+        obs[:, :, :, 0] = (~(agent_poor.bool() | agent_rich.bool() | agent_present)).float()
 
         return obs
 

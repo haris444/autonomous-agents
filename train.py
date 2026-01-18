@@ -64,6 +64,15 @@ def train(config: Config = None, visualize: bool = False,
     # Initialize components
     env = GridWorld(config, device)
     network = ActorCritic(config).to(device)
+
+    # Apply torch.compile() for faster forward passes (PyTorch 2.0+)
+    if hasattr(torch, 'compile'):
+        try:
+            network = torch.compile(network, mode='reduce-overhead')
+            print("torch.compile() enabled (reduce-overhead mode)")
+        except Exception as e:
+            print(f"torch.compile() unavailable: {e}")
+
     buffer = RolloutBuffer(config, device)
     ppo = PPO(config, network, device)
 
@@ -126,14 +135,10 @@ def train(config: Config = None, visualize: bool = False,
             # Track episode rewards (tensor)
             current_episode_rewards += rewards
 
-            # Store transition (convert to dict format for buffer compatibility)
-            obs_dict = {i: {k: obs[k][i] for k in obs} for i in range(config.n_agents)}
-            rewards_dict = {i: rewards[i].item() for i in range(config.n_agents)}
-            dones_dict = {i: dones[i].item() for i in range(config.n_agents)}
-
-            buffer.store(
-                obs_dict, move_actions, interact_actions,
-                log_probs, rewards_dict, dones_dict, values
+            # Store transition (fully batched - no dict conversion or .item() calls)
+            buffer.store_batched(
+                obs, move_actions, interact_actions,
+                log_probs, rewards, dones, values
             )
 
             obs = next_obs

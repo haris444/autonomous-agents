@@ -87,6 +87,34 @@ class RolloutBuffer:
 
         self.step_idx += 1
 
+    def store_batched(
+        self,
+        obs: Dict[str, torch.Tensor],  # Already batched [n_agents, ...]
+        move_actions: torch.Tensor,
+        interact_actions: torch.Tensor,
+        log_probs: torch.Tensor,
+        rewards: torch.Tensor,  # [n_agents] tensor, not dict
+        dones: torch.Tensor,    # [n_agents] tensor, not dict
+        values: torch.Tensor
+    ) -> None:
+        """Store one step - fully batched, no loops or .item() calls."""
+        t = self.step_idx
+
+        # Direct tensor assignment - no loops!
+        self.spatial_obs[t] = obs['spatial']
+        self.ledger_obs[t] = obs['ledger']
+        self.signal_obs[t] = obs['signals']
+        self.self_obs[t] = obs['self_hp']
+
+        self.move_actions[t] = move_actions
+        self.interact_actions[t] = interact_actions
+        self.log_probs[t] = log_probs
+        self.rewards[t] = rewards
+        self.dones[t] = dones.float()
+        self.values[t] = values
+
+        self.step_idx += 1
+
     def compute_gae(self, next_value: torch.Tensor, next_done: torch.Tensor) -> None:
         """
         Compute Generalized Advantage Estimation.

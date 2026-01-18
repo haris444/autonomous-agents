@@ -22,10 +22,17 @@ class Ledger:
     COOP_COUNT = 2     # Times they cooperatively unlocked rich food
     DEFENSE_SCORE = 3  # Damage source dealt defending target
 
-    def __init__(self, n_agents: int, device: torch.device):
+    def __init__(self, n_agents: int, device: torch.device,
+                 max_damage: float = 100.0, max_food: float = 100.0,
+                 max_coop: float = 10.0, max_defense: float = 100.0):
         self.n_agents = n_agents
         self.device = device
         self.tensor = torch.zeros((n_agents, n_agents, 4), device=device)
+        # Cached normalization scale (avoids tensor creation every step)
+        self._norm_scale = torch.tensor(
+            [1.0 / max_damage, 1.0 / max_food, 1.0 / max_coop, 1.0 / max_defense],
+            device=device
+        )
 
     def reset(self) -> None:
         """Clear all interaction history."""
@@ -52,12 +59,7 @@ class Ledger:
         """Return the full ledger tensor for observations."""
         return self.tensor.clone()
 
-    def get_normalized_tensor(self, max_damage: float = 100.0, max_food: float = 100.0,
-                               max_coop: float = 10.0, max_defense: float = 100.0) -> torch.Tensor:
+    def get_normalized_tensor(self) -> torch.Tensor:
         """Return normalized ledger tensor (values in [0, 1] range)."""
-        normalized = self.tensor.clone()
-        normalized[:, :, self.DAMAGE_DEALT] /= max_damage
-        normalized[:, :, self.FOOD_GIVEN] /= max_food
-        normalized[:, :, self.COOP_COUNT] /= max_coop
-        normalized[:, :, self.DEFENSE_SCORE] /= max_defense
-        return normalized.clamp(0, 1)
+        # Normalize directly without cloning - multiplication creates new tensor
+        return (self.tensor * self._norm_scale).clamp(0, 1)
