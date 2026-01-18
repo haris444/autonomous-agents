@@ -10,26 +10,33 @@ class Config:
     # Environment
     grid_size: int = 15
     n_agents: int = 8
-    vision_size: int = 7  # NxN observation window (must be odd)
+    vision_size: int = 13  # NxN observation window (must be odd)
     max_hp: float = 100.0
-    hp_decay_rate: float = 0.01  # Fraction of max HP lost per tick
+    hp_decay_rate: float = 0.001  # Fraction of max HP lost per tick (0.1 HP/tick)
     max_steps_per_episode: int = 1000
 
     # Actions
-    n_move_actions: int = 5      # UP, DOWN, LEFT, RIGHT, STAY
-    n_interact_actions: int = 11  # ATTACK x4, GIVE x4, SIGNAL, COOPERATE, IDLE
+    n_move_actions: int = 9      # UP, DOWN, LEFT, RIGHT, UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT, STAY
+    n_interact_actions: int = 19  # ATTACK x8, GIVE x8, SIGNAL, COOPERATE, IDLE (env format)
+    n_interact_types: int = 5    # Factorized: ATTACK, GIVE, SIGNAL, COOPERATE, IDLE
+    n_directions: int = 8        # 8 directions for ATTACK/GIVE
+
+    # Attention/Transformer parameters
+    attention_embed_dim: int = 64
+    attention_num_heads: int = 4
 
     # Food
     poor_food_value: float = 10.0
     rich_food_value: float = 30.0
-    poor_food_spawn_rate: float = 0.002  # Probability per empty cell per tick
-    rich_food_spawn_rate: float = 0.0004
+    poor_food_spawn_rate: float = 0.008  # Probability per empty cell per tick
+    rich_food_spawn_rate: float = 0.0016
 
     # Rewards
     r_small: float = 10.0       # Eat poor food
     r_large: float = 50.0       # Eat rich food (coop)
     r_attack_mult: float = 0.5  # Attack reward = 50% of damage dealt
-    r_damage_taken: float = -0.5  # Penalty per HP lost
+    r_damage_taken: float = -0.5  # Penalty per HP lost (scaled by HP ratio)
+    r_low_hp: float = -50.0     # Per-tick penalty when HP is low (500x)
     r_food_share: float = 0.0   # No reward for giving food
     r_survival: float = 0.0     # No survival bonus
     r_death: float = -100.0     # Penalty for dying

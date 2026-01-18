@@ -72,11 +72,12 @@ class PPO:
 
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> tuple:
         """Compute combined PPO loss for one minibatch."""
-        # Get current policy outputs
+        # Get current policy outputs (with action masks for correct log prob computation)
         _, _, new_log_prob, entropy, new_value = self.network.get_action_and_value(
             batch['obs'],
             batch['move_actions'],
-            batch['interact_actions']
+            batch['interact_actions'],
+            action_masks=batch.get('action_masks')
         )
 
         # Policy ratio

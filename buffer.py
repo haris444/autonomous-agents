@@ -37,6 +37,7 @@ class RolloutBuffer:
         self.ledger_obs = torch.zeros((self.num_steps, n, n, n, lc), device=device)
         self.signal_obs = torch.zeros((self.num_steps, n, n), device=device)
         self.self_obs = torch.zeros((self.num_steps, n, 1), device=device)
+        self.agent_ids = torch.zeros((self.num_steps, n), device=device, dtype=torch.long)
 
         # Actions - shape: [num_steps, n_agents]
         self.move_actions = torch.zeros((self.num_steps, n), device=device, dtype=torch.long)
@@ -51,6 +52,11 @@ class RolloutBuffer:
         # Computed after rollout
         self.advantages = torch.zeros((self.num_steps, n), device=device)
         self.returns = torch.zeros((self.num_steps, n), device=device)
+
+        # Action masks - shape: [num_steps, n_agents, action_dim]
+        self.move_masks = torch.zeros((self.num_steps, n, config.n_move_actions), device=device, dtype=torch.bool)
+        self.interact_type_masks = torch.zeros((self.num_steps, n, config.n_interact_types), device=device, dtype=torch.bool)
+        self.direction_masks = torch.zeros((self.num_steps, n, config.n_directions), device=device, dtype=torch.bool)
 
         self.step_idx = 0
 
@@ -76,6 +82,7 @@ class RolloutBuffer:
             self.ledger_obs[t, agent_id] = obs[agent_id]['ledger']
             self.signal_obs[t, agent_id] = obs[agent_id]['signals']
             self.self_obs[t, agent_id] = obs[agent_id]['self_hp']
+            self.agent_ids[t, agent_id] = obs[agent_id]['agent_id']
 
             self.rewards[t, agent_id] = rewards[agent_id]
             self.dones[t, agent_id] = float(dones[agent_id])
@@ -95,7 +102,8 @@ class RolloutBuffer:
         log_probs: torch.Tensor,
         rewards: torch.Tensor,  # [n_agents] tensor, not dict
         dones: torch.Tensor,    # [n_agents] tensor, not dict
-        values: torch.Tensor
+        values: torch.Tensor,
+        action_masks: Dict[str, torch.Tensor] = None  # Optional action masks
     ) -> None:
         """Store one step - fully batched, no loops or .item() calls."""
         t = self.step_idx
@@ -105,6 +113,7 @@ class RolloutBuffer:
         self.ledger_obs[t] = obs['ledger']
         self.signal_obs[t] = obs['signals']
         self.self_obs[t] = obs['self_hp']
+        self.agent_ids[t] = obs['agent_id']
 
         self.move_actions[t] = move_actions
         self.interact_actions[t] = interact_actions
@@ -112,6 +121,12 @@ class RolloutBuffer:
         self.rewards[t] = rewards
         self.dones[t] = dones.float()
         self.values[t] = values
+
+        # Store action masks if provided
+        if action_masks is not None:
+            self.move_masks[t] = action_masks['move_mask']
+            self.interact_type_masks[t] = action_masks['interact_type_mask']
+            self.direction_masks[t] = action_masks['direction_mask']
 
         self.step_idx += 1
 
@@ -160,12 +175,18 @@ class RolloutBuffer:
         ledger_flat = self.ledger_obs.reshape(batch_size, *self.ledger_obs.shape[2:])
         signal_flat = self.signal_obs.reshape(batch_size, -1)
         self_flat = self.self_obs.reshape(batch_size, -1)
+        agent_id_flat = self.agent_ids.reshape(batch_size)
 
         move_flat = self.move_actions.reshape(batch_size)
         interact_flat = self.interact_actions.reshape(batch_size)
         log_probs_flat = self.log_probs.reshape(batch_size)
         advantages_flat = self.advantages.reshape(batch_size)
         returns_flat = self.returns.reshape(batch_size)
+
+        # Flatten action masks
+        move_masks_flat = self.move_masks.reshape(batch_size, -1)
+        interact_type_masks_flat = self.interact_type_masks.reshape(batch_size, -1)
+        direction_masks_flat = self.direction_masks.reshape(batch_size, -1)
 
         # Yield minibatches
         minibatch_size = self.config.minibatch_size
@@ -178,11 +199,17 @@ class RolloutBuffer:
                     'spatial': spatial_flat[mb_indices],
                     'ledger': ledger_flat[mb_indices],
                     'signals': signal_flat[mb_indices],
-                    'self_hp': self_flat[mb_indices]
+                    'self_hp': self_flat[mb_indices],
+                    'agent_id': agent_id_flat[mb_indices]
                 },
                 'move_actions': move_flat[mb_indices],
                 'interact_actions': interact_flat[mb_indices],
                 'log_probs': log_probs_flat[mb_indices],
                 'advantages': advantages_flat[mb_indices],
-                'returns': returns_flat[mb_indices]
+                'returns': returns_flat[mb_indices],
+                'action_masks': {
+                    'move_mask': move_masks_flat[mb_indices],
+                    'interact_type_mask': interact_type_masks_flat[mb_indices],
+                    'direction_mask': direction_masks_flat[mb_indices]
+                }
             }

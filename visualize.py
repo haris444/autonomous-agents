@@ -20,33 +20,38 @@ import torch
 from config import Config
 
 # Action constants (must match environment.py)
-# Attack directions: 0-3, Give directions: 4-7, Signal: 8, Cooperate: 9, Idle: 10
+# Attack directions: 0-7, Give directions: 8-15, Signal: 16, Cooperate: 17, Idle: 18
 ATTACK_UP, ATTACK_DOWN, ATTACK_LEFT, ATTACK_RIGHT = 0, 1, 2, 3
-GIVE_UP, GIVE_DOWN, GIVE_LEFT, GIVE_RIGHT = 4, 5, 6, 7
-INTERACT_SIGNAL = 8
-INTERACT_COOPERATE = 9
-INTERACT_IDLE = 10
+ATTACK_UP_LEFT, ATTACK_UP_RIGHT, ATTACK_DOWN_LEFT, ATTACK_DOWN_RIGHT = 4, 5, 6, 7
+GIVE_UP, GIVE_DOWN, GIVE_LEFT, GIVE_RIGHT = 8, 9, 10, 11
+GIVE_UP_LEFT, GIVE_UP_RIGHT, GIVE_DOWN_LEFT, GIVE_DOWN_RIGHT = 12, 13, 14, 15
+INTERACT_SIGNAL = 16
+INTERACT_COOPERATE = 17
+INTERACT_IDLE = 18
 
-# Direction deltas: UP, DOWN, LEFT, RIGHT
-INTERACT_DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+# Direction deltas: UP, DOWN, LEFT, RIGHT, UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT
+INTERACT_DIR_DELTAS = [
+    (-1, 0), (1, 0), (0, -1), (0, 1),      # Cardinal
+    (-1, -1), (-1, 1), (1, -1), (1, 1)     # Diagonal
+]
 
 
 def _is_attack_action(action):
-    """Check if action is an attack (0-3)."""
-    return 0 <= action <= 3
+    """Check if action is an attack (0-7)."""
+    return 0 <= action <= 7
 
 
 def _is_give_action(action):
-    """Check if action is a give (4-7)."""
-    return 4 <= action <= 7
+    """Check if action is a give (8-15)."""
+    return 8 <= action <= 15
 
 
 def _get_target_from_action(agent_pos, action, grid_size):
     """Get target position from directional action. Returns None if out of bounds."""
     if _is_attack_action(action):
-        direction = action  # 0-3
+        direction = action  # 0-7
     elif _is_give_action(action):
-        direction = action - 4  # 4-7 -> 0-3
+        direction = action - 8  # 8-15 -> 0-7
     else:
         return None
 
@@ -597,6 +602,21 @@ def replay_episode(recording: List[StepData], config: Config,
 
                 target_row, target_col = target_pos
 
+                # CHECK: Is there actually a living agent at the target position?
+                target_agent_id = None
+                for other_id in range(n_agents):
+                    if other_id == agent_id:
+                        continue
+                    if not step_data.alive[other_id]:
+                        continue
+                    other_row, other_col = step_data.positions[other_id]
+                    if int(other_row) == target_row and int(other_col) == target_col:
+                        target_agent_id = other_id
+                        break
+
+                if target_agent_id is None:
+                    continue  # No agent at target - don't draw arrow
+
                 if _is_attack_action(interact_act):
                     # Red arrow for attack
                     ax_grid.annotate('',
@@ -699,11 +719,15 @@ def visualize_trained_agent(model_path: str, config: Config = None,
                 'spatial': torch.stack([obs[i]['spatial'] for i in range(config.n_agents)]),
                 'ledger': torch.stack([obs[i]['ledger'] for i in range(config.n_agents)]),
                 'signals': torch.stack([obs[i]['signals'] for i in range(config.n_agents)]),
-                'self_hp': torch.stack([obs[i]['self_hp'] for i in range(config.n_agents)])
+                'self_hp': torch.stack([obs[i]['self_hp'] for i in range(config.n_agents)]),
+                'agent_id': torch.stack([obs[i]['agent_id'] for i in range(config.n_agents)])
             }
 
             with torch.no_grad():
-                move_actions, interact_actions, _, _, _ = network.get_action_and_value(stacked_obs)
+                action_masks = env.get_action_masks()
+                move_actions, interact_actions, _, _, _ = network.get_action_and_value(
+                    stacked_obs, action_masks=action_masks
+                )
 
             actions = {
                 i: (move_actions[i].item(), interact_actions[i].item())

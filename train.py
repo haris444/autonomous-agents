@@ -29,7 +29,8 @@ def stack_observations(obs: Dict[int, Dict[str, torch.Tensor]], n_agents: int) -
         'spatial': torch.stack([obs[i]['spatial'] for i in range(n_agents)]),
         'ledger': torch.stack([obs[i]['ledger'] for i in range(n_agents)]),
         'signals': torch.stack([obs[i]['signals'] for i in range(n_agents)]),
-        'self_hp': torch.stack([obs[i]['self_hp'] for i in range(n_agents)])
+        'self_hp': torch.stack([obs[i]['self_hp'] for i in range(n_agents)]),
+        'agent_id': torch.stack([obs[i]['agent_id'] for i in range(n_agents)])
     }
 
 
@@ -124,10 +125,11 @@ def train(config: Config = None, visualize: bool = False,
             global_step += config.n_agents
 
             # obs is already batched from vectorized env
-            # Get actions from policy
+            # Get action masks and actions from policy
             with torch.no_grad():
+                action_masks = env.get_action_masks()
                 move_actions, interact_actions, log_probs, _, values = \
-                    network.get_action_and_value(obs)
+                    network.get_action_and_value(obs, action_masks=action_masks)
 
             # Environment step (tensor-based API)
             next_obs, rewards, dones, infos = env.step(move_actions, interact_actions)
@@ -138,7 +140,8 @@ def train(config: Config = None, visualize: bool = False,
             # Store transition (fully batched - no dict conversion or .item() calls)
             buffer.store_batched(
                 obs, move_actions, interact_actions,
-                log_probs, rewards, dones, values
+                log_probs, rewards, dones, values,
+                action_masks=action_masks
             )
 
             obs = next_obs
