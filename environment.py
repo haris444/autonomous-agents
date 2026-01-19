@@ -17,27 +17,24 @@ from typing import Dict, Tuple
 from config import Config
 from ledger import Ledger
 
+# Import scenarios module (lazy import to avoid circular dependency)
+# Scenarios are applied via apply_scenario() after reset()
 
-# Action indices for movement (8 directions + stay)
+
+# Action indices for movement (4 cardinal directions + stay)
 MOVE_UP, MOVE_DOWN, MOVE_LEFT, MOVE_RIGHT = 0, 1, 2, 3
-MOVE_UP_LEFT, MOVE_UP_RIGHT, MOVE_DOWN_LEFT, MOVE_DOWN_RIGHT = 4, 5, 6, 7
-MOVE_STAY = 8
+MOVE_STAY = 4
 
-# Interact actions with direction: ATTACK (0-7), GIVE (8-15), SIGNAL=16, COOPERATE=17, IDLE=18
+# Interact actions with direction: ATTACK (0-3), GIVE (4-7), SIGNAL=8, COOPERATE=9, IDLE=10
 ATTACK_UP, ATTACK_DOWN, ATTACK_LEFT, ATTACK_RIGHT = 0, 1, 2, 3
-ATTACK_UP_LEFT, ATTACK_UP_RIGHT, ATTACK_DOWN_LEFT, ATTACK_DOWN_RIGHT = 4, 5, 6, 7
-GIVE_UP, GIVE_DOWN, GIVE_LEFT, GIVE_RIGHT = 8, 9, 10, 11
-GIVE_UP_LEFT, GIVE_UP_RIGHT, GIVE_DOWN_LEFT, GIVE_DOWN_RIGHT = 12, 13, 14, 15
-INTERACT_SIGNAL = 16
-INTERACT_COOPERATE = 17
-INTERACT_IDLE = 18
+GIVE_UP, GIVE_DOWN, GIVE_LEFT, GIVE_RIGHT = 4, 5, 6, 7
+INTERACT_SIGNAL = 8
+INTERACT_COOPERATE = 9
+INTERACT_IDLE = 10
 
-# Direction deltas for interact actions (indices 0-7 for attack, 8-15 for give)
-# Maps to: UP, DOWN, LEFT, RIGHT, UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT
-INTERACT_DIR_DELTAS = [
-    (-1, 0), (1, 0), (0, -1), (0, 1),      # Cardinal
-    (-1, -1), (-1, 1), (1, -1), (1, 1)     # Diagonal
-]
+# Direction deltas for interact actions (indices 0-3 for attack, 4-7 for give)
+# Maps to: UP, DOWN, LEFT, RIGHT
+INTERACT_DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 
 class GridWorld:
@@ -55,18 +52,16 @@ class GridWorld:
         # Ledger for social memory
         self.ledger = Ledger(config.n_agents, device)
 
-        # Direction deltas tensor [9, 2] for movement (8 directions + stay)
+        # Direction deltas tensor [5, 2] for movement (4 cardinal directions + stay)
         self.direction_deltas = torch.tensor(
-            [[-1, 0], [1, 0], [0, -1], [0, 1],      # Cardinal: UP, DOWN, LEFT, RIGHT
-             [-1, -1], [-1, 1], [1, -1], [1, 1],    # Diagonal: UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT
-             [0, 0]],                               # STAY
+            [[-1, 0], [1, 0], [0, -1], [0, 1],  # Cardinal: UP, DOWN, LEFT, RIGHT
+             [0, 0]],                            # STAY
             device=device, dtype=torch.long
         )
 
-        # Direction deltas tensor [8, 2] for attacks/give (cached for reuse)
-        self.dir_deltas_8 = torch.tensor(
-            [[-1, 0], [1, 0], [0, -1], [0, 1],
-             [-1, -1], [-1, 1], [1, -1], [1, 1]],
+        # Direction deltas tensor [4, 2] for attacks/give (cached for reuse)
+        self.dir_deltas_4 = torch.tensor(
+            [[-1, 0], [1, 0], [0, -1], [0, 1]],
             device=device, dtype=torch.long
         )
 
@@ -74,6 +69,7 @@ class GridWorld:
         self.agent_positions: torch.Tensor = None  # [n_agents, 2] (row, col)
         self.agent_hp: torch.Tensor = None         # [n_agents]
         self.agent_alive: torch.Tensor = None      # [n_agents] bool
+        self.agent_inventory: torch.Tensor = None  # [n_agents] stored food units
         self.poor_food: torch.Tensor = None        # [grid_size, grid_size] bool
         self.rich_food: torch.Tensor = None        # [grid_size, grid_size] bool
         self.signals: torch.Tensor = None          # [n_agents] bool
@@ -81,9 +77,24 @@ class GridWorld:
 
         # Episode tracking for warmup food boost
         self.episode_count = 0
-        self.warmup_episodes = 20  # 100x food spawn/reward, 10x episode length
+        self.warmup_episodes = 0  # Disabled: was 100x food spawn/reward, 10x episode length
 
         self.step_count = 0
+
+        # Curriculum learning tracking
+        self.curriculum_phase = config.curriculum_phase if config.curriculum_enabled else 4
+        self.episode_returns = []  # Track returns for phase advancement
+        self.current_episode_reward = 0.0  # Accumulator for current episode
+
+        # Attack history buffer for extended defense tracking (last 3 steps)
+        # Shape: [3, n_agents, n_agents] - recent_attacks[t, attacker, victim] = damage
+        self.recent_attacks = torch.zeros((3, config.n_agents, config.n_agents), device=device)
+
+        # Cooperation tracking for diagnostics
+        self.last_coop_success_count = 0  # Number of successful cooperations in last step
+
+        # Current scenario (set via apply_scenario() after reset())
+        self._current_scenario = None
 
     def _update_occupancy(self) -> None:
         """Update occupancy grid from agent positions - FULLY VECTORIZED."""
@@ -104,8 +115,11 @@ class GridWorld:
     def reset(self) -> Dict[str, torch.Tensor]:
         """Reset environment and return initial observations for all agents."""
         self.ledger.reset()
+        self.recent_attacks.zero_()  # Clear attack history
         self.step_count = 0
         self.episode_count += 1
+        self.current_episode_reward = 0.0
+        self.partner_relationship = None  # Set by scenario if scripted partners
 
         # Initialize occupancy grid
         self.occupancy = torch.full(
@@ -113,16 +127,56 @@ class GridWorld:
             device=self.device, dtype=torch.long
         )
 
-        # Initialize agent positions (random, no overlap)
-        # Use torch for random positions
-        all_positions = torch.randperm(self.grid_size * self.grid_size, device=self.device)[:self.n_agents]
-        rows = all_positions // self.grid_size
-        cols = all_positions % self.grid_size
-        self.agent_positions = torch.stack([rows, cols], dim=1)
+        # Initialize agent positions
+        if self.config.pretrain_mode and self.config.curriculum_enabled and self.curriculum_phase <= 5:
+            # Solo curriculum (phases 1-5): place agent in center of grid
+            center = self.grid_size // 2
+            self.agent_positions = torch.zeros((self.n_agents, 2), device=self.device, dtype=torch.long)
+            self.agent_positions[0] = torch.tensor([center, center], device=self.device)
+            # Other agents get random positions (they'll be dead in pretrain mode anyway)
+            if self.n_agents > 1:
+                other_positions = torch.randperm(self.grid_size * self.grid_size, device=self.device)[:self.n_agents - 1]
+                rows = other_positions // self.grid_size
+                cols = other_positions % self.grid_size
+                self.agent_positions[1:] = torch.stack([rows, cols], dim=1)
+        elif self.config.pretrain_mode and self.config.curriculum_enabled and self.curriculum_phase >= 6:
+            # Coop curriculum (phases 6-8): place 2 agents near rich food
+            # Rich food spawns in center, agents spawn adjacent to it
+            self.agent_positions = torch.zeros((self.n_agents, 2), device=self.device, dtype=torch.long)
+            center = self.grid_size // 2
+            # Agent 0 and 1 will be positioned near the food (set after food spawns)
+            self.agent_positions[0] = torch.tensor([center, center], device=self.device)
+            self.agent_positions[1] = torch.tensor([center, center + 1], device=self.device)
+            # Other agents get random positions (they'll be dead anyway)
+            if self.n_agents > 2:
+                other_positions = torch.randperm(self.grid_size * self.grid_size, device=self.device)[:self.n_agents - 2]
+                rows = other_positions // self.grid_size
+                cols = other_positions % self.grid_size
+                self.agent_positions[2:] = torch.stack([rows, cols], dim=1)
+        else:
+            # Normal: random positions, no overlap
+            all_positions = torch.randperm(self.grid_size * self.grid_size, device=self.device)[:self.n_agents]
+            rows = all_positions // self.grid_size
+            cols = all_positions % self.grid_size
+            self.agent_positions = torch.stack([rows, cols], dim=1)
 
-        # Initialize HP and alive status
+        # Initialize HP, alive status, and inventory
         self.agent_hp = torch.full((self.n_agents,), self.config.max_hp, device=self.device)
         self.agent_alive = torch.ones(self.n_agents, device=self.device, dtype=torch.bool)
+        self.agent_inventory = torch.zeros(self.n_agents, device=self.device)  # Start with no stored food
+
+        # Pretraining mode: only keep appropriate number of agents alive
+        if self.config.pretrain_mode:
+            if self.curriculum_phase >= 6:
+                # Cooperation phases: 2 agents active
+                n_active = 2
+            else:
+                # Solo phases: 1 agent active
+                n_active = self.config.pretrain_spawn_agents
+            self.agent_alive[n_active:] = False
+            self.agent_hp[n_active:] = 0
+            if self.episode_count == 1:  # Print once on first episode
+                print(f"[Pretrain] Active agents: {self.agent_alive.sum().item()}/{self.n_agents}")
 
         # Initialize food grids
         self.poor_food = torch.zeros((self.grid_size, self.grid_size),
@@ -132,12 +186,35 @@ class GridWorld:
 
         # Update occupancy and spawn food
         self._update_occupancy()
-        self._spawn_food()
+        if self.config.pretrain_mode and self.config.curriculum_enabled:
+            self._spawn_food_curriculum()
+        else:
+            self._initialize_food_at_capacity()
 
         # Initialize signals (none active)
         self.signals = torch.zeros(self.n_agents, device=self.device, dtype=torch.bool)
 
         return self._get_all_observations()
+
+    def apply_scenario(self, scenario: 'Scenario') -> None:
+        """
+        Apply a scenario to configure the environment after reset().
+
+        The scenario controls agent positioning, activation, and food spawning.
+        This should be called immediately after reset() in the training loop.
+
+        Args:
+            scenario: The scenario to apply (from scenarios.py)
+        """
+        self._current_scenario = scenario
+
+        # Let scenario setup agent positions and activation
+        scenario.setup(self)
+
+        # Clear existing food and let scenario spawn fresh
+        self.poor_food.zero_()
+        self.rich_food.zero_()
+        scenario.spawn_food(self)
 
     def step(self, move_actions: torch.Tensor, interact_actions: torch.Tensor) -> Tuple[
         Dict[str, torch.Tensor],  # observations (batched)
@@ -168,33 +245,23 @@ class GridWorld:
         # 1. Process interactions FIRST (attack, give food, signal)
         #    This happens from CURRENT position before movement
         #    So agent attacks what they SEE in their observation
-        attack_rewards, damage_taken = self._resolve_interactions(interact_actions)
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards = self._resolve_interactions(interact_actions)
 
         # 2. Resolve movement (Heavyweight Rule)
         self._resolve_movement(move_actions)
         self._update_occupancy()
-
-        # Compute smell reward: (food_value / distance) / 3
-        # Stronger smell when closer, richer food smells more
-        dist, food_value = self._compute_nearest_food_info(self.agent_positions)
-
-        # Avoid division by zero (distance=0 means on food, they'll eat it)
-        safe_dist = torch.clamp(dist, min=1.0)
-        smell_rewards = (food_value / safe_dist) / 3.0
-
-        # Handle no-food case (inf distance)
-        smell_rewards = torch.where(
-            torch.isinf(dist),
-            torch.zeros_like(smell_rewards),
-            smell_rewards
-        )
-        smell_rewards = smell_rewards * self.agent_alive.float()
 
         # 3. Apply HP decay (vectorized)
         self._apply_hp_decay()
 
         # 4. Process food eating (agents on food cells after movement)
         food_rewards = self._process_food_eating(interact_actions)
+
+        # 4a. Compute intrinsic reward for attempting COOP near rich food + ally
+        intrinsic_coop_rewards = self._compute_intrinsic_coop_rewards(interact_actions)
+
+        # 4b. Auto-consume inventory to heal (if HP < max and have inventory)
+        self._consume_inventory()
 
         # 5. Spawn new food
         self._spawn_food()
@@ -219,13 +286,14 @@ class GridWorld:
 
         # Combine all rewards
         rewards = (
-            (hp_after - hp_before)    # HP delta (implicit)
-            + death_rewards           # Death penalty
-            + food_rewards            # Explicit food bonus
-            + attack_rewards          # Attack bonus
-            + damage_pain             # Damage pain (non-linear)
-            + low_hp_penalty          # Low HP penalty (constant per tick)
-            + smell_rewards           # Smell reward for moving toward food
+            death_rewards           # Death penalty (-50.0)
+            + food_rewards          # Eat food (+5.0)
+            + intrinsic_coop_rewards  # Intrinsic reward for COOP attempt near food + ally
+            + attack_rewards        # Attack bonus
+            + defense_rewards       # Defense bonus (for protecting allies)
+            + revenge_rewards       # Revenge bonus (for retaliating against attackers)
+            + damage_pain           # Damage pain (non-linear)
+            + low_hp_penalty        # Low HP penalty (constant per tick)
         )
 
         # Build outputs
@@ -237,8 +305,15 @@ class GridWorld:
         all_dead = ~self.agent_alive.any()
         episode_length = self.config.max_steps_per_episode * (10 if self.episode_count <= self.warmup_episodes else 1)
         max_steps = self.step_count >= episode_length
-        if all_dead or max_steps:
+        episode_done = all_dead or max_steps
+        if episode_done:
             dones = torch.ones(self.n_agents, device=self.device, dtype=torch.bool)
+
+        # Curriculum tracking: accumulate agent 0's rewards and check phase advancement
+        self.current_episode_reward += rewards[0].item()
+        if episode_done and self.config.pretrain_mode and self.config.curriculum_enabled:
+            self._check_curriculum_advance(self.current_episode_reward)
+            self.current_episode_reward = 0.0
 
         infos = {}
 
@@ -263,12 +338,13 @@ class GridWorld:
 
         return adjacent
 
-    def _compute_nearest_food_info(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _compute_nearest_food_info(self, positions: torch.Tensor, poor_only: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Manhattan distance and value of nearest food for each agent.
 
         Args:
             positions: [n_agents, 2] agent positions
+            poor_only: If True, only consider poor food (for smell rewards)
 
         Returns:
             distances: [n_agents] distance to nearest food, or inf if no food
@@ -276,7 +352,7 @@ class GridWorld:
         """
         # Get food coordinates and their values
         poor_coords = torch.nonzero(self.poor_food, as_tuple=False)  # [P, 2]
-        rich_coords = torch.nonzero(self.rich_food, as_tuple=False)  # [R, 2]
+        rich_coords = torch.nonzero(self.rich_food, as_tuple=False) if not poor_only else torch.empty((0, 2), device=self.device, dtype=torch.long)
 
         n_poor = poor_coords.size(0)
         n_rich = rich_coords.size(0)
@@ -303,7 +379,7 @@ class GridWorld:
             min_dist = torch.where(closer_mask, poor_min_dist, min_dist)
             nearest_value = torch.where(closer_mask, self.config.poor_food_value, nearest_value)
 
-        # Check rich food
+        # Check rich food (skip if poor_only)
         if n_rich > 0:
             diff = agent_pos.unsqueeze(1) - rich_coords.float().unsqueeze(0)  # [N, R, 2]
             rich_dist = diff.abs().sum(dim=-1)  # [N, R]
@@ -388,54 +464,61 @@ class GridWorld:
             self.agent_positions
         )
 
-    def _resolve_interactions(self, interact_actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _resolve_interactions(self, interact_actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process attack, give food, and signal actions with direction targeting.
 
         Returns:
             attack_rewards: [n_agents] reward for damage dealt
             damage_taken: [n_agents] damage received by each agent
+            defense_rewards: [n_agents] reward for defending allies
+            revenge_rewards: [n_agents] reward for retaliating against attackers
         """
         # Signal actions (action 8)
         signal_mask = (interact_actions == INTERACT_SIGNAL) & self.agent_alive
         self.signals = signal_mask
 
-        # Attack actions (0-7: 8 directions)
-        attack_mask = (interact_actions <= ATTACK_DOWN_RIGHT) & self.agent_alive
-        attack_rewards, damage_taken = self._resolve_attacks(interact_actions, attack_mask)
+        # Attack actions (0-3: 4 cardinal directions)
+        attack_mask = (interact_actions <= ATTACK_RIGHT) & self.agent_alive
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards = self._resolve_attacks(interact_actions, attack_mask)
 
-        # Give food actions (8-15: 8 directions)
-        give_mask = ((interact_actions >= GIVE_UP) & (interact_actions <= GIVE_DOWN_RIGHT)) & self.agent_alive
+        # Give food actions (4-7: 4 cardinal directions)
+        give_mask = ((interact_actions >= GIVE_UP) & (interact_actions <= GIVE_RIGHT)) & self.agent_alive
         self._resolve_give_food(interact_actions, give_mask)
 
-        return attack_rewards, damage_taken
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards
 
-    def _resolve_attacks(self, interact_actions: torch.Tensor, attack_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _resolve_attacks(self, interact_actions: torch.Tensor, attack_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Resolve attacks with direction targeting and defense tracking - FULLY VECTORIZED.
 
         Each attacker targets ONE cell in their chosen direction.
-        Defense: if C attacks A who is attacking B, C defended B.
+        Defense: if C attacks A who attacked B in last 3 steps, C defended B.
+        Revenge: if C attacks A who attacked C recently, C gets revenge reward.
         Attack costs 5% of max HP regardless of whether it hits.
 
         Returns:
             attack_rewards: [n_agents] reward for damage dealt
             damage_taken: [n_agents] damage received by each agent
+            defense_rewards: [n_agents] reward for defending allies
+            revenge_rewards: [n_agents] reward for retaliating
         """
         # Initialize return tensors
         attack_rewards = torch.zeros(self.n_agents, device=self.device)
         damage_taken = torch.zeros(self.n_agents, device=self.device)
+        defense_rewards = torch.zeros(self.n_agents, device=self.device)
+        revenge_rewards = torch.zeros(self.n_agents, device=self.device)
 
         # Early exit if no attackers
         if not attack_mask.any():
-            return attack_rewards, damage_taken
+            return attack_rewards, damage_taken, defense_rewards, revenge_rewards
 
         # === STEP 1: Apply attack cost to ALL attackers at once ===
         attack_cost = self.config.max_hp * 0.05
         self.agent_hp = self.agent_hp - attack_cost * attack_mask.float()
 
         # === STEP 2: Compute target positions for ALL agents ===
-        attack_dirs = interact_actions.clamp(0, 7)
-        deltas = self.dir_deltas_8[attack_dirs]  # [n_agents, 2]
+        attack_dirs = interact_actions.clamp(0, 3)
+        deltas = self.dir_deltas_4[attack_dirs]  # [n_agents, 2]
         target_positions = self.agent_positions + deltas
         target_rows = target_positions[:, 0]
         target_cols = target_positions[:, 1]
@@ -482,51 +565,62 @@ class GridWorld:
         # === STEP 8: Update ledger ===
         self.ledger.tensor[:, :, Ledger.DAMAGE_DEALT] += damage_matrix
 
-        # === STEP 9: Defense tracking (vectorized where possible) ===
-        # attack_target[i] = target agent id if i hit someone, else -1
-        attack_target = torch.where(valid_hit, target_ids,
-                                    torch.full_like(target_ids, -1))
+        # === STEP 9: Update attack history buffer ===
+        # Roll history: [0,1,2] -> [1,2,0], then overwrite slot 0 with current
+        self.recent_attacks = torch.roll(self.recent_attacks, 1, dims=0)
+        self.recent_attacks[0] = damage_matrix  # Current step attacks
 
+        # === STEP 10: Extended defense tracking (last 3 steps) ===
+        # C attacks A → check if A attacked anyone B in last 3 steps
+        # If so, C defended B by attacking their attacker A
         if hit_indices.numel() > 0:
-            # C = attackers who hit someone
+            # Who has A (the victim of C's attack) attacked recently?
+            # recent_victims[attacker, victim] = True if attacker hit victim in last 3 steps
+            recent_victims = (self.recent_attacks > 0).any(dim=0)  # [n_agents, n_agents]
+
+            # For each C who hit someone (A), check A's recent victims (B)
             c_indices = hit_indices
-            a_indices = attack_target[c_indices]  # who C attacked
+            a_indices = target_ids[c_indices]  # Who C attacked (A)
 
-            # Check if A was attacking someone B
-            a_was_hitting = valid_hit[a_indices]
-            b_indices = attack_target[a_indices]
+            # For each (C, A) pair, find all B that A attacked recently
+            for i in range(c_indices.numel()):
+                c = c_indices[i]
+                a = a_indices[i]
+                dmg = damage[c]
 
-            # Defense: C attacked A, A was attacking B
-            defense_mask = a_was_hitting & (b_indices >= 0)
+                # === Revenge: Did A attack ME (C) recently? ===
+                if recent_victims[a, c]:  # A attacked C recently
+                    revenge_rewards[c] += dmg * self.config.r_revenge
 
-            if defense_mask.any():
-                defense_c = c_indices[defense_mask]
-                defense_b = b_indices[defense_mask]
-                defense_damage = damage[defense_c]
+                # === Defense: Get all B that A attacked recently (excluding C) ===
+                victims_of_a = recent_victims[a].clone()
+                victims_of_a[c] = False  # Exclude self (revenge handled separately)
+                b_indices = torch.where(victims_of_a)[0]
 
-                # Update defense scores (vectorized with scatter_add_)
-                n = self.n_agents
-                flat_idx = defense_c * n + defense_b
-                ledger_flat = self.ledger.tensor[:, :, Ledger.DEFENSE_SCORE].view(-1)
-                ledger_flat.scatter_add_(0, flat_idx, defense_damage)
+                # C defended each of these victims B
+                if b_indices.numel() > 0:
+                    # Update defense scores and rewards for all (C, B) pairs
+                    for b in b_indices:
+                        self.ledger.tensor[c, b, Ledger.DEFENSE_SCORE] += dmg
+                        defense_rewards[c] += dmg * self.config.r_defense
 
-        # === STEP 10: Compute rewards and damage taken ===
-        # Attack rewards = damage dealt * multiplier
-        damage_dealt_per_agent = damage_matrix.sum(dim=1)  # Sum over targets
-        attack_rewards = damage_dealt_per_agent * self.config.r_attack_mult
+        # === STEP 11: Compute rewards and damage taken ===
+        # Attack rewards = 50% of ALL damage dealt (incentivizes combat)
+        total_damage_dealt = damage_matrix.sum(dim=1)  # Sum over all targets
+        attack_rewards = total_damage_dealt * self.config.r_attack_mult
 
-        # Damage taken per agent (sum over attackers)
+        # Damage taken per agent (sum over attackers) - still tracks all damage for pain calculation
         damage_taken = damage_matrix.sum(dim=0)
 
-        return attack_rewards, damage_taken
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards
 
     def _resolve_give_food(self, interact_actions: torch.Tensor, give_mask: torch.Tensor) -> None:
         """
-        Resolve food giving with direction targeting and HP transfer - FULLY VECTORIZED.
+        Resolve food giving from INVENTORY - FULLY VECTORIZED.
 
-        Giver LOSES HP regardless of whether there's a valid target (costs HP to the void).
-        Target GAINS HP if present.
-        If giver HP < food_value, transfers all remaining HP.
+        Giver transfers from their INVENTORY (no HP cost!).
+        Target receives to their INVENTORY.
+        Only transfers if giver has inventory AND valid target exists.
         """
         food_value = self.config.poor_food_value
 
@@ -534,27 +628,24 @@ class GridWorld:
         if not give_mask.any():
             return
 
-        # === STEP 1: Compute cost amount for each giver ===
-        # cost = min(food_value, giver_hp), but only for givers
-        cost_amount = torch.minimum(
+        # === STEP 1: Compute transfer amount for each giver ===
+        # Can only give what you have in inventory (up to food_value per action)
+        give_amount = torch.minimum(
             torch.full((self.n_agents,), food_value, device=self.device),
-            self.agent_hp
+            self.agent_inventory
         ) * give_mask.float()
 
-        # Valid givers have HP to give
-        valid_giver = give_mask & (cost_amount > 0)
+        # Valid givers have inventory to give
+        valid_giver = give_mask & (give_amount > 0)
 
-        # === STEP 2: Deduct cost from all givers (even to void) ===
-        self.agent_hp = self.agent_hp - cost_amount
-
-        # === STEP 3: Compute target positions ===
-        give_dirs = (interact_actions - GIVE_UP).clamp(0, 7)
-        deltas = self.dir_deltas_8[give_dirs]
+        # === STEP 2: Compute target positions ===
+        give_dirs = (interact_actions - GIVE_UP).clamp(0, 3)
+        deltas = self.dir_deltas_4[give_dirs]
         target_positions = self.agent_positions + deltas
         target_rows = target_positions[:, 0]
         target_cols = target_positions[:, 1]
 
-        # === STEP 4: Check bounds ===
+        # === STEP 3: Check bounds ===
         in_bounds = (
             (target_rows >= 0) & (target_rows < self.grid_size) &
             (target_cols >= 0) & (target_cols < self.grid_size)
@@ -564,7 +655,7 @@ class GridWorld:
         safe_rows = target_rows.clamp(0, self.grid_size - 1)
         safe_cols = target_cols.clamp(0, self.grid_size - 1)
 
-        # === STEP 5: Look up targets ===
+        # === STEP 4: Look up targets ===
         target_ids = self.occupancy[safe_rows, safe_cols]
 
         has_target = target_ids >= 0
@@ -572,22 +663,22 @@ class GridWorld:
         target_alive = self.agent_alive[valid_target_ids] & has_target
         valid_transfer = valid_giver & in_bounds & has_target & target_alive
 
-        # === STEP 6: Transfer HP to targets ===
+        # === STEP 5: Transfer INVENTORY (only if valid target) ===
         transfer_indices = torch.where(valid_transfer)[0]
 
         if transfer_indices.numel() > 0:
             transfer_targets = target_ids[transfer_indices]
-            transfer_values = cost_amount[transfer_indices]
+            transfer_values = give_amount[transfer_indices]
 
-            # Aggregate HP gains per target using scatter_add
-            hp_gain = torch.zeros(self.n_agents, device=self.device)
-            hp_gain.scatter_add_(0, transfer_targets, transfer_values)
+            # Deduct from giver's inventory
+            self.agent_inventory[transfer_indices] -= transfer_values
 
-            # Add HP (clamped to max)
-            self.agent_hp = (self.agent_hp + hp_gain).clamp(max=self.config.max_hp)
+            # Add to target's inventory using scatter_add
+            inventory_gain = torch.zeros(self.n_agents, device=self.device)
+            inventory_gain.scatter_add_(0, transfer_targets, transfer_values)
+            self.agent_inventory = self.agent_inventory + inventory_gain
 
-            # === STEP 7: Update ledger ===
-            # Flatten index for scatter_add on 2D ledger slice
+            # === STEP 6: Update ledger ===
             flat_indices = transfer_indices * self.n_agents + transfer_targets
             ledger_food = self.ledger.tensor[:, :, Ledger.FOOD_GIVEN].view(-1)
             ledger_food.scatter_add_(0, flat_indices, transfer_values)
@@ -595,12 +686,11 @@ class GridWorld:
     def _process_food_eating(self, interact_actions: torch.Tensor) -> torch.Tensor:
         """Process agents eating food on their cells.
 
-        Poor food: eaten automatically by stepping on it
-        Rich food: requires 2+ adjacent agents who both chose COOPERATE action
-        Cooperate action costs 1 HP regardless of success.
+        Poor food: picked up automatically by stepping on it -> goes to INVENTORY
+        Rich food: requires 2+ adjacent agents who both chose COOPERATE action -> goes to INVENTORY
 
         Returns:
-            food_rewards: [n_agents] explicit reward for eating food
+            food_rewards: [n_agents] explicit reward for picking up food
         """
         food_rewards = torch.zeros(self.n_agents, device=self.device)
 
@@ -611,16 +701,12 @@ class GridWorld:
         # Poor food - check which alive agents are on poor food
         on_poor = self.poor_food[rows, cols] & self.agent_alive
 
-        # Explicit reward for eating poor food (100x during warmup)
+        # Explicit reward for picking up poor food (100x during warmup)
         reward_multiplier = 100.0 if self.episode_count <= self.warmup_episodes else 1.0
         food_rewards += on_poor.float() * self.config.r_small * reward_multiplier
 
-        # Update HP for agents eating poor food
-        self.agent_hp = torch.where(
-            on_poor,
-            (self.agent_hp + self.config.poor_food_value).clamp(max=self.config.max_hp),
-            self.agent_hp
-        )
+        # Add poor food to INVENTORY (not HP directly)
+        self.agent_inventory = self.agent_inventory + on_poor.float() * self.config.poor_food_value
 
         # Remove eaten poor food
         poor_food_flat = self.poor_food.view(-1)
@@ -629,9 +715,6 @@ class GridWorld:
 
         # Rich food - requires 2+ adjacent agents who BOTH chose COOPERATE (vectorized)
         coop_mask = (interact_actions == INTERACT_COOPERATE) & self.agent_alive
-
-        # Cooperate action costs 1 HP (even if no food consumed)
-        self.agent_hp = self.agent_hp - coop_mask.float() * 1.0
 
         rich_rewards = self._process_rich_food_vectorized(coop_mask)
         food_rewards += rich_rewards
@@ -652,6 +735,7 @@ class GridWorld:
 
         # Early exit if no rich food or fewer than 2 cooperators
         if n_food == 0 or coop_mask.sum() < 2:
+            self.last_coop_success_count = 0
             return torch.zeros(self.n_agents, device=self.device)
 
         # Compute distance matrix [N, F] - Manhattan distance
@@ -669,12 +753,16 @@ class GridWorld:
         consumed_mask = cooperators_per_food >= 2   # [F] bool
 
         if not consumed_mask.any():
+            self.last_coop_success_count = 0
             return torch.zeros(self.n_agents, device=self.device)
 
-        # HP update: count consumed foods each agent participated in
+        # Track successful cooperations for diagnostics
+        self.last_coop_success_count = consumed_mask.sum().item()
+
+        # INVENTORY update: count consumed foods each agent participated in
         foods_per_agent = eligible.float() @ consumed_mask.float()  # [N]
-        hp_gain = foods_per_agent * self.config.rich_food_value
-        self.agent_hp = (self.agent_hp + hp_gain).clamp(max=self.config.max_hp)
+        inventory_gain = foods_per_agent * self.config.rich_food_value
+        self.agent_inventory = self.agent_inventory + inventory_gain
 
         # Ledger update: cooperation pairs via outer product
         consumed_food_indices = torch.where(consumed_mask)[0]  # [C]
@@ -693,10 +781,77 @@ class GridWorld:
         participated = (foods_per_agent > 0).float()
         return participated * self.config.r_large * reward_multiplier
 
+    def _compute_intrinsic_coop_rewards(self, interact_actions: torch.Tensor) -> torch.Tensor:
+        """
+        Compute intrinsic reward for attempting COOP when conditions are right.
+
+        An agent gets intrinsic reward if:
+        1. They chose the COOP action
+        2. They are within distance 1 of rich food
+        3. Another alive agent is also within distance 1 of the same rich food
+
+        This encourages agents to try COOP even before they coordinate successfully.
+        """
+        intrinsic_rewards = torch.zeros(self.n_agents, device=self.device)
+
+        # Get agents who chose COOP and are alive
+        coop_mask = (interact_actions == INTERACT_COOPERATE) & self.agent_alive
+
+        # Early exit if no cooperators or no rich food
+        if not coop_mask.any():
+            return intrinsic_rewards
+
+        rich_food_coords = torch.nonzero(self.rich_food, as_tuple=False)
+        n_food = rich_food_coords.size(0)
+
+        if n_food == 0:
+            return intrinsic_rewards
+
+        # Compute distance from all agents to all rich food [N, F]
+        agent_pos = self.agent_positions.float()
+        food_pos = rich_food_coords.float()
+        diff = agent_pos.unsqueeze(1) - food_pos.unsqueeze(0)  # [N, F, 2]
+        manhattan_dist = diff.abs().sum(dim=-1)  # [N, F]
+
+        # Find agents within distance 1 of each food [N, F]
+        within_range = (manhattan_dist <= 1) & self.agent_alive.unsqueeze(1)
+
+        # For each food, count how many alive agents are nearby
+        agents_per_food = within_range.sum(dim=0)  # [F]
+
+        # Foods with 2+ agents nearby are "cooperation opportunities"
+        coop_opportunity = agents_per_food >= 2  # [F]
+
+        # An agent gets intrinsic reward if:
+        # - They chose COOP
+        # - They are within range of a food with 2+ agents
+        # Check: for each agent who chose COOP, is there any food they're near that has 2+ agents?
+        near_coop_opportunity = (within_range & coop_opportunity.unsqueeze(0)).any(dim=1)  # [N]
+
+        # Reward agents who chose COOP and are near a coop opportunity
+        reward_mask = coop_mask & near_coop_opportunity
+        intrinsic_rewards = reward_mask.float() * self.config.r_coop_attempt
+
+        return intrinsic_rewards
+
     def _apply_hp_decay(self) -> None:
         """Apply HP decay to all alive agents - fully vectorized."""
         decay = self.config.max_hp * self.config.hp_decay_rate
         self.agent_hp = self.agent_hp - decay * self.agent_alive.float()
+
+    def _consume_inventory(self) -> None:
+        """Auto-heal when HP < max. Free healing, no inventory required."""
+        # How much HP is missing?
+        hp_missing = self.config.max_hp - self.agent_hp
+
+        # Heal up to 10 HP per tick for free (enough to offset HP decay + some)
+        heal_amount = torch.minimum(hp_missing, torch.tensor(10.0, device=self.device))
+
+        # Only heal alive agents with missing HP
+        heal_amount = heal_amount * self.agent_alive.float() * (hp_missing > 0).float()
+
+        # Apply healing (free, no inventory consumed)
+        self.agent_hp = self.agent_hp + heal_amount
 
     def _check_deaths(self) -> torch.Tensor:
         """Mark agents with HP <= 0 as dead and return death penalties."""
@@ -712,35 +867,319 @@ class GridWorld:
 
         return death_rewards
 
+    def _initialize_food_at_capacity(self) -> None:
+        """Initialize food at full capacity on empty cells."""
+        total_cells = self.grid_size * self.grid_size
+        cap_cells = int(total_cells * self.config.food_coverage_cap)
+
+        # Get empty cells (no agent)
+        empty = (self.occupancy == -1)
+        empty_indices = empty.flatten().nonzero(as_tuple=True)[0]
+
+        # Shuffle empty indices for random placement
+        perm = torch.randperm(len(empty_indices), device=self.device)
+        shuffled_indices = empty_indices[perm]
+
+        # Place poor food on first cap_cells positions
+        poor_count = min(cap_cells, len(shuffled_indices))
+        for i in range(poor_count):
+            idx = shuffled_indices[i].item()
+            row, col = idx // self.grid_size, idx % self.grid_size
+            self.poor_food[row, col] = True
+
+        # Place rich food on next cap_cells positions (non-overlapping)
+        # Skip rich food in pretrain mode
+        if not self.config.pretrain_mode:
+            rich_start = poor_count
+            rich_count = min(cap_cells, len(shuffled_indices) - rich_start)
+            for i in range(rich_count):
+                idx = shuffled_indices[rich_start + i].item()
+                row, col = idx // self.grid_size, idx % self.grid_size
+                self.rich_food[row, col] = True
+
+    def _spawn_food_curriculum(self) -> None:
+        """Spawn food for curriculum learning - progressive difficulty."""
+        if self.curriculum_phase >= 6:
+            # Cooperation phases 6-8: spawn rich food, position agents nearby
+            self._spawn_food_coop_curriculum()
+            return
+
+        # Solo phases 1-5: Only use agent 0
+        r, c = self.agent_positions[0][0].item(), self.agent_positions[0][1].item()
+
+        # Phase configs: (distance, cardinal_only)
+        # Phase 1: dist 1, cardinal | Phase 2: dist 2, cardinal
+        # Phase 3: dist 3, any      | Phase 4: dist 7, any
+        # Phase 5: max dist, any (final solo phase)
+        # All distances are bounded by grid_size - 1 to support small grids
+        max_dist = self.grid_size - 1
+        phase_configs = {
+            1: (min(1, max_dist), True),
+            2: (min(2, max_dist), True),
+            3: (min(3, max_dist), False),
+            4: (min(7, max_dist), False),
+            5: (max_dist, False),
+        }
+
+        phase = min(self.curriculum_phase, 5)  # Cap at phase 5 for solo
+        distance, cardinal_only = phase_configs[phase]
+
+        # Find valid positions at the target distance
+        valid_positions = self._get_positions_at_distance(r, c, distance, cardinal_only)
+
+        # Pick one random position and spawn exactly one food
+        if valid_positions:
+            idx = torch.randint(len(valid_positions), (1,)).item()
+            nr, nc = valid_positions[idx]
+            self.poor_food[nr, nc] = True
+
+    def _spawn_food_coop_curriculum(self) -> None:
+        """Spawn RICH food for cooperation curriculum (phases 6-8).
+
+        Places one rich food and positions both agents ADJACENT to it.
+        Phase 6: agents adjacent (distance 1) - just need to learn COOP
+        Phase 7: agents at distance 2 from food
+        Phase 8: agents at distance 3 from food
+
+        Key: Phase 6 makes both agents adjacent so they ONLY need to learn
+        the COOP action, not movement + coordination simultaneously.
+        """
+        # Bound distances by grid_size - 1 to support small grids
+        max_dist = self.grid_size - 1
+        phase_distances = {6: min(1, max_dist), 7: min(2, max_dist), 8: min(3, max_dist)}
+        distance = phase_distances.get(self.curriculum_phase, 1)
+
+        # Place rich food in center of grid
+        center = self.grid_size // 2
+        self.rich_food[center, center] = True
+
+        # Find valid positions for agents at the specified distance from food
+        valid_positions = self._get_positions_at_distance(center, center, distance, cardinal_only=False)
+
+        # Need at least 2 positions for both agents
+        if len(valid_positions) >= 2:
+            # Randomly pick 2 positions for the agents
+            perm = torch.randperm(len(valid_positions))[:2]
+            r0, c0 = valid_positions[perm[0].item()]
+            r1, c1 = valid_positions[perm[1].item()]
+            self.agent_positions[0] = torch.tensor([r0, c0], device=self.device)
+            self.agent_positions[1] = torch.tensor([r1, c1], device=self.device)
+        else:
+            # Fallback: place agents adjacent to food
+            self.agent_positions[0] = torch.tensor([center - 1, center], device=self.device)
+            self.agent_positions[1] = torch.tensor([center, center - 1], device=self.device)
+
+        # Update occupancy after repositioning
+        self._update_occupancy()
+
+    def _get_positions_at_distance(self, r: int, c: int, distance: int, cardinal_only: bool) -> list:
+        """Get all valid grid positions at exact Manhattan distance from (r, c)."""
+        positions = []
+
+        if cardinal_only:
+            # Only 4 cardinal directions
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr * distance, c + dc * distance
+                if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                    positions.append((nr, nc))
+        else:
+            # All positions at exact Manhattan distance
+            for dr in range(-distance, distance + 1):
+                dc_abs = distance - abs(dr)  # Remaining distance for column
+                for dc in ([-dc_abs, dc_abs] if dc_abs > 0 else [0]):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                        positions.append((nr, nc))
+
+        return positions
+
+    def _spawn_food_near(self, agent_pos: torch.Tensor, min_dist: int, max_dist: int, count: int) -> None:
+        """Spawn 'count' food items within distance range of agent."""
+        r, c = agent_pos[0].item(), agent_pos[1].item()
+        candidates = []
+
+        for dr in range(-max_dist, max_dist + 1):
+            for dc in range(-max_dist, max_dist + 1):
+                nr, nc = r + dr, c + dc
+                dist = abs(dr) + abs(dc)  # Manhattan distance
+                if min_dist <= dist <= max_dist:
+                    if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                        if self.occupancy[nr, nc] == -1 and not self.poor_food[nr, nc]:
+                            candidates.append((nr, nc))
+
+        # Randomly select 'count' cells
+        if candidates:
+            perm = torch.randperm(len(candidates))[:count]
+            for idx in perm:
+                nr, nc = candidates[idx]
+                self.poor_food[nr, nc] = True
+
+    def _check_curriculum_advance(self, episode_return: float) -> None:
+        """Track episode returns for curriculum advancement based on thresholds."""
+        # Import thresholds from scenarios module
+        from scenarios import THRESHOLDS
+
+        # Max phase is the highest defined in THRESHOLDS
+        max_phase = max(THRESHOLDS.keys())
+        if self.curriculum_phase >= max_phase:
+            return
+
+        self.episode_returns.append(episode_return)
+
+        # Check advancement every 20 episodes
+        if len(self.episode_returns) >= 20:
+            avg_return = sum(self.episode_returns[-20:]) / 20
+
+            threshold = THRESHOLDS.get(self.curriculum_phase, 999999)
+
+            if avg_return >= threshold and self.curriculum_phase < max_phase:
+                self.curriculum_phase += 1
+                self.episode_returns = []
+                print(f"[Curriculum] Avg return {avg_return:.1f} >= {threshold} -> Advanced to phase {self.curriculum_phase}")
+
+    def advance_curriculum_phase(self) -> bool:
+        """Manually advance curriculum phase. Returns True if advanced, False if already at max."""
+        from scenarios import THRESHOLDS
+        max_phase = max(THRESHOLDS.keys())
+        if self.curriculum_phase >= max_phase:
+            return False
+        self.curriculum_phase += 1
+        self.episode_returns = []
+        print(f"[Curriculum] Advanced to phase {self.curriculum_phase}")
+        return True
+
+    def get_curriculum_phase(self) -> int:
+        """Get current curriculum phase."""
+        return self.curriculum_phase
+
     def _spawn_food(self) -> None:
-        """Spawn new food on empty cells - fully vectorized."""
+        """Spawn new food on empty cells - fully vectorized with caps."""
+        # In curriculum pretrain mode, use scenario-based or legacy curriculum spawning
+        if self.config.pretrain_mode and self.config.curriculum_enabled:
+            self._spawn_food_curriculum_continuous()
+            return
+
         # Mask of empty cells (no agent, no food)
         empty = (self.occupancy == -1) & ~self.poor_food & ~self.rich_food
 
-        # 100x food spawn rate during warmup episodes
-        food_multiplier = 100.0 if self.episode_count <= self.warmup_episodes else 1.0
-        poor_rate = min(1.0, self.config.poor_food_spawn_rate * food_multiplier)
-        rich_rate = min(1.0, self.config.rich_food_spawn_rate * food_multiplier)
+        total_cells = self.grid_size * self.grid_size
+        cap_cells = int(total_cells * self.config.food_coverage_cap)
 
-        # Random spawn probabilities
-        rand = torch.rand((self.grid_size, self.grid_size), device=self.device)
+        # Count current food
+        poor_count = self.poor_food.sum().item()
+        rich_count = self.rich_food.sum().item()
 
-        # Spawn poor food
-        spawn_poor = empty & (rand < poor_rate)
-        self.poor_food = self.poor_food | spawn_poor
+        # Spawn poor food (2x rate if below cap, skip if at cap)
+        if poor_count < cap_cells:
+            poor_multiplier = 2.0
+            poor_rate = min(1.0, self.config.poor_food_spawn_rate * poor_multiplier)
+            rand = torch.rand((self.grid_size, self.grid_size), device=self.device)
+            spawn_poor = empty & (rand < poor_rate)
+            self.poor_food = self.poor_food | spawn_poor
+        else:
+            spawn_poor = torch.zeros_like(empty)
 
-        # Spawn rich food (only where poor didn't spawn)
-        rand2 = torch.rand((self.grid_size, self.grid_size), device=self.device)
-        spawn_rich = empty & ~spawn_poor & (rand2 < rich_rate)
-        self.rich_food = self.rich_food | spawn_rich
+        # Spawn rich food (2x rate if below cap, skip if at cap)
+        # Skip rich food in pretrain mode
+        if not self.config.pretrain_mode and rich_count < cap_cells:
+            rich_multiplier = 2.0
+            rich_rate = min(1.0, self.config.rich_food_spawn_rate * rich_multiplier)
+            rand2 = torch.rand((self.grid_size, self.grid_size), device=self.device)
+            spawn_rich = empty & ~spawn_poor & (rand2 < rich_rate)
+            self.rich_food = self.rich_food | spawn_rich
+
+    def _spawn_food_curriculum_continuous(self) -> None:
+        """Respawn food when eaten during curriculum - delegates to scenario if set."""
+        # If scenario is active, use its respawn logic
+        if self._current_scenario is not None:
+            self._current_scenario.respawn_food(self)
+            return
+
+        # Legacy fallback: cooperation phases 6-8: respawn rich food
+        if self.curriculum_phase >= 6:
+            self._spawn_food_coop_curriculum_continuous()
+            return
+
+        # Legacy fallback: Solo phases 1-5: respawn poor food
+        if self.poor_food.any():
+            return  # Food still exists, don't spawn more
+
+        # Only use agent 0 (the single active agent in pretrain mode)
+        r, c = self.agent_positions[0][0].item(), self.agent_positions[0][1].item()
+
+        # Phase configs: (distance, cardinal_only)
+        # All distances are bounded by grid_size - 1 to support small grids
+        max_dist = self.grid_size - 1
+        phase_configs = {
+            1: (min(1, max_dist), True),
+            2: (min(2, max_dist), True),
+            3: (min(3, max_dist), False),
+            4: (min(7, max_dist), False),
+            5: (max_dist, False),
+        }
+
+        phase = min(self.curriculum_phase, 5)  # Cap at phase 5
+        distance, cardinal_only = phase_configs[phase]
+
+        # Find valid positions and spawn one food
+        valid_positions = self._get_positions_at_distance(r, c, distance, cardinal_only)
+        if valid_positions:
+            idx = torch.randint(len(valid_positions), (1,)).item()
+            nr, nc = valid_positions[idx]
+            self.poor_food[nr, nc] = True
+
+    def _spawn_food_coop_curriculum_continuous(self) -> None:
+        """Respawn rich food for cooperation curriculum when eaten."""
+        if self.rich_food.any():
+            return  # Rich food still exists, don't spawn more
+
+        # Bound distances by grid_size - 1 to support small grids
+        max_dist = self.grid_size - 1
+        phase_distances = {6: min(1, max_dist), 7: min(2, max_dist), 8: min(3, max_dist)}
+        distance = phase_distances.get(self.curriculum_phase, 1)
+
+        # Get positions of both agents
+        r0, c0 = self.agent_positions[0][0].item(), self.agent_positions[0][1].item()
+        r1, c1 = self.agent_positions[1][0].item(), self.agent_positions[1][1].item()
+
+        # Find center point between agents
+        center_r = (r0 + r1) // 2
+        center_c = (c0 + c1) // 2
+
+        # Find positions within 'distance' of BOTH agents (intersection)
+        valid_positions = []
+        for dr in range(-distance * 2, distance * 2 + 1):
+            for dc in range(-distance * 2, distance * 2 + 1):
+                nr, nc = center_r + dr, center_c + dc
+                if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                    # Check distance to both agents
+                    dist0 = abs(nr - r0) + abs(nc - c0)
+                    dist1 = abs(nr - r1) + abs(nc - c1)
+                    # Both agents must be within reach
+                    if dist0 <= distance and dist1 <= distance:
+                        # Don't spawn on agents
+                        if self.occupancy[nr, nc] == -1:
+                            valid_positions.append((nr, nc))
+
+        if valid_positions:
+            idx = torch.randint(len(valid_positions), (1,)).item()
+            nr, nc = valid_positions[idx]
+            self.rich_food[nr, nc] = True
+        else:
+            # Fallback: spawn between the agents if possible
+            if 0 <= center_r < self.grid_size and 0 <= center_c < self.grid_size:
+                if self.occupancy[center_r, center_c] == -1:
+                    self.rich_food[center_r, center_c] = True
 
     def _get_all_observations(self) -> Dict[str, torch.Tensor]:
         """Build batched observations for all agents."""
+        entity_tokens, entity_mask = self._get_entity_tokens()
         return {
-            'spatial': self._get_all_spatial_obs(),
-            'ledger': self.ledger.get_normalized_tensor().unsqueeze(0).expand(self.n_agents, -1, -1, -1),
+            'entity_tokens': entity_tokens,    # [n_agents, max_entities, 8]
+            'entity_mask': entity_mask,        # [n_agents, max_entities]
             'signals': self.signals.float().unsqueeze(0).expand(self.n_agents, -1),
             'self_hp': (self.agent_hp / self.config.max_hp).unsqueeze(1),
+            'self_inventory': (self.agent_inventory / self.config.max_hp).unsqueeze(1),  # Normalized by max_hp
             'agent_id': torch.arange(self.n_agents, device=self.device)
         }
 
@@ -763,22 +1202,22 @@ class GridWorld:
             (intended[..., 0] >= 0) & (intended[..., 0] < gs) &
             (intended[..., 1] >= 0) & (intended[..., 1] < gs)
         )
-        move_mask = in_bounds & self.agent_alive.unsqueeze(1)  # [n, 9]
+        move_mask = in_bounds & self.agent_alive.unsqueeze(1)  # [n, 5]
 
-        # === DIRECTION MASK [n, 8] (for attack/give) ===
-        # Check each of 8 directions: is there a living agent?
-        target_pos = self.agent_positions.unsqueeze(1) + self.dir_deltas_8.unsqueeze(0)  # [n, 8, 2]
+        # === DIRECTION MASK [n, 4] (for attack/give) ===
+        # Check each of 4 cardinal directions: is there a living agent?
+        target_pos = self.agent_positions.unsqueeze(1) + self.dir_deltas_4.unsqueeze(0)  # [n, 4, 2]
         target_in_bounds = (
             (target_pos[..., 0] >= 0) & (target_pos[..., 0] < gs) &
             (target_pos[..., 1] >= 0) & (target_pos[..., 1] < gs)
         )
         safe_rows = target_pos[..., 0].clamp(0, gs - 1)
         safe_cols = target_pos[..., 1].clamp(0, gs - 1)
-        occupants = self.occupancy[safe_rows, safe_cols]  # [n, 8]
+        occupants = self.occupancy[safe_rows, safe_cols]  # [n, 4]
 
         has_target = (occupants >= 0)
         target_alive = self.agent_alive[occupants.clamp(min=0)] & has_target
-        direction_mask = target_in_bounds & target_alive  # [n, 8]
+        direction_mask = target_in_bounds & target_alive  # [n, 4]
 
         # === INTERACT TYPE MASK [n, 5] ===
         # 0=ATTACK: always valid (direction mask handles targeting)
@@ -806,73 +1245,106 @@ class GridWorld:
             'direction_mask': direction_mask
         }
 
-    def _get_all_spatial_obs(self) -> torch.Tensor:
+    def _get_entity_tokens(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get spatial observations for ALL agents at once - FULLY VECTORIZED.
-        Uses unfold for efficient window extraction + F.one_hot for agent IDs.
-        Returns [n_agents, vision_size, vision_size, channels]
+        Create unified entity tokens for agents AND food.
+
+        Token format (8 features):
+            - dx, dy: relative position (normalized by grid size)
+            - entity_type: 0=food, 1=agent
+            - value: quality (food) or hp (agent)
+            - social[4]: interaction history (zeros for food)
+
+        Returns:
+            tokens: [n_agents, max_entities, 8] - padded to max_entities
+            mask: [n_agents, max_entities] - True if token is valid
         """
-        vs = self.config.vision_size
-        half = vs // 2
         n = self.n_agents
-        gs = self.grid_size
-        pad = half
+        gs = self.config.grid_size
+        max_food = self.config.max_food_tokens
+        max_ent = self.config.max_entities  # n_agents + max_food_tokens
 
-        # === STEP 1: Pad all grids ===
-        padded_poor = F.pad(self.poor_food.float().unsqueeze(0).unsqueeze(0),
-                           (pad, pad, pad, pad), value=0).squeeze()
-        padded_rich = F.pad(self.rich_food.float().unsqueeze(0).unsqueeze(0),
-                           (pad, pad, pad, pad), value=0).squeeze()
-        # Add 1 to occupancy so -1 becomes 0 (for safe one_hot indexing)
-        padded_occ = F.pad((self.occupancy + 1).float().unsqueeze(0).unsqueeze(0),
-                          (pad, pad, pad, pad), value=0).squeeze()
+        # Initialize output tensors
+        tokens = torch.zeros(n, max_ent, 8, device=self.device)
+        mask = torch.zeros(n, max_ent, device=self.device, dtype=torch.bool)
 
-        # === STEP 2: Use unfold to extract ALL windows at once ===
-        # unfold extracts sliding windows: [H, W] -> [H-vs+1, W-vs+1, vs, vs]
-        poor_windows = padded_poor.unfold(0, vs, 1).unfold(1, vs, 1)  # [gs, gs, vs, vs]
-        rich_windows = padded_rich.unfold(0, vs, 1).unfold(1, vs, 1)
-        occ_windows = padded_occ.unfold(0, vs, 1).unfold(1, vs, 1)
+        # === AGENT TOKENS (first n_agents slots) ===
+        # Relative positions: pos[j] - pos[i] for all pairs
+        # Scale by 5x after normalization so positions have stronger signal in embeddings
+        rel_pos_agents = (self.agent_positions.unsqueeze(0) - self.agent_positions.unsqueeze(1)).float()
+        rel_pos_agents = (rel_pos_agents / gs) * 5.0  # Normalize and scale up
 
-        # === STEP 3: Index into windows at agent positions ===
-        rows = self.agent_positions[:, 0]
-        cols = self.agent_positions[:, 1]
+        # Agent features
+        agent_type = torch.ones(n, n, 1, device=self.device)  # type=1 for agents
+        agent_hp = (self.agent_hp / self.config.max_hp).view(1, n, 1).expand(n, n, 1)
+        # Scale social features by 5x to match position feature magnitude
+        social = self.ledger.get_normalized_tensor() * 5.0  # [n, n, 4] scaled to [0, 5]
 
-        # Extract windows for each agent: [n_agents, vs, vs]
-        agent_poor = poor_windows[rows, cols]
-        agent_rich = rich_windows[rows, cols]
-        agent_occ = occ_windows[rows, cols]  # values are (agent_id + 1), 0 means empty
+        # Combine: [n, n, 8] = dx, dy, type, hp, social[4]
+        agent_tokens = torch.cat([rel_pos_agents, agent_type, agent_hp, social], dim=-1)
+        tokens[:, :n, :] = agent_tokens
 
-        # Restore to original agent_id (-1 for empty, but we'll use 0+ for indexing)
-        agent_occ_ids = agent_occ.long() - 1  # [n_agents, vs, vs], -1 = empty
+        # Agent mask: alive agents are valid
+        mask[:, :n] = self.agent_alive.unsqueeze(0).expand(n, n)
 
-        # === STEP 4: Build observation channels ===
-        # Channels: 0=Empty, 1=Poor food, 2=Rich food, 3=Agent health, 4+=One-hot agent ID
-        n_channels = 4 + self.n_agents
-        obs = torch.zeros((n, vs, vs, n_channels), device=self.device)
+        # === FOOD TOKENS (next max_food_tokens slots) ===
+        # Gather all food positions
+        poor_coords = torch.nonzero(self.poor_food, as_tuple=False)  # [F1, 2]
+        rich_coords = torch.nonzero(self.rich_food, as_tuple=False)  # [F2, 2]
 
-        # Channel 1: Poor food
-        obs[:, :, :, 1] = agent_poor
+        # Combine with quality indicator (0.5 for poor, 1.0 for rich)
+        if poor_coords.numel() > 0:
+            poor_quality = torch.full((poor_coords.shape[0], 1), 0.5, device=self.device)
+            poor_food = torch.cat([poor_coords.float(), poor_quality], dim=-1)  # [F1, 3]
+        else:
+            poor_food = torch.zeros(0, 3, device=self.device)
 
-        # Channel 2: Rich food
-        obs[:, :, :, 2] = agent_rich
+        if rich_coords.numel() > 0:
+            rich_quality = torch.full((rich_coords.shape[0], 1), 1.0, device=self.device)
+            rich_food = torch.cat([rich_coords.float(), rich_quality], dim=-1)  # [F2, 3]
+        else:
+            rich_food = torch.zeros(0, 3, device=self.device)
 
-        # === STEP 5: One-hot Agent ID channels (4 to 4+n_agents) - VECTORIZED ===
-        # F.one_hot on clamped IDs, then mask out empty cells
-        agent_present = (agent_occ_ids >= 0)
-        safe_ids_for_onehot = agent_occ_ids.clamp(min=0)
-        one_hot = F.one_hot(safe_ids_for_onehot, num_classes=self.n_agents).float()
-        # Zero out one-hot for empty cells
-        one_hot = one_hot * agent_present.unsqueeze(-1).float()
-        obs[:, :, :, 4:4+self.n_agents] = one_hot
+        # Combine all food: [F, 3] where columns are (row, col, quality)
+        all_food = torch.cat([poor_food, rich_food], dim=0)
+        n_food = all_food.shape[0]
 
-        # Channel 3: Agent health (normalized) - only where agent present
-        hp_values = self.agent_hp[safe_ids_for_onehot] / self.config.max_hp
-        obs[:, :, :, 3] = torch.where(agent_present, hp_values, torch.zeros_like(hp_values))
+        if n_food > 0:
+            # For each agent, compute distance to each food and select K nearest
+            agent_pos = self.agent_positions.float()  # [n, 2]
+            food_pos = all_food[:, :2]  # [F, 2]
+            food_quality = all_food[:, 2]  # [F]
 
-        # Channel 0: Empty (not food and not agent)
-        obs[:, :, :, 0] = (~(agent_poor.bool() | agent_rich.bool() | agent_present)).float()
+            # Relative positions: food_pos - agent_pos -> [n, F, 2]
+            rel_pos_food = food_pos.unsqueeze(0) - agent_pos.unsqueeze(1)
 
-        return obs
+            # Manhattan distance for sorting
+            dist = rel_pos_food.abs().sum(dim=-1)  # [n, F]
+
+            # Get K nearest for each agent
+            k = min(max_food, n_food)
+            _, nearest_idx = dist.topk(k, dim=1, largest=False)  # [n, k]
+
+            # Gather nearest food positions and qualities
+            batch_idx = torch.arange(n, device=self.device).unsqueeze(1).expand(n, k)
+            nearest_rel_pos = rel_pos_food[batch_idx, nearest_idx]  # [n, k, 2]
+            nearest_quality = food_quality[nearest_idx]  # [n, k]
+
+            # Normalize and scale up positions (5x for stronger signal)
+            nearest_rel_pos = (nearest_rel_pos / gs) * 5.0
+
+            # Build food tokens: [dx, dy, type=0, quality, 0, 0, 0, 0]
+            food_type = torch.zeros(n, k, 1, device=self.device)  # type=0 for food
+            food_val = nearest_quality.unsqueeze(-1)  # [n, k, 1]
+            food_social = torch.zeros(n, k, 4, device=self.device)  # No social for food
+
+            food_tokens = torch.cat([nearest_rel_pos, food_type, food_val, food_social], dim=-1)
+
+            # Place in output (after agent tokens)
+            tokens[:, n:n+k, :] = food_tokens
+            mask[:, n:n+k] = True
+
+        return tokens, mask
 
 
 # Wrapper for backward compatibility with dict-based API
