@@ -24,7 +24,7 @@ from utils import set_seed, get_device
 from scenarios import CURRICULUM, THRESHOLDS
 
 
-def apply_scripted_partner(env, interact_actions: torch.Tensor, relationship: str = 'ally') -> torch.Tensor:
+def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally') -> torch.Tensor:
     """
     Override partner agents' actions based on relationship type.
 
@@ -38,14 +38,22 @@ def apply_scripted_partner(env, interact_actions: torch.Tensor, relationship: st
         Agent 1 is always ally (coops), agent 2+ are enemies (attack).
 
     This provides consistent partner behavior matching the injected history.
+
+    Unified action space:
+        0-4: Movement (UP, DOWN, LEFT, RIGHT, STAY)
+        5-8: ATTACK (UP, DOWN, LEFT, RIGHT)
+        9-12: GIVE (UP, DOWN, LEFT, RIGHT)
+        13: SIGNAL
+        14: COOPERATE
     """
-    INTERACT_COOPERATE = 9
-    INTERACT_IDLE = 10
-    # Attack directions: 0=up, 1=down, 2=left, 3=right
-    ATTACK_UP, ATTACK_DOWN, ATTACK_LEFT, ATTACK_RIGHT = 0, 1, 2, 3
+    # Movement actions: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY
+    ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTION_STAY = 0, 1, 2, 3, 4
+    ACTION_COOPERATE = 14
+    # Attack directions: 5=UP, 6=DOWN, 7=LEFT, 8=RIGHT
+    ACTION_ATTACK_UP, ACTION_ATTACK_DOWN, ACTION_ATTACK_LEFT, ACTION_ATTACK_RIGHT = 5, 6, 7, 8
 
     pos0 = env.agent_positions[0].float()
-    interact_actions = interact_actions.clone()
+    actions = actions.clone()
 
     # Determine which agents are allies vs enemies
     n_active = env.agent_alive.sum().item()
@@ -61,28 +69,51 @@ def apply_scripted_partner(env, interact_actions: torch.Tensor, relationship: st
         ally_agents = [1] if n_active > 1 else []
         enemy_agents = list(range(2, int(n_active)))
     else:
-        return interact_actions
+        return actions
 
-    # Apply ally behavior: coop when near rich food with agent 0
+    # Apply ally behavior: move towards rich food, coop when both agents adjacent
     rich_coords = torch.nonzero(env.rich_food, as_tuple=False)
     for agent_id in ally_agents:
         if not env.agent_alive[agent_id]:
             continue
         pos_a = env.agent_positions[agent_id].float()
 
-        # Default to idle for allies
-        interact_actions[agent_id] = INTERACT_IDLE
+        # Default to STAY
+        actions[agent_id] = ACTION_STAY
 
         if rich_coords.numel() > 0:
+            # Find closest rich food
+            best_food = None
+            best_dist = float('inf')
             for food_pos in rich_coords:
                 food_pos_f = food_pos.float()
-                dist0 = (pos0 - food_pos_f).abs().sum()
-                dist_a = (pos_a - food_pos_f).abs().sum()
+                dist_a = (pos_a - food_pos_f).abs().sum().item()
+                if dist_a < best_dist:
+                    best_dist = dist_a
+                    best_food = food_pos_f
+
+            if best_food is not None:
+                dist0 = (pos0 - best_food).abs().sum().item()
+                dist_a = best_dist
 
                 if dist0 <= 1 and dist_a <= 1:
                     # Both near food - ally coops
-                    interact_actions[agent_id] = INTERACT_COOPERATE
-                    break
+                    actions[agent_id] = ACTION_COOPERATE
+                elif dist_a > 1:
+                    # Not adjacent to food - move towards it
+                    diff = best_food - pos_a  # Direction to food
+                    # Prioritize larger distance axis
+                    if abs(diff[0]) >= abs(diff[1]):
+                        if diff[0] < 0:
+                            actions[agent_id] = ACTION_UP
+                        elif diff[0] > 0:
+                            actions[agent_id] = ACTION_DOWN
+                    else:
+                        if diff[1] < 0:
+                            actions[agent_id] = ACTION_LEFT
+                        elif diff[1] > 0:
+                            actions[agent_id] = ACTION_RIGHT
+                # else: adjacent to food but agent 0 not there yet - STAY
 
     # Apply enemy behavior: attack agent 0 when adjacent
     for agent_id in enemy_agents:
@@ -94,18 +125,18 @@ def apply_scripted_partner(env, interact_actions: torch.Tensor, relationship: st
 
         if dist == 1:  # Adjacent
             if diff[0] == -1:  # Agent 0 is above
-                interact_actions[agent_id] = ATTACK_UP
+                actions[agent_id] = ACTION_ATTACK_UP
             elif diff[0] == 1:  # Agent 0 is below
-                interact_actions[agent_id] = ATTACK_DOWN
+                actions[agent_id] = ACTION_ATTACK_DOWN
             elif diff[1] == -1:  # Agent 0 is left
-                interact_actions[agent_id] = ATTACK_LEFT
+                actions[agent_id] = ACTION_ATTACK_LEFT
             elif diff[1] == 1:  # Agent 0 is right
-                interact_actions[agent_id] = ATTACK_RIGHT
+                actions[agent_id] = ACTION_ATTACK_RIGHT
         else:
-            # Not adjacent - idle
-            interact_actions[agent_id] = INTERACT_IDLE
+            # Not adjacent - stay in place
+            actions[agent_id] = ACTION_STAY
 
-    return interact_actions
+    return actions
 
 
 def save_pretrained(network, path: str, curriculum_phase: int = None):
@@ -124,6 +155,11 @@ def load_pretrained(networks, path: str, env=None):
     Handles architecture mismatches by loading only compatible layers.
     """
     checkpoint = torch.load(path, weights_only=False)
+
+    # Check if this is a recording file instead of a model checkpoint
+    if 'steps' in checkpoint and 'ledger_snapshots' in checkpoint:
+        raise ValueError(f"'{path}' is an episode recording file, not a model checkpoint. "
+                        f"Use a checkpoint file (e.g., final_model.pt or checkpoint_*.pt) instead.")
 
     # Handle different checkpoint formats
     if 'network_state_dicts' in checkpoint:
@@ -187,6 +223,9 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
     """
     Test if model moves toward food in all 4 directions.
 
+    With unified action space, we check that the model selects move actions (0-4)
+    instead of interactions when food is adjacent.
+
     Returns:
         (num_correct, details): num_correct out of 4, and list of (direction, expected, actual, prob)
     """
@@ -218,6 +257,7 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
     # Values are in grid cells (will be normalized by grid_size then scaled by 5x)
     # For distance 1: 1/15 * 5 = 0.333 in token
     # row_diff > 0 = food DOWN, col_diff > 0 = food RIGHT
+    # In unified action space, movement actions are 0-4: UP, DOWN, LEFT, RIGHT, STAY
     gs = config.grid_size
     dist1 = 1.0 / gs  # Distance 1 in normalized coords (before 5x scaling in create_obs)
     tests = [
@@ -235,9 +275,11 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
     with torch.no_grad():
         for dx, dy, name, expected_idx in tests:
             obs = create_obs(dx, dy)
-            hidden = model._encode(obs)
-            logits = model.move_head(hidden)
-            probs = F.softmax(logits, dim=-1).squeeze()
+            # Unified action head returns logits for all 15 actions
+            action_logits, _ = model.forward(obs)
+            # Extract move action probs (first 5 actions)
+            move_logits = action_logits[:, :5]
+            probs = F.softmax(move_logits, dim=-1).squeeze()
 
             best_action = probs.argmax().item()
             expected_prob = probs[expected_idx].item()
@@ -435,47 +477,48 @@ def train(config: Config = None, visualize: bool = False,
             global_step += config.n_agents
 
             # obs is already batched from vectorized env
-            # Get action masks and actions from each agent's policy
+            # Get action mask and actions from each agent's policy
             with torch.no_grad():
-                action_masks = env.get_action_masks()
+                action_mask = env.get_action_masks()  # Now returns [n_agents, 15] tensor
 
                 # In coop phases (6-8), mask out attack actions for BOTH agents (learn to cooperate, not fight)
+                # Attack actions are 5-8 in unified action space
                 if scenario_config is not None and scenario_config.partner_mode == "always_coop":
-                    action_masks['interact_type_mask'][0, 0] = False  # Disable ATTACK for agent 0
-                    action_masks['interact_type_mask'][1, 0] = False  # Disable ATTACK for agent 1 (partner)
+                    action_mask[0, 5:9] = False  # Disable ATTACK for agent 0
+                    action_mask[1, 5:9] = False  # Disable ATTACK for agent 1 (partner)
 
                 # In scripted social phases, mask based on relationship
                 if scenario_config is not None and scenario_config.partner_mode == "scripted":
                     if env.partner_relationship == 'ally':
-                        action_masks['interact_type_mask'][0, 0] = False  # Disable ATTACK for agent 0
-                        action_masks['interact_type_mask'][1, 0] = False  # Disable ATTACK for agent 1 (partner)
+                        action_mask[0, 5:9] = False  # Disable ATTACK for agent 0
+                        action_mask[1, 5:9] = False  # Disable ATTACK for agent 1 (partner)
 
-                move_actions, interact_actions, log_probs, _, values = \
-                    multi_agent.get_actions_and_values(obs, action_masks=action_masks)
+                actions, log_probs, _, values = \
+                    multi_agent.get_actions_and_values(obs, action_mask=action_mask)
 
             # Apply scripted partner behavior (phases 6-8: always coop)
             if scenario_config is not None and scenario_config.partner_mode == "always_coop":
-                interact_actions = apply_scripted_partner(env, interact_actions, relationship='ally')
+                actions = apply_scripted_partner(env, actions, relationship='ally')
 
             # Apply scripted partner behavior (phase 9+: ally or enemy based on relationship)
             if scenario_config is not None and scenario_config.partner_mode == "scripted":
-                interact_actions = apply_scripted_partner(env, interact_actions, relationship=env.partner_relationship)
+                actions = apply_scripted_partner(env, actions, relationship=env.partner_relationship)
 
             # Record training step (before env.step so we capture pre-step state)
             if recording_this_update and episodes_this_rollout == 0:
-                actions_dict = {i: (move_actions[i].item(), interact_actions[i].item()) for i in range(config.n_agents)}
+                # Unified action - store as single value per agent
+                actions_dict = {i: actions[i].item() for i in range(config.n_agents)}
                 values_np = values.cpu().numpy()
 
                 # Capture action probabilities for visualization
-                move_probs, interact_probs = multi_agent.get_action_probs(obs, action_masks)
-                move_probs_np = move_probs.cpu().numpy()
-                interact_probs_np = interact_probs.cpu().numpy()
+                action_probs = multi_agent.get_action_probs(obs, action_mask)
+                action_probs_np = action_probs.cpu().numpy()
 
                 recorder.record(env, actions=actions_dict, values=values_np,
-                               move_probs=move_probs_np, interact_probs=interact_probs_np)
+                               action_probs=action_probs_np)
 
-            # Environment step (tensor-based API)
-            next_obs, rewards, dones, infos = env.step(move_actions, interact_actions)
+            # Environment step (tensor-based API - unified action)
+            next_obs, rewards, dones, infos = env.step(actions)
 
             # Update recorded step with rewards
             if recording_this_update and episodes_this_rollout == 0 and recorder.steps:
@@ -491,11 +534,11 @@ def train(config: Config = None, visualize: bool = False,
             # Store per-agent to individual buffers (only active agents)
             for i in range(multi_agent.n_active):
                 obs_i = {k: v[i] for k, v in obs.items()}
-                masks_i = {k: v[i] for k, v in action_masks.items()}
+                mask_i = action_mask[i]
                 buffers[i].store(
-                    obs_i, move_actions[i], interact_actions[i],
+                    obs_i, actions[i],
                     log_probs[i], rewards[i], dones[i], values[i],
-                    action_masks=masks_i
+                    action_mask=mask_i
                 )
 
             obs = next_obs
@@ -568,19 +611,19 @@ def train(config: Config = None, visualize: bool = False,
 
         # === DIAGNOSTIC: Check actions taken ===
         if update % 50 == 0:
-            # Count MOVE actions for agent 0
-            move_actions = buffers[0].move_actions
-            move_counts = torch.bincount(move_actions.long(), minlength=5)
+            # Unified action space: 0-4 move, 5-8 attack, 9-12 give, 13 signal, 14 coop
+            actions_taken = buffers[0].actions
+            action_counts = torch.bincount(actions_taken.long(), minlength=15)
+
+            # Movement actions (0-4)
             move_names = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'STAY']
-            move_str = ', '.join([f"{move_names[i]}={move_counts[i].item()}" for i in range(5)])
+            move_str = ', '.join([f"{move_names[i]}={action_counts[i].item()}" for i in range(5)])
             print(f"  [Diag] Moves (128 steps): {move_str}")
 
-            # Count interact actions for agent 0 (full buffer)
-            actions_taken = buffers[0].interact_actions
-            action_counts = torch.bincount(actions_taken.long(), minlength=11)
-            print(f"  [Diag] Interact: ATK={action_counts[:4].sum().item()}, "
-                  f"GIVE={action_counts[4:8].sum().item()}, SIG={action_counts[8].item()}, "
-                  f"COOP={action_counts[9].item()}, IDLE={action_counts[10].item()}")
+            # Interaction actions (5-14)
+            print(f"  [Diag] Interact: ATK={action_counts[5:9].sum().item()}, "
+                  f"GIVE={action_counts[9:13].sum().item()}, SIG={action_counts[13].item()}, "
+                  f"COOP={action_counts[14].item()}")
 
             # Coop phase diagnostic: show successful cooperations
             if env.get_curriculum_phase() >= 6:

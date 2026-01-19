@@ -14,10 +14,10 @@ class Config:
     hp_decay_rate: float = 0.01   # Fraction of max HP lost per tick (1 HP/tick)
     max_steps_per_episode: int = 128
 
-    # Actions
-    n_move_actions: int = 5      # UP, DOWN, LEFT, RIGHT, STAY
-    n_interact_actions: int = 11  # ATTACK x4, GIVE x4, SIGNAL, COOPERATE, IDLE (env format)
-    n_interact_types: int = 5    # Factorized: ATTACK, GIVE, SIGNAL, COOPERATE, IDLE
+    # Actions - unified action space (move OR interact, not both)
+    n_actions: int = 15          # 5 move + 10 interact (no IDLE)
+    n_move_actions: int = 5      # UP, DOWN, LEFT, RIGHT, STAY (actions 0-4)
+    n_interact_actions: int = 10 # ATTACK x4, GIVE x4, SIGNAL, COOPERATE (actions 5-14, no IDLE)
     n_directions: int = 4        # 4 cardinal directions for ATTACK/GIVE
 
     # Entity tokens (unified agents + food representation)

@@ -253,6 +253,27 @@ class CoopFoodScenario(Scenario):
         return positions
 
 
+class CoopFoodLowHPScenario(CoopFoodScenario):
+    """Phase 8.5: Same as CoopFoodScenario but agents start at 50% HP.
+
+    This teaches agents to cooperate even when wounded, preventing the
+    "desperation aggression" behavior where low-HP agents attack allies.
+    """
+
+    def __init__(self, distance: int, hp_fraction: float = 0.5):
+        super().__init__(distance)
+        self.hp_fraction = hp_fraction
+
+    def setup(self, env: 'GridWorld') -> None:
+        """Position 2 agents near rich food, but at reduced HP."""
+        # Call parent setup first
+        super().setup(env)
+
+        # Reduce HP for active agents
+        for i in range(2):
+            env.agent_hp[i] = env.config.max_hp * self.hp_fraction
+
+
 # =============================================================================
 # SOCIAL PHASES (9+): Multiple agents with social dynamics
 # =============================================================================
@@ -881,13 +902,17 @@ def get_curriculum() -> dict:
         7: CoopFoodScenario(distance=2),
         8: CoopFoodScenario(distance=3),
 
-        # Social pretraining (phases 9-11)
-        # Phase 9: 3 agents - agent 1 always ally, agent 2 can be enemy (20%)
+        # Low-HP cooperation (phase 9) - teaches cooperation when wounded
+        # Prevents "desperation aggression" where low-HP agents attack allies
+        9: CoopFoodLowHPScenario(distance=3, hp_fraction=0.5),
+
+        # Social pretraining (phases 10-12)
+        # Phase 10: 3 agents - agent 1 always ally, agent 2 can be enemy (20%)
         # This teaches discrimination: friend vs foe when both present
-        9: SocialScenario(n_agents=3, inject_histories=True, scripted_partners=True, enemy_prob=0.2, always_one_ally=True),
-        # Phase 10: Cloned weights, coherent friend/foe histories (learn to discriminate)
-        10: SocialScenario(n_agents=4, inject_histories=True, clone_weights=True, coherent_histories=True),
-        11: SocialScenario(n_agents=8, inject_histories=False),
+        10: SocialScenario(n_agents=3, inject_histories=True, scripted_partners=True, enemy_prob=0.2, always_one_ally=True),
+        # Phase 11: Cloned weights, coherent friend/foe histories (learn to discriminate)
+        11: SocialScenario(n_agents=4, inject_histories=True, clone_weights=True, coherent_histories=True),
+        12: SocialScenario(n_agents=8, inject_histories=False),
     }
 
 
@@ -907,10 +932,14 @@ def get_thresholds() -> dict:
         7: 448,
         8: 294,
 
+        # Low-HP coop phase: same mission as phase 8 but at 50% HP
+        # Slightly lower threshold since survival is harder
+        9: 250,   # 2 agents at 50% HP, must cooperate without attacking ally
+
         # Social phases
-        9: 800,   # 2-agent with scripted ally - must learn reliable cooperation
-        10: 500,  # 4-agent with cloned weights, coherent friend/foe histories
-        11: 60,   # Full population emergent learning
+        10: 800,  # 3-agent with scripted ally - must learn reliable cooperation
+        11: 500,  # 4-agent with cloned weights, coherent friend/foe histories
+        12: 60,   # Full population emergent learning
     }
 
 
