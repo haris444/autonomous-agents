@@ -893,18 +893,19 @@ class GridWorld:
         self.agent_hp = self.agent_hp - decay * self.agent_alive.float()
 
     def _consume_inventory(self) -> None:
-        """Auto-heal when HP < max. Free healing, no inventory required."""
+        """Auto-consume inventory to heal. 1 inventory = 1 HP restored."""
         # How much HP is missing?
         hp_missing = self.config.max_hp - self.agent_hp
 
-        # Heal up to 10 HP per tick for free (enough to offset HP decay + some)
-        heal_amount = torch.minimum(hp_missing, torch.tensor(10.0, device=self.device))
+        # Heal amount is minimum of: missing HP, available inventory
+        heal_amount = torch.minimum(hp_missing, self.agent_inventory)
 
         # Only heal alive agents with missing HP
         heal_amount = heal_amount * self.agent_alive.float() * (hp_missing > 0).float()
 
-        # Apply healing (free, no inventory consumed)
+        # Apply healing and deduct from inventory
         self.agent_hp = self.agent_hp + heal_amount
+        self.agent_inventory = self.agent_inventory - heal_amount
 
     def _check_deaths(self) -> torch.Tensor:
         """Mark agents with HP <= 0 as dead and return death penalties."""

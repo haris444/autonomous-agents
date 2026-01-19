@@ -40,7 +40,7 @@ class Config:
     r_large: float = 20.0       # Eat rich food (coop)
     r_attack_mult: float = 0.1  # Attack reward = 10% of ALL damage dealt (5x reduced)
     r_damage_taken: float = -1.0  # Penalty per HP lost (scaled by HP ratio)
-    r_low_hp: float = -0.0625   # Per-tick penalty when HP is low (minimal signal)
+    r_low_hp: float = -3.125    # Per-tick penalty when HP is low (50x original)
     r_food_share: float = 0.0   # No bonus - giving food already transfers HP naturally
     r_defense: float = 0.0      # No bonus - defense value is in the OBSERVATION, not reward
     r_revenge: float = 0.5      # Bonus for retaliating against attackers (50% of damage dealt)

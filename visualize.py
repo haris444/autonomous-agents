@@ -1079,7 +1079,7 @@ def visualize_trained_agent(model_path: str, config: Config = None,
 
 
 if __name__ == "__main__":
-    # Demo with random environment
+    # Demo with random environment - animated episode replay
     import torch
     from environment import GridWorld
     from utils import set_seed, get_device
@@ -1091,14 +1091,27 @@ if __name__ == "__main__":
     env = GridWorld(config, device)
     env.reset()
 
-    # Run a few random steps with unified action space (0-14)
-    for _ in range(10):
+    # Record an episode with random actions
+    recorder = EpisodeRecorder(config)
+    recorder.record(env)  # Record initial state
+
+    num_steps = 50  # Run 50 steps for demo
+    for step in range(num_steps):
         actions = torch.randint(0, 15, (config.n_agents,), device=device)
-        env.step(actions)
+        rewards, dones, info = env.step(actions)
 
-    # Render
-    renderer = GridRenderer(config)
-    renderer.render_with_health_bars(env)
+        # Convert to dicts for recording
+        actions_dict = {i: actions[i].item() for i in range(config.n_agents)}
+        rewards_dict = {i: rewards[i].item() for i in range(config.n_agents)}
 
-    # Show ledger
-    render_ledger_heatmaps(env.ledger.get_tensor())
+        recorder.record(env, actions=actions_dict, rewards=rewards_dict)
+
+    # Replay the recorded episode with animation
+    print(f"Replaying {len(recorder.steps)} frames...")
+    replay_episode(
+        recording=recorder.get_recording(),
+        config=config,
+        speed=1.0,
+        ledger_snapshots=recorder.ledger_snapshots,
+        show_ledger=True
+    )

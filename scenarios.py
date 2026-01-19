@@ -288,7 +288,7 @@ class SocialScenario(Scenario):
         scripted_partners: bool = False,
         clone_weights: bool = False,
         coherent_histories: bool = False,
-        enemy_prob: float = 0.2,
+        neutral_prob: float = 0.2,
         always_one_ally: bool = False,  # Ensure agent 1 is always an ally
     ):
         self.n_agents = n_agents
@@ -296,7 +296,7 @@ class SocialScenario(Scenario):
         self.scripted_partners = scripted_partners
         self.clone_weights = clone_weights
         self.coherent_histories = coherent_histories
-        self.enemy_prob = enemy_prob
+        self.neutral_prob = neutral_prob
         self.always_one_ally = always_one_ally
 
     def get_config(self) -> ScenarioConfig:
@@ -313,20 +313,32 @@ class SocialScenario(Scenario):
         self._position_agents(env)
 
         if self.scripted_partners:
-            if self.always_one_ally and self.n_agents >= 3:
-                # Mixed scenario: agent 1 is always ally, agent 2+ can be enemy
-                has_enemy = random.random() < self.enemy_prob
-                env.partner_relationship = 'mixed' if has_enemy else 'ally'
-                self._inject_mixed_histories(env, has_enemy)
+            if self.n_agents == 2 and self.neutral_prob > 0:
+                # 2-agent mode: partner is either friend (scripted ally) or neutral (learning)
+                is_neutral = random.random() < self.neutral_prob
+                env.partner_relationship = 'neutral' if is_neutral else 'ally'
+                if env.partner_relationship == 'ally':
+                    self._inject_ally_histories(env)
+                # For neutral: no history injected (stranger), learned policy used
+            elif self.always_one_ally and self.n_agents >= 3:
+                # Mixed scenario: agent 1 is always ally, agent 2+ can be neutral
+                has_neutral = random.random() < self.neutral_prob
+                env.partner_relationship = 'mixed' if has_neutral else 'ally'
+                self._inject_mixed_histories(env, has_neutral)
             else:
                 # Original behavior: all partners are ally OR all are enemy
-                env.partner_relationship = 'enemy' if random.random() < self.enemy_prob else 'ally'
+                env.partner_relationship = 'enemy' if random.random() < self.neutral_prob else 'ally'
                 if env.partner_relationship == 'ally':
                     self._inject_ally_histories(env)
                 else:
                     self._inject_enemy_histories(env)
         elif self.inject_histories:
-            if self.coherent_histories:
+            if self.always_one_ally and self.n_agents >= 3:
+                # Learning mode with guaranteed ally + possible neutral
+                has_neutral = random.random() < self.neutral_prob
+                env.partner_relationship = 'mixed' if has_neutral else 'ally'
+                self._inject_mixed_histories(env, has_neutral)
+            elif self.coherent_histories:
                 self._inject_coherent_histories(env)
             else:
                 self._inject_random_histories(env)
@@ -445,10 +457,10 @@ class SocialScenario(Scenario):
             env.ledger.tensor[0, enemy_id, Ledger.COOP_COUNT] = random.uniform(0, 1)
             env.ledger.tensor[0, enemy_id, Ledger.DEFENSE_SCORE] = 0.0
 
-    def _inject_mixed_histories(self, env: 'GridWorld', has_enemy: bool) -> None:
-        """Inject mixed histories: agent 1 is always ally, agent 2 can be enemy.
+    def _inject_mixed_histories(self, env: 'GridWorld', has_neutral: bool) -> None:
+        """Inject mixed histories: agent 1 is always ally, agent 2 can be neutral.
 
-        This teaches agent 0 to discriminate between friends and foes
+        This teaches agent 0 to discriminate between friends and strangers
         when both are present simultaneously.
         """
         from ledger import Ledger
@@ -464,19 +476,12 @@ class SocialScenario(Scenario):
         env.ledger.tensor[0, 1, Ledger.DEFENSE_SCORE] = random.uniform(10, 30)
         env.ledger.tensor[0, 1, Ledger.DAMAGE_DEALT] = 0.0
 
-        # Agent 2+ depends on has_enemy flag
+        # Agent 2+ depends on has_neutral flag
         for partner_id in range(2, self.n_agents):
-            if has_enemy:
-                # Enemy history
-                env.ledger.tensor[partner_id, 0, Ledger.DAMAGE_DEALT] = random.uniform(40, 70)
-                env.ledger.tensor[partner_id, 0, Ledger.FOOD_GIVEN] = 0.0
-                env.ledger.tensor[partner_id, 0, Ledger.COOP_COUNT] = random.uniform(0, 1)
-                env.ledger.tensor[partner_id, 0, Ledger.DEFENSE_SCORE] = 0.0
-
-                env.ledger.tensor[0, partner_id, Ledger.DAMAGE_DEALT] = random.uniform(20, 50)
-                env.ledger.tensor[0, partner_id, Ledger.FOOD_GIVEN] = 0.0
-                env.ledger.tensor[0, partner_id, Ledger.COOP_COUNT] = random.uniform(0, 1)
-                env.ledger.tensor[0, partner_id, Ledger.DEFENSE_SCORE] = 0.0
+            if has_neutral:
+                # Neutral: no history at all (stranger)
+                env.ledger.tensor[partner_id, 0, :] = 0.0
+                env.ledger.tensor[0, partner_id, :] = 0.0
             else:
                 # Ally history
                 env.ledger.tensor[partner_id, 0, Ledger.FOOD_GIVEN] = random.uniform(40, 60)
@@ -489,8 +494,8 @@ class SocialScenario(Scenario):
                 env.ledger.tensor[0, partner_id, Ledger.DEFENSE_SCORE] = random.uniform(10, 30)
                 env.ledger.tensor[0, partner_id, Ledger.DAMAGE_DEALT] = 0.0
 
-        # Allies (agent 1 + non-enemy partners) have positive histories with each other
-        ally_ids = [1] + [i for i in range(2, self.n_agents) if not has_enemy]
+        # Allies (agent 1 + non-neutral partners) have positive histories with each other
+        ally_ids = [1] + [i for i in range(2, self.n_agents) if not has_neutral]
         for i in ally_ids:
             for j in ally_ids:
                 if i != j:
@@ -722,26 +727,27 @@ class MultiTeamScenario(Scenario):
             team_agents[team_id].append(agent_id)
 
         # Calculate spawn positions for each team
+        edge_margin = 2  # How close to edge teams spawn
         if self.num_teams == 2:
-            # Left vs right
+            # Left edge vs right edge (true opposite sides)
             team_centers = [
-                (center, gs // 4),      # Team 0: left side
-                (center, 3 * gs // 4),  # Team 1: right side
+                (center, edge_margin),          # Team 0: left edge
+                (center, gs - 1 - edge_margin), # Team 1: right edge
             ]
         elif self.num_teams == 3:
-            # Triangle formation
+            # Triangle formation at edges
             team_centers = [
-                (gs // 4, center),      # Team 0: top
-                (3 * gs // 4, gs // 4), # Team 1: bottom-left
-                (3 * gs // 4, 3 * gs // 4),  # Team 2: bottom-right
+                (edge_margin, center),                  # Team 0: top edge
+                (gs - 1 - edge_margin, edge_margin),    # Team 1: bottom-left
+                (gs - 1 - edge_margin, gs - 1 - edge_margin),  # Team 2: bottom-right
             ]
         elif self.num_teams == 4:
-            # Four corners
+            # Four corners at edges
             team_centers = [
-                (gs // 4, gs // 4),         # Team 0: top-left
-                (gs // 4, 3 * gs // 4),     # Team 1: top-right
-                (3 * gs // 4, gs // 4),     # Team 2: bottom-left
-                (3 * gs // 4, 3 * gs // 4), # Team 3: bottom-right
+                (edge_margin, edge_margin),                     # Team 0: top-left
+                (edge_margin, gs - 1 - edge_margin),            # Team 1: top-right
+                (gs - 1 - edge_margin, edge_margin),            # Team 2: bottom-left
+                (gs - 1 - edge_margin, gs - 1 - edge_margin),   # Team 3: bottom-right
             ]
         else:
             # Fallback: distribute around center
@@ -907,9 +913,9 @@ def get_curriculum() -> dict:
         9: CoopFoodLowHPScenario(distance=3, hp_fraction=0.5),
 
         # Social pretraining (phases 10-12)
-        # Phase 10: 3 agents - agent 1 always ally, agent 2 can be enemy (20%)
-        # This teaches discrimination: friend vs foe when both present
-        10: SocialScenario(n_agents=3, inject_histories=True, scripted_partners=True, enemy_prob=0.2, always_one_ally=True),
+        # Phase 10: 2 agents - 50% scripted friend (like phase 9), 50% neutral stranger (learning)
+        # Teaches agent 0 to handle both cooperative allies and unknown strangers
+        10: SocialScenario(n_agents=2, inject_histories=True, scripted_partners=True, neutral_prob=0.5),
         # Phase 11: Cloned weights, coherent friend/foe histories (learn to discriminate)
         11: SocialScenario(n_agents=4, inject_histories=True, clone_weights=True, coherent_histories=True),
         12: SocialScenario(n_agents=8, inject_histories=False),

@@ -22,6 +22,7 @@ from buffer import RolloutBuffer, SingleAgentBuffer
 from ppo import PPO, IndependentPPO, VmapPPO
 from utils import set_seed, get_device
 from scenarios import CURRICULUM, THRESHOLDS
+from ledger import Ledger
 
 
 def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally') -> torch.Tensor:
@@ -68,6 +69,16 @@ def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally
         # Agent 1 is always ally, agent 2+ are enemies
         ally_agents = [1] if n_active > 1 else []
         enemy_agents = list(range(2, int(n_active)))
+    elif relationship == 'neutral':
+        # Neutral: never attack unless agent 0 attacked first
+        # Check if agent 0 has dealt any damage to the neutral agents
+        agent0_attacked = env.ledger.tensor[0, 1, Ledger.DAMAGE_DEALT] > 0
+        if not agent0_attacked:
+            # Block attack actions (5-8) for neutral agents - replace with STAY
+            for agent_id in range(1, int(n_active)):
+                if 5 <= actions[agent_id] <= 8:  # Attack actions
+                    actions[agent_id] = ACTION_STAY
+        return actions
     else:
         return actions
 
@@ -99,8 +110,8 @@ def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally
                 if dist0 <= 1 and dist_a <= 1:
                     # Both near food - ally coops
                     actions[agent_id] = ACTION_COOPERATE
-                elif dist_a > 1:
-                    # Not adjacent to food - move towards it
+                elif dist_a > 0:
+                    # Not on top of food yet - move towards it
                     diff = best_food - pos_a  # Direction to food
                     # Prioritize larger distance axis
                     if abs(diff[0]) >= abs(diff[1]):
@@ -858,6 +869,7 @@ if __name__ == "__main__":
         config.grid_size = args.grid_size
     if args.episode_length is not None:
         config.max_steps_per_episode = args.episode_length
+        config.num_steps = args.episode_length  # Sync rollout length with episode length
     if args.poor_food_spawn_rate is not None:
         config.poor_food_spawn_rate = args.poor_food_spawn_rate
     if args.rich_food_spawn_rate is not None:
