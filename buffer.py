@@ -38,8 +38,9 @@ class RolloutBuffer:
         self.self_obs = torch.zeros((self.num_steps, n, 1), device=device)
         self.agent_ids = torch.zeros((self.num_steps, n), device=device, dtype=torch.long)
 
-        # Actions - shape: [num_steps, n_agents] (unified action space)
-        self.actions = torch.zeros((self.num_steps, n), device=device, dtype=torch.long)
+        # Actions - factored action space
+        self.directions = torch.zeros((self.num_steps, n), device=device, dtype=torch.long)
+        self.action_types = torch.zeros((self.num_steps, n), device=device, dtype=torch.long)
 
         # Other data
         self.log_probs = torch.zeros((self.num_steps, n), device=device)
@@ -51,8 +52,9 @@ class RolloutBuffer:
         self.advantages = torch.zeros((self.num_steps, n), device=device)
         self.returns = torch.zeros((self.num_steps, n), device=device)
 
-        # Action mask - shape: [num_steps, n_agents, 15] (unified)
-        self.action_masks = torch.zeros((self.num_steps, n, config.n_actions), device=device, dtype=torch.bool)
+        # Action masks - factored: [num_steps, n_agents, 5] for each
+        self.direction_masks = torch.zeros((self.num_steps, n, config.n_directions), device=device, dtype=torch.bool)
+        self.action_type_masks = torch.zeros((self.num_steps, n, config.n_action_types), device=device, dtype=torch.bool)
 
         self.step_idx = 0
 
@@ -63,12 +65,14 @@ class RolloutBuffer:
     def store(
         self,
         obs: Dict[int, Dict[str, torch.Tensor]],
-        actions: torch.Tensor,
+        directions: torch.Tensor,
+        action_types: torch.Tensor,
         log_probs: torch.Tensor,
         rewards: Dict[int, float],
         dones: Dict[int, bool],
         values: torch.Tensor,
-        action_mask: torch.Tensor = None
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None
     ) -> None:
         """Store one step of experience for all agents."""
         t = self.step_idx
@@ -83,24 +87,29 @@ class RolloutBuffer:
             self.rewards[t, agent_id] = rewards[agent_id]
             self.dones[t, agent_id] = float(dones[agent_id])
 
-        self.actions[t] = actions
+        self.directions[t] = directions
+        self.action_types[t] = action_types
         self.log_probs[t] = log_probs
         self.values[t] = values
 
-        if action_mask is not None:
-            self.action_masks[t] = action_mask
+        if direction_mask is not None:
+            self.direction_masks[t] = direction_mask
+        if action_type_mask is not None:
+            self.action_type_masks[t] = action_type_mask
 
         self.step_idx += 1
 
     def store_batched(
         self,
         obs: Dict[str, torch.Tensor],  # Already batched [n_agents, ...]
-        actions: torch.Tensor,
+        directions: torch.Tensor,
+        action_types: torch.Tensor,
         log_probs: torch.Tensor,
         rewards: torch.Tensor,  # [n_agents] tensor, not dict
         dones: torch.Tensor,    # [n_agents] tensor, not dict
         values: torch.Tensor,
-        action_mask: torch.Tensor = None  # Optional [n_agents, 15] mask
+        direction_mask: torch.Tensor = None,  # Optional [n_agents, 5] mask
+        action_type_mask: torch.Tensor = None  # Optional [n_agents, 5] mask
     ) -> None:
         """Store one step - fully batched, no loops or .item() calls."""
         t = self.step_idx
@@ -112,15 +121,18 @@ class RolloutBuffer:
         self.self_obs[t] = obs['self_hp']
         self.agent_ids[t] = obs['agent_id']
 
-        self.actions[t] = actions
+        self.directions[t] = directions
+        self.action_types[t] = action_types
         self.log_probs[t] = log_probs
         self.rewards[t] = rewards
         self.dones[t] = dones.float()
         self.values[t] = values
 
-        # Store action mask if provided
-        if action_mask is not None:
-            self.action_masks[t] = action_mask
+        # Store action masks if provided
+        if direction_mask is not None:
+            self.direction_masks[t] = direction_mask
+        if action_type_mask is not None:
+            self.action_type_masks[t] = action_type_mask
 
         self.step_idx += 1
 
@@ -171,13 +183,15 @@ class RolloutBuffer:
         self_flat = self.self_obs.reshape(batch_size, -1)
         agent_id_flat = self.agent_ids.reshape(batch_size)
 
-        actions_flat = self.actions.reshape(batch_size)
+        directions_flat = self.directions.reshape(batch_size)
+        action_types_flat = self.action_types.reshape(batch_size)
         log_probs_flat = self.log_probs.reshape(batch_size)
         advantages_flat = self.advantages.reshape(batch_size)
         returns_flat = self.returns.reshape(batch_size)
 
-        # Flatten action mask
-        action_masks_flat = self.action_masks.reshape(batch_size, -1)
+        # Flatten action masks
+        direction_masks_flat = self.direction_masks.reshape(batch_size, -1)
+        action_type_masks_flat = self.action_type_masks.reshape(batch_size, -1)
 
         # Yield minibatches
         minibatch_size = self.config.minibatch_size
@@ -193,11 +207,13 @@ class RolloutBuffer:
                     'self_hp': self_flat[mb_indices],
                     'agent_id': agent_id_flat[mb_indices]
                 },
-                'actions': actions_flat[mb_indices],
+                'directions': directions_flat[mb_indices],
+                'action_types': action_types_flat[mb_indices],
                 'log_probs': log_probs_flat[mb_indices],
                 'advantages': advantages_flat[mb_indices],
                 'returns': returns_flat[mb_indices],
-                'action_mask': action_masks_flat[mb_indices]
+                'direction_mask': direction_masks_flat[mb_indices],
+                'action_type_mask': action_type_masks_flat[mb_indices]
             }
 
 
@@ -228,8 +244,9 @@ class SingleAgentBuffer:
         self.self_inventory_obs = torch.zeros((self.num_steps, 1), device=device)
         self.agent_ids = torch.zeros((self.num_steps,), device=device, dtype=torch.long)
 
-        # Actions (unified action space)
-        self.actions = torch.zeros((self.num_steps,), device=device, dtype=torch.long)
+        # Actions (factored action space)
+        self.directions = torch.zeros((self.num_steps,), device=device, dtype=torch.long)
+        self.action_types = torch.zeros((self.num_steps,), device=device, dtype=torch.long)
 
         # Other data
         self.log_probs = torch.zeros((self.num_steps,), device=device)
@@ -241,8 +258,24 @@ class SingleAgentBuffer:
         self.advantages = torch.zeros((self.num_steps,), device=device)
         self.returns = torch.zeros((self.num_steps,), device=device)
 
-        # Action mask (unified)
-        self.action_masks = torch.zeros((self.num_steps, config.n_actions), device=device, dtype=torch.bool)
+        # Action masks (factored)
+        self.direction_masks = torch.zeros((self.num_steps, config.n_directions), device=device, dtype=torch.bool)
+        self.action_type_masks = torch.zeros((self.num_steps, config.n_action_types), device=device, dtype=torch.bool)
+
+        # Decomposed rewards for auxiliary value heads
+        self.rewards_survival = torch.zeros((self.num_steps,), device=device)
+        self.rewards_resource = torch.zeros((self.num_steps,), device=device)
+        self.rewards_social = torch.zeros((self.num_steps,), device=device)
+
+        # Decomposed returns (computed in compute_gae)
+        self.returns_survival = torch.zeros((self.num_steps,), device=device)
+        self.returns_resource = torch.zeros((self.num_steps,), device=device)
+        self.returns_social = torch.zeros((self.num_steps,), device=device)
+
+        # Auxiliary values (stored during rollout)
+        self.values_survival = torch.zeros((self.num_steps,), device=device)
+        self.values_resource = torch.zeros((self.num_steps,), device=device)
+        self.values_social = torch.zeros((self.num_steps,), device=device)
 
         self.step_idx = 0
 
@@ -253,12 +286,20 @@ class SingleAgentBuffer:
     def store(
         self,
         obs: Dict[str, torch.Tensor],
-        action: torch.Tensor,
+        direction: torch.Tensor,
+        action_type: torch.Tensor,
         log_prob: torch.Tensor,
         reward: torch.Tensor,
         done: torch.Tensor,
         value: torch.Tensor,
-        action_mask: torch.Tensor = None
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None,
+        reward_survival: torch.Tensor = None,
+        reward_resource: torch.Tensor = None,
+        reward_social: torch.Tensor = None,
+        value_survival: torch.Tensor = None,
+        value_resource: torch.Tensor = None,
+        value_social: torch.Tensor = None
     ) -> None:
         """Store one step of experience for this single agent."""
         t = self.step_idx
@@ -271,26 +312,55 @@ class SingleAgentBuffer:
         self.self_inventory_obs[t] = obs['self_inventory']
         self.agent_ids[t] = obs['agent_id']
 
-        # Store action and values
-        self.actions[t] = action
+        # Store actions and values
+        self.directions[t] = direction
+        self.action_types[t] = action_type
         self.log_probs[t] = log_prob
         self.rewards[t] = reward
         self.dones[t] = done.float() if isinstance(done, torch.Tensor) else float(done)
         self.values[t] = value
 
-        # Store action mask if provided
-        if action_mask is not None:
-            self.action_masks[t] = action_mask
+        # Store action masks if provided
+        if direction_mask is not None:
+            self.direction_masks[t] = direction_mask
+        if action_type_mask is not None:
+            self.action_type_masks[t] = action_type_mask
+
+        # Store decomposed rewards if provided
+        if reward_survival is not None:
+            self.rewards_survival[t] = reward_survival
+        if reward_resource is not None:
+            self.rewards_resource[t] = reward_resource
+        if reward_social is not None:
+            self.rewards_social[t] = reward_social
+
+        # Store auxiliary values if provided
+        if value_survival is not None:
+            self.values_survival[t] = value_survival
+        if value_resource is not None:
+            self.values_resource[t] = value_resource
+        if value_social is not None:
+            self.values_social[t] = value_social
 
         self.step_idx += 1
 
-    def compute_gae(self, next_value: torch.Tensor, next_done: torch.Tensor) -> None:
+    def compute_gae(
+        self,
+        next_value: torch.Tensor,
+        next_done: torch.Tensor,
+        next_value_survival: torch.Tensor = None,
+        next_value_resource: torch.Tensor = None,
+        next_value_social: torch.Tensor = None
+    ) -> None:
         """
         Compute Generalized Advantage Estimation for this single agent.
 
         Args:
             next_value: Value estimate for state after last step (scalar tensor)
             next_done: Whether episode ended after last step (scalar tensor)
+            next_value_survival: Auxiliary value estimate for survival rewards
+            next_value_resource: Auxiliary value estimate for resource rewards
+            next_value_social: Auxiliary value estimate for social rewards
         """
         gamma = self.config.gamma
         gae_lambda = self.config.gae_lambda
@@ -314,6 +384,25 @@ class SingleAgentBuffer:
 
         # Returns = advantages + values
         self.returns = self.advantages + self.values
+
+        # Compute auxiliary returns (simple discounted returns, not GAE)
+        # These are used for auxiliary value head supervision
+        if next_value_survival is not None:
+            for t in reversed(range(self.num_steps)):
+                if t == self.num_steps - 1:
+                    next_non_terminal = 1.0 - next_done.float()
+                    next_ret_surv = next_value_survival
+                    next_ret_res = next_value_resource
+                    next_ret_soc = next_value_social
+                else:
+                    next_non_terminal = 1.0 - self.dones[t + 1]
+                    next_ret_surv = self.returns_survival[t + 1]
+                    next_ret_res = self.returns_resource[t + 1]
+                    next_ret_soc = self.returns_social[t + 1]
+
+                self.returns_survival[t] = self.rewards_survival[t] + gamma * next_ret_surv * next_non_terminal
+                self.returns_resource[t] = self.rewards_resource[t] + gamma * next_ret_res * next_non_terminal
+                self.returns_social[t] = self.rewards_social[t] + gamma * next_ret_soc * next_non_terminal
 
     def get_batches(self) -> Generator[Dict[str, torch.Tensor], None, None]:
         """
@@ -340,9 +429,15 @@ class SingleAgentBuffer:
                     'self_inventory': self.self_inventory_obs[mb_indices],
                     'agent_id': self.agent_ids[mb_indices]
                 },
-                'actions': self.actions[mb_indices],
+                'directions': self.directions[mb_indices],
+                'action_types': self.action_types[mb_indices],
                 'log_probs': self.log_probs[mb_indices],
                 'advantages': self.advantages[mb_indices],
                 'returns': self.returns[mb_indices],
-                'action_mask': self.action_masks[mb_indices]
+                'direction_mask': self.direction_masks[mb_indices],
+                'action_type_mask': self.action_type_masks[mb_indices],
+                # Auxiliary returns for decomposed value heads
+                'returns_survival': self.returns_survival[mb_indices],
+                'returns_resource': self.returns_resource[mb_indices],
+                'returns_social': self.returns_social[mb_indices],
             }

@@ -19,26 +19,22 @@ import torch
 
 from config import Config
 
-# Action constants (must match environment.py)
-# Attack directions: 0-3, Give directions: 4-7, Signal: 8, Cooperate: 9, Idle: 10
-ATTACK_UP, ATTACK_DOWN, ATTACK_LEFT, ATTACK_RIGHT = 0, 1, 2, 3
-GIVE_UP, GIVE_DOWN, GIVE_LEFT, GIVE_RIGHT = 4, 5, 6, 7
-INTERACT_SIGNAL = 8
-INTERACT_COOPERATE = 9
-INTERACT_IDLE = 10
-
-# Direction deltas: UP, DOWN, LEFT, RIGHT
-INTERACT_DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+# Factored action space constants (must match environment.py)
+DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
+ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
+DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]  # UP, DOWN, LEFT, RIGHT, STAY
 
 
-def _is_attack_action(action):
-    """Check if action is an attack (0-3)."""
-    return 0 <= action <= 3
-
-
-def _is_give_action(action):
-    """Check if action is a give (4-7)."""
-    return 4 <= action <= 7
+def _get_target_from_direction(agent_pos, direction, grid_size):
+    """Get target position from direction. Returns None if out of bounds or STAY."""
+    if direction == DIR_STAY:
+        return None
+    delta_row, delta_col = DIR_DELTAS[direction]
+    target_row = int(agent_pos[0]) + delta_row
+    target_col = int(agent_pos[1]) + delta_col
+    if 0 <= target_row < grid_size and 0 <= target_col < grid_size:
+        return (target_row, target_col)
+    return None
 
 
 def classify_relationship(ledger, viewer_id, target_id):
@@ -70,25 +66,6 @@ def classify_relationship(ledger, viewer_id, target_id):
         return 'neutral', 0
 
 
-def _get_target_from_action(agent_pos, action, grid_size):
-    """Get target position from directional action. Returns None if out of bounds."""
-    if _is_attack_action(action):
-        direction = action  # 0-3
-    elif _is_give_action(action):
-        direction = action - 4  # 4-7 -> 0-3
-    else:
-        return None
-
-    delta_row, delta_col = INTERACT_DIR_DELTAS[direction]
-    target_row = agent_pos[0] + delta_row
-    target_col = agent_pos[1] + delta_col
-
-    # Bounds check
-    if 0 <= target_row < grid_size and 0 <= target_col < grid_size:
-        return (target_row, target_col)
-    return None
-
-
 @dataclass
 class StepData:
     """Data for a single timestep."""
@@ -98,11 +75,14 @@ class StepData:
     poor_food: np.ndarray      # [grid_size, grid_size]
     rich_food: np.ndarray      # [grid_size, grid_size]
     signals: np.ndarray        # [n_agents]
-    actions: Dict[int, int]    # Unified action per agent (0-14)
+    actions: Dict[int, tuple]  # (direction, action_type) per agent
     rewards: Dict[int, float]
     values: Optional[np.ndarray] = None  # [n_agents] value estimates
-    # Action probabilities for visualization (unified action space)
-    action_probs: Optional[np.ndarray] = None     # [n_agents, 15] unified action probs
+    # Action probabilities for visualization (factored action space)
+    direction_probs: Optional[np.ndarray] = None     # [n_agents, 5] direction probs
+    action_type_probs: Optional[np.ndarray] = None   # [n_agents, 5] action type probs
+    # Auxiliary value estimates for decomposed reward streams
+    aux_values: Optional[Dict[str, np.ndarray]] = None  # {'survival': [n], 'resource': [n], 'social': [n]}
 
 
 class GridRenderer:
@@ -522,11 +502,37 @@ class EpisodeRecorder:
         self.steps = []
         self.ledger_snapshots = []
 
-    def record(self, env, actions: Dict[int, int] = None,
+    def record(self, env, actions: Dict[int, tuple] = None,
                rewards: Dict[int, float] = None,
                values: np.ndarray = None,
-               action_probs: np.ndarray = None) -> None:
-        """Record current environment state."""
+               action_probs: tuple = None,
+               aux_values: Dict[str, np.ndarray] = None) -> None:
+        """Record current environment state.
+
+        Args:
+            env: GridWorld environment
+            actions: Dict mapping agent_id -> (direction, action_type)
+            rewards: Dict mapping agent_id -> reward
+            values: [n_agents] value estimates
+            action_probs: Tuple of (direction_probs, action_type_probs) arrays
+            aux_values: Dict with 'survival', 'resource', 'social' arrays [n_agents]
+        """
+        # Unpack action_probs tuple if provided
+        direction_probs = None
+        action_type_probs = None
+        if action_probs is not None:
+            direction_probs, action_type_probs = action_probs
+            direction_probs = direction_probs.copy()
+            action_type_probs = action_type_probs.copy()
+
+        # Copy auxiliary values if provided
+        aux_values_copy = None
+        if aux_values is not None:
+            aux_values_copy = {
+                k: v.copy() if isinstance(v, np.ndarray) else v
+                for k, v in aux_values.items()
+            }
+
         step_data = StepData(
             positions=env.agent_positions.cpu().numpy().copy(),
             hp=env.agent_hp.cpu().numpy().copy(),
@@ -537,7 +543,9 @@ class EpisodeRecorder:
             actions=actions or {},
             rewards=rewards or {},
             values=values.copy() if values is not None else None,
-            action_probs=action_probs.copy() if action_probs is not None else None
+            direction_probs=direction_probs,
+            action_type_probs=action_type_probs,
+            aux_values=aux_values_copy
         )
         self.steps.append(step_data)
         self.ledger_snapshots.append(env.ledger.tensor.cpu().numpy().copy())
@@ -607,8 +615,12 @@ def replay_episode(recording: List[StepData], config: Config,
     # Check if we have value estimates
     has_values = recording[0].values is not None
 
-    # Check if we have action probabilities (unified action space)
-    has_probs = recording[0].action_probs is not None
+    # Check if we have auxiliary value estimates
+    has_aux_values = recording[0].aux_values is not None
+
+    # Check for factored action probabilities
+    has_probs = (recording[0].direction_probs is not None and
+                 recording[0].action_type_probs is not None)
 
     # Pre-compute kills: track (killer, victim) pairs by checking when agents die
     # and who dealt damage to them (from ledger snapshots)
@@ -755,41 +767,20 @@ def replay_episode(recording: List[StepData], config: Config,
                                     color=color, linewidth=linewidth, alpha=alpha,
                                     linestyle='-', zorder=1)
 
-        # Draw attack, give, and cooperate interactions
+        # Draw attack, give, and cooperate interactions (factored action space)
         if step_data.actions:
-            for agent_id, action_val in step_data.actions.items():
+            for agent_id, action_tuple in step_data.actions.items():
                 if not step_data.alive[agent_id]:
                     continue
 
-                # Handle both action formats:
-                # Old format: (move_act, interact_act) tuple
-                # New unified format: single int (0-14)
-                if isinstance(action_val, tuple):
-                    move_act, interact_act = action_val
-                else:
-                    # Unified action: 0-4 move, 5-8 atk, 9-12 give, 13 sig, 14 coop
-                    unified_act = action_val
-                    if unified_act < 5:
-                        # Move action - no interaction to draw
-                        continue
-                    elif unified_act < 9:
-                        # Attack: 5-8 -> interact_act 0-3
-                        interact_act = unified_act - 5
-                    elif unified_act < 13:
-                        # Give: 9-12 -> interact_act 4-7
-                        interact_act = unified_act - 5  # 9->4, 10->5, 11->6, 12->7
-                    elif unified_act == 13:
-                        # Signal
-                        interact_act = INTERACT_SIGNAL
-                    else:
-                        # Cooperate (14)
-                        interact_act = INTERACT_COOPERATE
+                # Factored action space: (direction, action_type) tuple
+                direction, action_type = action_tuple
 
                 agent_pos = step_data.positions[agent_id]
                 agent_row, agent_col = int(agent_pos[0]), int(agent_pos[1])
 
-                # Handle COOPERATE action (non-directional)
-                if interact_act == INTERACT_COOPERATE:
+                # Handle COOPERATE (non-directional)
+                if action_type == ACT_COOPERATE:
                     # Blue circle around agent for cooperation
                     coop_circle = plt.Circle((agent_col, agent_row), 0.45,
                                             fill=False, color='blue', linewidth=3, alpha=0.8)
@@ -799,8 +790,16 @@ def replay_episode(recording: List[StepData], config: Config,
                                 fontsize=9, color='blue', fontweight='bold')
                     continue
 
-                # Get target position from directional action (attack/give)
-                target_pos = _get_target_from_action(agent_pos, interact_act, gs)
+                # Handle SIGNAL (non-directional) - already shown via signals array
+                if action_type == ACT_SIGNAL:
+                    continue
+
+                # Handle MOVE - no arrow to draw
+                if action_type == ACT_MOVE:
+                    continue
+
+                # Handle ATTACK and GIVE (directional)
+                target_pos = _get_target_from_direction(agent_pos, direction, gs)
                 if target_pos is None:
                     continue
 
@@ -821,7 +820,7 @@ def replay_episode(recording: List[StepData], config: Config,
                 if target_agent_id is None:
                     continue  # No agent at target - don't draw arrow
 
-                if _is_attack_action(interact_act):
+                if action_type == ACT_ATTACK:
                     # Red arrow for attack
                     ax_grid.annotate('',
                         xy=(target_col, target_row),
@@ -831,7 +830,7 @@ def replay_episode(recording: List[StepData], config: Config,
                     ax_grid.text(target_col + 0.3, target_row + 0.3, '⚔',
                                 fontsize=10, color='red', fontweight='bold')
 
-                elif _is_give_action(interact_act):
+                elif action_type == ACT_GIVE:
                     # Green arrow for food giving
                     ax_grid.annotate('',
                         xy=(target_col, target_row),
@@ -862,11 +861,21 @@ def replay_episode(recording: List[StepData], config: Config,
                 if rel_parts:
                     rel_str = " | " + " ".join(rel_parts)
 
+            # Build value string with main value and auxiliary values
+            value_str = ""
             if has_values and step_data.values is not None:
                 value = step_data.values[agent_id]
-                info_lines.append(f'A{agent_id}: R={cum_reward:+.1f}  V={value:.2f}{rel_str}')
-            else:
-                info_lines.append(f'A{agent_id}: R={cum_reward:+.1f}{rel_str}')
+                value_str = f"  V={value:.1f}"
+
+            # Add auxiliary values (V_survival, V_resource, V_social)
+            aux_str = ""
+            if has_aux_values and step_data.aux_values is not None:
+                v_surv = step_data.aux_values['survival'][agent_id]
+                v_res = step_data.aux_values['resource'][agent_id]
+                v_soc = step_data.aux_values['social'][agent_id]
+                aux_str = f" [S:{v_surv:+.1f} R:{v_res:+.1f} C:{v_soc:+.1f}]"
+
+            info_lines.append(f'A{agent_id}: R={cum_reward:+.1f}{value_str}{aux_str}{rel_str}')
 
         info_text = '\n'.join(info_lines)
         # Position in upper right of grid (using axes coordinates)
@@ -900,59 +909,52 @@ def replay_episode(recording: List[StepData], config: Config,
                                 ax.plot(victim_id, killer_id, 'X', markersize=15,
                                        color='black', markeredgecolor='white', markeredgewidth=1.5)
 
-        # Draw action probability MATRICES (heatmap style)
-        # Unified action space: 0-4 move, 5-8 attack, 9-12 give, 13 signal, 14 coop
-        if has_probs and ax_move_probs is not None and step_data.action_probs is not None:
+        # Draw factored action probability MATRICES (heatmap style)
+        if has_probs and ax_move_probs is not None:
             ax_move_probs.clear()
             ax_interact_probs.clear()
 
-            move_names = ['UP', 'DN', 'LT', 'RT', 'ST']
-            interact_names = ['ATK', 'GIV', 'SIG', 'COP']
+            dir_names = ['UP', 'DN', 'LT', 'RT', 'ST']
+            act_names = ['MOV', 'ATK', 'GIV', 'SIG', 'COP']
 
-            # Extract move probabilities from unified action probs (actions 0-4)
-            move_data = step_data.action_probs[:, :5].copy()
+            # Use direction_probs and action_type_probs from StepData
+            dir_data = step_data.direction_probs.copy()  # [n_agents, 5]
+            act_data = step_data.action_type_probs.copy()  # [n_agents, 5]
+
             # Gray out dead agents
             for i in range(n_agents):
                 if not step_data.alive[i]:
-                    move_data[i, :] = 0
+                    dir_data[i, :] = 0
+                    act_data[i, :] = 0
 
-            im_move = ax_move_probs.imshow(move_data, cmap='Blues', aspect='auto', vmin=0, vmax=1)
-            ax_move_probs.set_title('Move Probabilities', fontsize=10, fontweight='bold')
+            # Draw direction probability matrix
+            im_dir = ax_move_probs.imshow(dir_data, cmap='Blues', aspect='auto', vmin=0, vmax=1)
+            ax_move_probs.set_title('Direction Probs', fontsize=10, fontweight='bold')
             ax_move_probs.set_xticks(range(5))
-            ax_move_probs.set_xticklabels(move_names, fontsize=8)
+            ax_move_probs.set_xticklabels(dir_names, fontsize=8)
             ax_move_probs.set_yticks(range(n_agents))
             ax_move_probs.set_yticklabels([f'A{i}' for i in range(n_agents)], fontsize=8)
 
             # Annotate cells with probability values
             for i in range(n_agents):
                 for j in range(5):
-                    val = move_data[i, j]
+                    val = dir_data[i, j]
                     color = 'white' if val > 0.5 else 'black'
                     ax_move_probs.text(j, i, f'{val:.2f}', ha='center', va='center',
                                       fontsize=7, color=color)
 
-            # Aggregate interact probabilities from unified actions
-            # ATK: sum of actions 5-8, GIV: sum of 9-12, SIG: 13, COP: 14
-            interact_data = np.zeros((n_agents, 4))
-            interact_data[:, 0] = step_data.action_probs[:, 5:9].sum(axis=1)   # ATK
-            interact_data[:, 1] = step_data.action_probs[:, 9:13].sum(axis=1)  # GIV
-            interact_data[:, 2] = step_data.action_probs[:, 13]                # SIG
-            interact_data[:, 3] = step_data.action_probs[:, 14]                # COP
-            for i in range(n_agents):
-                if not step_data.alive[i]:
-                    interact_data[i, :] = 0
-
-            im_interact = ax_interact_probs.imshow(interact_data, cmap='Oranges', aspect='auto', vmin=0, vmax=1)
-            ax_interact_probs.set_title('Interact Probabilities', fontsize=10, fontweight='bold')
-            ax_interact_probs.set_xticks(range(4))
-            ax_interact_probs.set_xticklabels(interact_names, fontsize=8)
+            # Draw action type probability matrix
+            im_act = ax_interact_probs.imshow(act_data, cmap='Oranges', aspect='auto', vmin=0, vmax=1)
+            ax_interact_probs.set_title('Action Type Probs', fontsize=10, fontweight='bold')
+            ax_interact_probs.set_xticks(range(5))
+            ax_interact_probs.set_xticklabels(act_names, fontsize=8)
             ax_interact_probs.set_yticks(range(n_agents))
             ax_interact_probs.set_yticklabels([f'A{i}' for i in range(n_agents)], fontsize=8)
 
             # Annotate cells
             for i in range(n_agents):
-                for j in range(4):
-                    val = interact_data[i, j]
+                for j in range(5):
+                    val = act_data[i, j]
                     color = 'white' if val > 0.5 else 'black'
                     ax_interact_probs.text(j, i, f'{val:.2f}', ha='center', va='center',
                                           fontsize=7, color=color)
@@ -1056,17 +1058,17 @@ def visualize_trained_agent(model_path: str, config: Config = None,
             }
 
             with torch.no_grad():
-                action_masks = env.get_action_masks()
-                move_actions, interact_actions, _, _, _ = network.get_action_and_value(
-                    stacked_obs, action_masks=action_masks
+                direction_mask, action_type_mask = env.get_action_masks()
+                directions, action_types, _, _, _ = network.get_action_and_value(
+                    stacked_obs, direction_mask=direction_mask, action_type_mask=action_type_mask
                 )
 
             actions = {
-                i: (move_actions[i].item(), interact_actions[i].item())
+                i: (directions[i].item(), action_types[i].item())
                 for i in range(config.n_agents)
             }
 
-            obs, rewards, dones, _ = env.step(actions)
+            obs, rewards, dones, _ = env.step(directions, action_types)
             done = all(dones.values())
 
         print(f"Episode {ep + 1} finished after {env.step_count} steps")
@@ -1097,11 +1099,15 @@ if __name__ == "__main__":
 
     num_steps = 50  # Run 50 steps for demo
     for step in range(num_steps):
-        actions = torch.randint(0, 15, (config.n_agents,), device=device)
-        rewards, dones, info = env.step(actions)
+        # Random factored actions
+        directions = torch.randint(0, 5, (config.n_agents,), device=device)
+        action_types = torch.randint(0, 5, (config.n_agents,), device=device)
+
+        obs, rewards, dones, info = env.step(directions, action_types)
 
         # Convert to dicts for recording
-        actions_dict = {i: actions[i].item() for i in range(config.n_agents)}
+        actions_dict = {i: (directions[i].item(), action_types[i].item())
+                        for i in range(config.n_agents)}
         rewards_dict = {i: rewards[i].item() for i in range(config.n_agents)}
 
         recorder.record(env, actions=actions_dict, rewards=rewards_dict)

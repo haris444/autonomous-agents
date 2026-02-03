@@ -19,12 +19,17 @@ class ObservationEncoder(nn.Module):
     Encodes observations using a unified Transformer over all entities.
 
     Architecture:
-        - Entity Tokens: Single Transformer over agents + food (explicit dx, dy)
+        - Entity Tokens: Single Transformer over agents + food (Fourier positional encoding)
         - Signals: MLP
         - Self HP: MLP
 
     Inputs:
-        - entity_tokens: [batch, max_entities, 8] - (dx, dy, type, value, social[4])
+        - entity_tokens: [batch, max_entities, 25]
+            - fourier[16]: 4 freq bands × (sin_dx, cos_dx, sin_dy, cos_dy)
+            - velocity[2]: (dv_x, dv_y)
+            - type_onehot[2]: [is_food, is_agent]
+            - value[1]: HP or quality
+            - social[4]: [dmg_dealt, food_given, coop_count, defense]
         - entity_mask: [batch, max_entities] - which tokens are valid
         - signals: [batch, n_agents] - who is signaling
         - self_hp: [batch, 1] - agent's own HP (normalized)
@@ -40,7 +45,7 @@ class ObservationEncoder(nn.Module):
         self.config = config
 
         # 1. ENTITY TOKENS: Unified Transformer over agents + food
-        # Each token has 8 features: dx, dy, type, value, social[4]
+        # Each token has 25 features: fourier[16] + velocity[2] + type[2] + value[1] + social[4]
         self.entity_embed = nn.Linear(config.entity_token_dim, config.attention_embed_dim)
         self.entity_attention = nn.MultiheadAttention(
             embed_dim=config.attention_embed_dim,
@@ -77,11 +82,11 @@ class ObservationEncoder(nn.Module):
 
         # Handle both batched formats
         if entity_tokens.dim() == 4:
-            # [B, n_agents, max_entities, 8] - need to select observer's row
-            my_tokens = entity_tokens[batch_indices, agent_id.long(), :, :]  # [B, max_entities, 8]
+            # [B, n_agents, max_entities, 25] - need to select observer's row
+            my_tokens = entity_tokens[batch_indices, agent_id.long(), :, :]  # [B, max_entities, 25]
             my_mask = entity_mask[batch_indices, agent_id.long(), :]  # [B, max_entities]
         else:
-            # [B, max_entities, 8] - already per-observer
+            # [B, max_entities, 25] - already per-observer
             my_tokens = entity_tokens
             my_mask = entity_mask
 
@@ -127,16 +132,12 @@ class ObservationEncoder(nn.Module):
 
 class ActorCritic(nn.Module):
     """
-    Actor-Critic network with unified action head.
+    Actor-Critic network with factored action space.
 
-    Action space (15 total):
-        - 0-4: Movement (UP, DOWN, LEFT, RIGHT, STAY)
-        - 5-8: ATTACK (UP, DOWN, LEFT, RIGHT)
-        - 9-12: GIVE (UP, DOWN, LEFT, RIGHT)
-        - 13: SIGNAL
-        - 14: COOPERATE
+    Direction head (5 outputs): UP=0, DOWN=1, LEFT=2, RIGHT=3, STAY=4
+    Action type head (5 outputs): MOVE=0, ATTACK=1, GIVE=2, SIGNAL=3, COOPERATE=4
 
-    Agent chooses ONE action per step (move OR interact, not both).
+    Direction is ignored for SIGNAL and COOPERATE (non-directional actions).
     """
 
     def __init__(self, config: Config):
@@ -152,11 +153,17 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
 
-        # Unified actor head (15 actions)
-        self.action_head = nn.Linear(128, config.n_actions)
+        # Factored actor heads
+        self.direction_head = nn.Linear(128, config.n_directions)
+        self.action_type_head = nn.Linear(128, config.n_action_types)
 
         # Critic head
         self.value_head = nn.Linear(128, 1)
+
+        # Auxiliary value heads for decomposed reward streams
+        self.value_head_survival = nn.Linear(128, 1)
+        self.value_head_resource = nn.Linear(128, 1)
+        self.value_head_social = nn.Linear(128, 1)
 
         # Initialize weights
         self._init_weights()
@@ -170,10 +177,19 @@ class ActorCritic(nn.Module):
                 nn.init.orthogonal_(module.weight, gain=math.sqrt(2))
                 nn.init.constant_(module.bias, 0.0)
 
-        # Smaller initialization for policy head (helps with exploration)
-        nn.init.orthogonal_(self.action_head.weight, gain=0.01)
+        # Smaller initialization for policy heads (helps with exploration)
+        nn.init.orthogonal_(self.direction_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.action_type_head.weight, gain=0.01)
         # Value head uses gain=1.0 (outputs should be in reasonable range initially)
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+
+        # Auxiliary value heads also use gain=1.0
+        nn.init.orthogonal_(self.value_head_survival.weight, gain=1.0)
+        nn.init.orthogonal_(self.value_head_resource.weight, gain=1.0)
+        nn.init.orthogonal_(self.value_head_social.weight, gain=1.0)
+        nn.init.zeros_(self.value_head_survival.bias)
+        nn.init.zeros_(self.value_head_resource.bias)
+        nn.init.zeros_(self.value_head_social.bias)
 
     def _encode(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Encode observations through encoder and shared trunk."""
@@ -187,64 +203,98 @@ class ActorCritic(nn.Module):
         )
         return self.shared(features)
 
-    def forward(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass returning raw logits and value.
 
         Returns:
-            action_logits: [batch, n_actions] (15 actions)
+            direction_logits: [batch, n_directions] (5 directions)
+            action_type_logits: [batch, n_action_types] (5 action types)
             value: [batch, 1]
         """
         hidden = self._encode(obs)
-        action_logits = self.action_head(hidden)
+        direction_logits = self.direction_head(hidden)
+        action_type_logits = self.action_type_head(hidden)
         value = self.value_head(hidden)
-        return action_logits, value
+        return direction_logits, action_type_logits, value
 
     def get_value(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Return value estimate only."""
         hidden = self._encode(obs)
         return self.value_head(hidden)
 
+    def get_auxiliary_values(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Return auxiliary value estimates for decomposed reward streams."""
+        hidden = self._encode(obs)
+        return {
+            'survival': self.value_head_survival(hidden).squeeze(-1),
+            'resource': self.value_head_resource(hidden).squeeze(-1),
+            'social': self.value_head_social(hidden).squeeze(-1),
+        }
+
     def get_action_and_value(
         self,
         obs: Dict[str, torch.Tensor],
-        action: Optional[torch.Tensor] = None,
-        action_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        direction: Optional[torch.Tensor] = None,
+        action_type: Optional[torch.Tensor] = None,
+        direction_mask: Optional[torch.Tensor] = None,
+        action_type_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Get action, log probability, entropy, and value.
+        Get direction, action type, log probability, entropy, and value.
+
+        Samples from two independent Categorical distributions.
+        log_prob = log_prob_direction + log_prob_action_type
+        entropy = entropy_direction + entropy_action_type
 
         Args:
             obs: Observation dictionary
-            action: Optional pre-selected action (for computing log prob during PPO update)
-            action_mask: Optional [batch, 15] mask of valid actions
+            direction: Optional pre-selected direction (for PPO update)
+            action_type: Optional pre-selected action type (for PPO update)
+            direction_mask: Optional [batch, 5] mask of valid directions
+            action_type_mask: Optional [batch, 5] mask of valid action types
 
         Returns:
-            action: [batch] selected action (0-14)
-            log_prob: [batch] log probability of action
-            entropy: [batch] policy entropy
+            direction: [batch] selected direction (0-4)
+            action_type: [batch] selected action type (0-4)
+            log_prob: [batch] combined log probability
+            entropy: [batch] combined policy entropy
             value: [batch] value estimate
         """
         hidden = self._encode(obs)
 
-        # Get logits for unified action head
-        action_logits = self.action_head(hidden)
+        # Get logits for both heads
+        direction_logits = self.direction_head(hidden)
+        action_type_logits = self.action_type_head(hidden)
         value = self.value_head(hidden)
 
-        # Apply action mask if provided
-        if action_mask is not None:
-            LARGE_NEG = -1e8
-            action_logits = action_logits.masked_fill(~action_mask, LARGE_NEG)
+        LARGE_NEG = -1e8
 
-        # Create distribution
-        action_dist = Categorical(logits=action_logits)
+        # Apply direction mask if provided
+        if direction_mask is not None:
+            direction_logits = direction_logits.masked_fill(~direction_mask, LARGE_NEG)
 
-        # Sample or use provided action
-        if action is None:
-            action = action_dist.sample()
+        # Apply action type mask if provided
+        if action_type_mask is not None:
+            action_type_logits = action_type_logits.masked_fill(~action_type_mask, LARGE_NEG)
 
-        # Compute log probability and entropy
-        log_prob = action_dist.log_prob(action)
-        entropy = action_dist.entropy()
+        # Create distributions
+        direction_dist = Categorical(logits=direction_logits)
+        action_type_dist = Categorical(logits=action_type_logits)
 
-        return action, log_prob, entropy, value.squeeze(-1)
+        # Sample or use provided actions
+        if direction is None:
+            direction = direction_dist.sample()
+        if action_type is None:
+            action_type = action_type_dist.sample()
+
+        # Compute combined log probability and entropy
+        log_prob_dir = direction_dist.log_prob(direction)
+        log_prob_act = action_type_dist.log_prob(action_type)
+        log_prob = log_prob_dir + log_prob_act
+
+        entropy_dir = direction_dist.entropy()
+        entropy_act = action_type_dist.entropy()
+        entropy = entropy_dir + entropy_act
+
+        return direction, action_type, log_prob, entropy, value.squeeze(-1)

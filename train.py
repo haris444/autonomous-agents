@@ -8,7 +8,7 @@ Usage:
     python train.py --visualize        # Train with live visualization
     python train.py --visualize --render-every 50  # Render grid every 50 updates
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import time
 import argparse
 
@@ -25,7 +25,12 @@ from scenarios import CURRICULUM, THRESHOLDS
 from ledger import Ledger
 
 
-def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally') -> torch.Tensor:
+def apply_scripted_partner(
+    env,
+    directions: torch.Tensor,
+    action_types: torch.Tensor,
+    relationship: str = 'ally'
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Override partner agents' actions based on relationship type.
 
@@ -40,21 +45,18 @@ def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally
 
     This provides consistent partner behavior matching the injected history.
 
-    Unified action space:
-        0-4: Movement (UP, DOWN, LEFT, RIGHT, STAY)
-        5-8: ATTACK (UP, DOWN, LEFT, RIGHT)
-        9-12: GIVE (UP, DOWN, LEFT, RIGHT)
-        13: SIGNAL
-        14: COOPERATE
+    Factored action space:
+        directions: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY
+        action_types: 0=MOVE, 1=ATTACK, 2=GIVE, 3=SIGNAL, 4=COOPERATE
     """
-    # Movement actions: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY
-    ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTION_STAY = 0, 1, 2, 3, 4
-    ACTION_COOPERATE = 14
-    # Attack directions: 5=UP, 6=DOWN, 7=LEFT, 8=RIGHT
-    ACTION_ATTACK_UP, ACTION_ATTACK_DOWN, ACTION_ATTACK_LEFT, ACTION_ATTACK_RIGHT = 5, 6, 7, 8
+    # Direction constants
+    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
+    # Action type constants
+    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
 
     pos0 = env.agent_positions[0].float()
-    actions = actions.clone()
+    directions = directions.clone()
+    action_types = action_types.clone()
 
     # Determine which agents are allies vs enemies
     n_active = env.agent_alive.sum().item()
@@ -70,30 +72,125 @@ def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally
         ally_agents = [1] if n_active > 1 else []
         enemy_agents = list(range(2, int(n_active)))
     elif relationship == 'neutral':
-        # Neutral: never attack unless agent 0 attacked first
-        # Check if agent 0 has dealt any damage to the neutral agents
-        agent0_attacked = env.ledger.tensor[0, 1, Ledger.DAMAGE_DEALT] > 0
-        if not agent0_attacked:
-            # Block attack actions (5-8) for neutral agents - replace with STAY
-            for agent_id in range(1, int(n_active)):
-                if 5 <= actions[agent_id] <= 8:  # Attack actions
-                    actions[agent_id] = ACTION_STAY
-        return actions
+        # Neutral: responds to agent 0's behavior with reciprocity
+        # - Positive: If agent 0 gives food or cooperates, neutral becomes friendly
+        # - Negative: If agent 0 attacks, neutral retaliates
+        # - Passive: If no interaction, block attacks only
+
+        # Get rich food locations for positive reciprocity behavior
+        rich_coords = torch.nonzero(env.rich_food, as_tuple=False)
+
+        for agent_id in range(1, int(n_active)):
+            if not env.agent_alive[agent_id]:
+                continue
+
+            # Check agent 0's behavior toward this neutral
+            damage_dealt = env.ledger.tensor[0, agent_id, Ledger.DAMAGE_DEALT].item()
+            food_given = env.ledger.tensor[0, agent_id, Ledger.FOOD_GIVEN].item()
+            coop_count = env.ledger.tensor[0, agent_id, Ledger.COOP_COUNT].item()
+
+            if damage_dealt > 0:
+                # NEGATIVE RECIPROCITY: Agent 0 attacked -> neutral retaliates
+                pos_n = env.agent_positions[agent_id].float()
+                diff = pos0 - pos_n
+                dist = diff.abs().sum()
+
+                if dist == 1:  # Adjacent - attack
+                    action_types[agent_id] = ACT_ATTACK
+                    if diff[0] == -1:
+                        directions[agent_id] = DIR_UP
+                    elif diff[0] == 1:
+                        directions[agent_id] = DIR_DOWN
+                    elif diff[1] == -1:
+                        directions[agent_id] = DIR_LEFT
+                    else:
+                        directions[agent_id] = DIR_RIGHT
+                # else: keep learned policy action (move toward agent 0 to retaliate)
+
+            elif food_given > 0 or coop_count > 0:
+                # POSITIVE RECIPROCITY: Agent 0 was nice -> neutral becomes ally
+                pos_n = env.agent_positions[agent_id].float()
+                action_types[agent_id] = ACT_MOVE
+                directions[agent_id] = DIR_STAY
+
+                if rich_coords.numel() > 0:
+                    # Find closest rich food
+                    best_food = None
+                    best_dist = float('inf')
+                    for food_pos in rich_coords:
+                        food_pos_f = food_pos.float()
+                        dist_n = (pos_n - food_pos_f).abs().sum().item()
+                        if dist_n < best_dist:
+                            best_dist = dist_n
+                            best_food = food_pos_f
+
+                    if best_food is not None:
+                        dist0 = (pos0 - best_food).abs().sum().item()
+
+                        if dist0 <= 1 and best_dist <= 1:
+                            # Both near food - cooperate
+                            action_types[agent_id] = ACT_COOPERATE
+                            directions[agent_id] = DIR_STAY
+                        elif best_dist > 0:
+                            # Move toward food
+                            diff = best_food - pos_n
+                            if abs(diff[0]) >= abs(diff[1]):
+                                directions[agent_id] = DIR_UP if diff[0] < 0 else DIR_DOWN
+                            else:
+                                directions[agent_id] = DIR_LEFT if diff[1] < 0 else DIR_RIGHT
+            else:
+                # PASSIVE: No interaction yet - block attacks only
+                if action_types[agent_id] == ACT_ATTACK:
+                    action_types[agent_id] = ACT_MOVE
+                    directions[agent_id] = DIR_STAY
+
+        return directions, action_types
     else:
-        return actions
+        return directions, action_types
 
     # Apply ally behavior: move towards rich food, coop when both agents adjacent
     rich_coords = torch.nonzero(env.rich_food, as_tuple=False)
+    food_count = env.rich_food.sum().item()
+    expected_foods = getattr(env, '_coop_n_foods', 1)  # Get from scenario or default
+
     for agent_id in ally_agents:
         if not env.agent_alive[agent_id]:
             continue
         pos_a = env.agent_positions[agent_id].float()
 
-        # Default to STAY
-        actions[agent_id] = ACTION_STAY
+        # Default to MOVE + STAY
+        action_types[agent_id] = ACT_MOVE
+        directions[agent_id] = DIR_STAY
 
-        if rich_coords.numel() > 0:
-            # Find closest rich food
+        # Check if we should flee (food was recently eaten)
+        # "Flee mode": partner moves away from food nearest to agent 0
+        flee_mode = False
+        if food_count < expected_foods and rich_coords.numel() > 0:
+            # Food was eaten - find food closest to agent 0
+            best_food_for_agent0 = None
+            best_dist_to_0 = float('inf')
+            for food_pos in rich_coords:
+                food_pos_f = food_pos.float()
+                dist_to_0 = (pos0 - food_pos_f).abs().sum().item()
+                if dist_to_0 < best_dist_to_0:
+                    best_dist_to_0 = dist_to_0
+                    best_food_for_agent0 = food_pos_f
+
+            if best_food_for_agent0 is not None:
+                dist_partner_to_that_food = (pos_a - best_food_for_agent0).abs().sum().item()
+                # If partner is near that food, move AWAY from it
+                if dist_partner_to_that_food <= 3:
+                    flee_mode = True
+                    # Move away = opposite direction from food
+                    diff = pos_a - best_food_for_agent0  # Direction AWAY from food
+                    action_types[agent_id] = ACT_MOVE
+                    if abs(diff[0]) >= abs(diff[1]):
+                        directions[agent_id] = DIR_DOWN if diff[0] > 0 else DIR_UP
+                    else:
+                        directions[agent_id] = DIR_RIGHT if diff[1] > 0 else DIR_LEFT
+
+        if not flee_mode and rich_coords.numel() > 0:
+            # Normal behavior: Find closest rich food and move toward it
             best_food = None
             best_dist = float('inf')
             for food_pos in rich_coords:
@@ -109,21 +206,23 @@ def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally
 
                 if dist0 <= 1 and dist_a <= 1:
                     # Both near food - ally coops
-                    actions[agent_id] = ACTION_COOPERATE
+                    action_types[agent_id] = ACT_COOPERATE
+                    directions[agent_id] = DIR_STAY  # Direction ignored for COOP
                 elif dist_a > 0:
                     # Not on top of food yet - move towards it
+                    action_types[agent_id] = ACT_MOVE
                     diff = best_food - pos_a  # Direction to food
                     # Prioritize larger distance axis
                     if abs(diff[0]) >= abs(diff[1]):
                         if diff[0] < 0:
-                            actions[agent_id] = ACTION_UP
+                            directions[agent_id] = DIR_UP
                         elif diff[0] > 0:
-                            actions[agent_id] = ACTION_DOWN
+                            directions[agent_id] = DIR_DOWN
                     else:
                         if diff[1] < 0:
-                            actions[agent_id] = ACTION_LEFT
+                            directions[agent_id] = DIR_LEFT
                         elif diff[1] > 0:
-                            actions[agent_id] = ACTION_RIGHT
+                            directions[agent_id] = DIR_RIGHT
                 # else: adjacent to food but agent 0 not there yet - STAY
 
     # Apply enemy behavior: attack agent 0 when adjacent
@@ -135,19 +234,21 @@ def apply_scripted_partner(env, actions: torch.Tensor, relationship: str = 'ally
         dist = diff.abs().sum()
 
         if dist == 1:  # Adjacent
+            action_types[agent_id] = ACT_ATTACK
             if diff[0] == -1:  # Agent 0 is above
-                actions[agent_id] = ACTION_ATTACK_UP
+                directions[agent_id] = DIR_UP
             elif diff[0] == 1:  # Agent 0 is below
-                actions[agent_id] = ACTION_ATTACK_DOWN
+                directions[agent_id] = DIR_DOWN
             elif diff[1] == -1:  # Agent 0 is left
-                actions[agent_id] = ACTION_ATTACK_LEFT
+                directions[agent_id] = DIR_LEFT
             elif diff[1] == 1:  # Agent 0 is right
-                actions[agent_id] = ACTION_ATTACK_RIGHT
+                directions[agent_id] = DIR_RIGHT
         else:
             # Not adjacent - stay in place
-            actions[agent_id] = ACTION_STAY
+            action_types[agent_id] = ACT_MOVE
+            directions[agent_id] = DIR_STAY
 
-    return actions
+    return directions, action_types
 
 
 def save_pretrained(network, path: str, curriculum_phase: int = None):
@@ -234,25 +335,64 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
     """
     Test if model moves toward food in all 4 directions.
 
-    With unified action space, we check that the model selects move actions (0-4)
-    instead of interactions when food is adjacent.
+    With factored action space, we check that the model selects the correct
+    direction AND the MOVE action type when food is adjacent.
 
     Returns:
         (num_correct, details): num_correct out of 4, and list of (direction, expected, actual, prob)
     """
     import torch.nn.functional as F
 
+    def fourier_encode(dx, dy):
+        """Encode position using Fourier features (matching environment)."""
+        bands = [1.0, 2.0, 4.0, 8.0]
+        features = []
+        for freq in bands:
+            features.extend([
+                torch.sin(torch.tensor(freq * torch.pi * dx)),
+                torch.cos(torch.tensor(freq * torch.pi * dx)),
+                torch.sin(torch.tensor(freq * torch.pi * dy)),
+                torch.cos(torch.tensor(freq * torch.pi * dy)),
+            ])
+        return torch.stack(features)
+
     def create_obs(food_dx, food_dy):
-        """Create observation with food at relative position (scaled by 5x like env does)."""
+        """Create observation with food at relative position using Fourier encoding."""
         tokens = torch.zeros(1, config.max_entities, config.entity_token_dim, device=device)
         mask = torch.zeros(1, config.max_entities, device=device, dtype=torch.bool)
 
-        # Self token (agent 0)
-        tokens[0, 0, :] = torch.tensor([0, 0, 1, 1.0, 0, 0, 0, 0], device=device)
+        # Self token (agent 0 at position 0,0):
+        # fourier[16]: sin(0)=0, cos(0)=1 for all bands
+        # velocity[2]: [0, 0]
+        # type[2]: [0, 1] (is_agent)
+        # hp[1]: 1.0
+        # social[4]: [0, 0, 0, 0]
+        self_fourier = fourier_encode(0.0, 0.0).to(device)  # [16]
+        self_token = torch.cat([
+            self_fourier,                                      # 16: fourier
+            torch.zeros(2, device=device),                     # 2: velocity
+            torch.tensor([0.0, 1.0], device=device),           # 2: type [is_food, is_agent]
+            torch.tensor([1.0], device=device),                # 1: hp
+            torch.zeros(4, device=device),                     # 4: social
+        ])
+        tokens[0, 0, :] = self_token
         mask[0, 0] = True
 
-        # Food token (scaled positions like environment)
-        tokens[0, config.n_agents, :] = torch.tensor([food_dx * 5, food_dy * 5, 0, 0.5, 0, 0, 0, 0], device=device)
+        # Food token:
+        # fourier[16]: encoded from (food_dx, food_dy)
+        # velocity[2]: [0, 0] (food doesn't move)
+        # type[2]: [1, 0] (is_food)
+        # quality[1]: 0.5 (poor food)
+        # social[4]: [0, 0, 0, 0]
+        food_fourier = fourier_encode(food_dx, food_dy).to(device)  # [16]
+        food_token = torch.cat([
+            food_fourier,                                      # 16: fourier
+            torch.zeros(2, device=device),                     # 2: velocity
+            torch.tensor([1.0, 0.0], device=device),           # 2: type [is_food, is_agent]
+            torch.tensor([0.5], device=device),                # 1: quality
+            torch.zeros(4, device=device),                     # 4: social
+        ])
+        tokens[0, config.n_agents, :] = food_token
         mask[0, config.n_agents] = True
 
         return {
@@ -264,11 +404,11 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
             'agent_id': torch.zeros(1, dtype=torch.long, device=device)
         }
 
-    # Test cases: (row_diff, col_diff, direction_name, expected_action)
+    # Test cases: (row_diff, col_diff, direction_name, expected_direction)
     # Values are in grid cells (will be normalized by grid_size then scaled by 5x)
     # For distance 1: 1/15 * 5 = 0.333 in token
     # row_diff > 0 = food DOWN, col_diff > 0 = food RIGHT
-    # In unified action space, movement actions are 0-4: UP, DOWN, LEFT, RIGHT, STAY
+    # Direction: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY
     gs = config.grid_size
     dist1 = 1.0 / gs  # Distance 1 in normalized coords (before 5x scaling in create_obs)
     tests = [
@@ -278,28 +418,27 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
         (-dist1, 0.0, 'UP', 0),     # Food up -> move UP (idx 0)
     ]
 
-    move_names = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'STAY']
+    dir_names = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'STAY']
     correct = 0
     details = []
 
     model.eval()
     with torch.no_grad():
-        for dx, dy, name, expected_idx in tests:
+        for dx, dy, name, expected_dir in tests:
             obs = create_obs(dx, dy)
-            # Unified action head returns logits for all 15 actions
-            action_logits, _ = model.forward(obs)
-            # Extract move action probs (first 5 actions)
-            move_logits = action_logits[:, :5]
-            probs = F.softmax(move_logits, dim=-1).squeeze()
+            # Factored action heads return direction and action type logits
+            direction_logits, action_type_logits, _ = model.forward(obs)
+            # Get direction probabilities
+            dir_probs = F.softmax(direction_logits, dim=-1).squeeze()
 
-            best_action = probs.argmax().item()
-            expected_prob = probs[expected_idx].item()
-            is_correct = best_action == expected_idx
+            best_dir = dir_probs.argmax().item()
+            expected_prob = dir_probs[expected_dir].item()
+            is_correct = best_dir == expected_dir
 
             if is_correct:
                 correct += 1
 
-            details.append((name, move_names[expected_idx], move_names[best_action], expected_prob))
+            details.append((name, dir_names[expected_dir], dir_names[best_dir], expected_prob))
 
     model.train()
     return correct, details
@@ -451,7 +590,7 @@ def train(config: Config = None, visualize: bool = False,
                     sig = social[0, 1]  # Agent 0's view of agent 1 (matches entity token)
                     print(f"  [Signal] {rel.upper()}: dmg={sig[0]:.2f} food={sig[1]:.2f} coop={sig[2]:.2f} def={sig[3]:.2f}")
                     # Entity tokens (what transformer actually sees) - agent 0's view of agent 1
-                    tok = obs['entity_tokens'][0, 1, 4:8]  # social channels from agent 1 token
+                    tok = obs['entity_tokens'][0, 1, 21:25]  # social channels from agent 1 token (indices 21-24)
                     print(f"  [Token]  {rel.upper()}: dmg={tok[0]:.2f} food={tok[1]:.2f} coop={tok[2]:.2f} def={tok[3]:.2f}")
                     # Encoder output (what network produces) - check if ally/enemy produce different features
                     with torch.no_grad():
@@ -488,48 +627,58 @@ def train(config: Config = None, visualize: bool = False,
             global_step += config.n_agents
 
             # obs is already batched from vectorized env
-            # Get action mask and actions from each agent's policy
+            # Get action masks and actions from each agent's policy
             with torch.no_grad():
-                action_mask = env.get_action_masks()  # Now returns [n_agents, 15] tensor
+                direction_mask, action_type_mask = env.get_action_masks()  # Returns two [n_agents, 5] tensors
 
-                # In coop phases (6-8), mask out attack actions for BOTH agents (learn to cooperate, not fight)
-                # Attack actions are 5-8 in unified action space
+                # In coop phases (6-8), mask out ATTACK action type for BOTH agents (learn to cooperate, not fight)
+                # ACT_ATTACK = 1 in action type space
                 if scenario_config is not None and scenario_config.partner_mode == "always_coop":
-                    action_mask[0, 5:9] = False  # Disable ATTACK for agent 0
-                    action_mask[1, 5:9] = False  # Disable ATTACK for agent 1 (partner)
+                    action_type_mask[0, 1] = False  # Disable ATTACK for agent 0
+                    action_type_mask[1, 1] = False  # Disable ATTACK for agent 1 (partner)
 
                 # In scripted social phases, mask based on relationship
                 if scenario_config is not None and scenario_config.partner_mode == "scripted":
                     if env.partner_relationship == 'ally':
-                        action_mask[0, 5:9] = False  # Disable ATTACK for agent 0
-                        action_mask[1, 5:9] = False  # Disable ATTACK for agent 1 (partner)
+                        action_type_mask[0, 1] = False  # Disable ATTACK for agent 0
+                        action_type_mask[1, 1] = False  # Disable ATTACK for agent 1 (partner)
 
-                actions, log_probs, _, values = \
-                    multi_agent.get_actions_and_values(obs, action_mask=action_mask)
+                directions, action_types, log_probs, _, values = \
+                    multi_agent.get_actions_and_values(obs, direction_mask=direction_mask, action_type_mask=action_type_mask)
+
+                # Get auxiliary values for decomposed reward streams
+                aux_values = multi_agent.get_auxiliary_values(obs)
 
             # Apply scripted partner behavior (phases 6-8: always coop)
             if scenario_config is not None and scenario_config.partner_mode == "always_coop":
-                actions = apply_scripted_partner(env, actions, relationship='ally')
+                directions, action_types = apply_scripted_partner(env, directions, action_types, relationship='ally')
 
             # Apply scripted partner behavior (phase 9+: ally or enemy based on relationship)
             if scenario_config is not None and scenario_config.partner_mode == "scripted":
-                actions = apply_scripted_partner(env, actions, relationship=env.partner_relationship)
+                directions, action_types = apply_scripted_partner(env, directions, action_types, relationship=env.partner_relationship)
 
             # Record training step (before env.step so we capture pre-step state)
             if recording_this_update and episodes_this_rollout == 0:
-                # Unified action - store as single value per agent
-                actions_dict = {i: actions[i].item() for i in range(config.n_agents)}
+                # Factored actions - store direction and action_type per agent
+                actions_dict = {i: (directions[i].item(), action_types[i].item()) for i in range(config.n_agents)}
                 values_np = values.cpu().numpy()
 
+                # Convert auxiliary values to numpy for recording
+                aux_values_np = {
+                    'survival': aux_values['survival'].cpu().numpy(),
+                    'resource': aux_values['resource'].cpu().numpy(),
+                    'social': aux_values['social'].cpu().numpy(),
+                }
+
                 # Capture action probabilities for visualization
-                action_probs = multi_agent.get_action_probs(obs, action_mask)
-                action_probs_np = action_probs.cpu().numpy()
+                direction_probs, action_type_probs = multi_agent.get_action_probs(obs, direction_mask, action_type_mask)
+                action_probs_np = (direction_probs.cpu().numpy(), action_type_probs.cpu().numpy())
 
                 recorder.record(env, actions=actions_dict, values=values_np,
-                               action_probs=action_probs_np)
+                               action_probs=action_probs_np, aux_values=aux_values_np)
 
-            # Environment step (tensor-based API - unified action)
-            next_obs, rewards, dones, infos = env.step(actions)
+            # Environment step (tensor-based API - factored actions)
+            next_obs, rewards, dones, infos = env.step(directions, action_types)
 
             # Update recorded step with rewards
             if recording_this_update and episodes_this_rollout == 0 and recorder.steps:
@@ -545,11 +694,19 @@ def train(config: Config = None, visualize: bool = False,
             # Store per-agent to individual buffers (only active agents)
             for i in range(multi_agent.n_active):
                 obs_i = {k: v[i] for k, v in obs.items()}
-                mask_i = action_mask[i]
+                dir_mask_i = direction_mask[i]
+                act_mask_i = action_type_mask[i]
                 buffers[i].store(
-                    obs_i, actions[i],
+                    obs_i, directions[i], action_types[i],
                     log_probs[i], rewards[i], dones[i], values[i],
-                    action_mask=mask_i
+                    direction_mask=dir_mask_i, action_type_mask=act_mask_i,
+                    # Decomposed rewards and auxiliary values
+                    reward_survival=infos['reward_survival'][i],
+                    reward_resource=infos['reward_resource'][i],
+                    reward_social=infos['reward_social'][i],
+                    value_survival=aux_values['survival'][i],
+                    value_resource=aux_values['resource'][i],
+                    value_social=aux_values['social'][i],
                 )
 
             obs = next_obs
@@ -600,9 +757,17 @@ def train(config: Config = None, visualize: bool = False,
             next_values = multi_agent.get_values(obs)
             next_done = dones.float()
 
+            # Get auxiliary next values for decomposed reward streams
+            next_aux_values = multi_agent.get_auxiliary_values(obs)
+
         # Compute GAE for each active agent's buffer
         for i in range(multi_agent.n_active):
-            buffers[i].compute_gae(next_values[i], next_done[i])
+            buffers[i].compute_gae(
+                next_values[i], next_done[i],
+                next_value_survival=next_aux_values['survival'][i],
+                next_value_resource=next_aux_values['resource'][i],
+                next_value_social=next_aux_values['social'][i],
+            )
 
         # If no episodes completed this rollout, use agent 0's rollout reward as proxy
         if episodes_this_rollout == 0:
@@ -622,19 +787,21 @@ def train(config: Config = None, visualize: bool = False,
 
         # === DIAGNOSTIC: Check actions taken ===
         if update % 50 == 0:
-            # Unified action space: 0-4 move, 5-8 attack, 9-12 give, 13 signal, 14 coop
-            actions_taken = buffers[0].actions
-            action_counts = torch.bincount(actions_taken.long(), minlength=15)
+            # Factored action space: directions (0-4) and action_types (0-4)
+            directions_taken = buffers[0].directions
+            action_types_taken = buffers[0].action_types
+            dir_counts = torch.bincount(directions_taken.long(), minlength=5)
+            act_counts = torch.bincount(action_types_taken.long(), minlength=5)
 
-            # Movement actions (0-4)
-            move_names = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'STAY']
-            move_str = ', '.join([f"{move_names[i]}={action_counts[i].item()}" for i in range(5)])
-            print(f"  [Diag] Moves (128 steps): {move_str}")
+            # Direction counts
+            dir_names = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'STAY']
+            dir_str = ', '.join([f"{dir_names[i]}={dir_counts[i].item()}" for i in range(5)])
+            print(f"  [Diag] Directions (128 steps): {dir_str}")
 
-            # Interaction actions (5-14)
-            print(f"  [Diag] Interact: ATK={action_counts[5:9].sum().item()}, "
-                  f"GIVE={action_counts[9:13].sum().item()}, SIG={action_counts[13].item()}, "
-                  f"COOP={action_counts[14].item()}")
+            # Action type counts
+            act_names = ['MOVE', 'ATTACK', 'GIVE', 'SIGNAL', 'COOP']
+            act_str = ', '.join([f"{act_names[i]}={act_counts[i].item()}" for i in range(5)])
+            print(f"  [Diag] Action types: {act_str}")
 
             # Coop phase diagnostic: show successful cooperations
             if env.get_curriculum_phase() >= 6:

@@ -140,8 +140,9 @@ class CoopFoodScenario(Scenario):
     so agent 0 can learn to cooperate with a reliable partner.
     """
 
-    def __init__(self, distance: int):
+    def __init__(self, distance: int, n_rich_food: int = 1):
         self.distance = distance
+        self.n_rich_food = n_rich_food
 
     def get_config(self) -> ScenarioConfig:
         return ScenarioConfig(
@@ -195,14 +196,32 @@ class CoopFoodScenario(Scenario):
         env.ledger.tensor[1, 0, Ledger.DEFENSE_SCORE] = 30.0  # Agent 1 defended agent 0
         env.ledger.tensor[1, 0, Ledger.COOP_COUNT] = 5.0      # They've cooperated before
 
+        # Store expected food count for partner flee behavior
+        env._coop_n_foods = self.n_rich_food
+
     def spawn_food(self, env: 'GridWorld') -> None:
-        """Spawn one rich food in center of grid."""
+        """Spawn rich food(s) - center + 4 corners."""
         center = env.grid_size // 2
-        env.rich_food[center, center] = True
+        edge = env.grid_size - 1
+
+        if self.n_rich_food == 1:
+            env.rich_food[center, center] = True
+        else:
+            # Spawn at center + 4 corners (offset by 1 to avoid edge)
+            positions = [
+                (center, center),           # Center
+                (1, 1),                     # Top-left corner
+                (1, edge - 1),              # Top-right corner
+                (edge - 1, 1),              # Bottom-left corner
+                (edge - 1, edge - 1),       # Bottom-right corner
+            ]
+            for r, c in positions[:self.n_rich_food]:
+                env.rich_food[r, c] = True
 
     def respawn_food(self, env: 'GridWorld') -> None:
-        """Respawn rich food reachable by both agents."""
-        if env.rich_food.any():
+        """Respawn rich food if below target count."""
+        current_count = env.rich_food.sum().item()
+        if current_count >= self.n_rich_food:
             return
 
         # Bound distance
@@ -226,18 +245,18 @@ class CoopFoodScenario(Scenario):
                     dist0 = abs(nr - r0) + abs(nc - c0)
                     dist1 = abs(nr - r1) + abs(nc - c1)
                     if dist0 <= distance and dist1 <= distance:
-                        if env.occupancy[nr, nc] == -1:
+                        # Check empty and no existing food
+                        if env.occupancy[nr, nc] == -1 and not env.rich_food[nr, nc]:
                             valid_positions.append((nr, nc))
 
-        if valid_positions:
+        # Spawn foods up to target count
+        foods_needed = self.n_rich_food - int(current_count)
+        for _ in range(min(foods_needed, len(valid_positions))):
+            if not valid_positions:
+                break
             idx = torch.randint(len(valid_positions), (1,)).item()
-            nr, nc = valid_positions[idx]
+            nr, nc = valid_positions.pop(idx)
             env.rich_food[nr, nc] = True
-        else:
-            # Fallback: spawn between agents
-            if 0 <= center_r < env.grid_size and 0 <= center_c < env.grid_size:
-                if env.occupancy[center_r, center_c] == -1:
-                    env.rich_food[center_r, center_c] = True
 
     def _get_positions_at_distance(
         self, env: 'GridWorld', r: int, c: int, distance: int
@@ -260,8 +279,8 @@ class CoopFoodLowHPScenario(CoopFoodScenario):
     "desperation aggression" behavior where low-HP agents attack allies.
     """
 
-    def __init__(self, distance: int, hp_fraction: float = 0.5):
-        super().__init__(distance)
+    def __init__(self, distance: int, hp_fraction: float = 0.5, n_rich_food: int = 1):
+        super().__init__(distance, n_rich_food=n_rich_food)
         self.hp_fraction = hp_fraction
 
     def setup(self, env: 'GridWorld') -> None:
@@ -905,12 +924,13 @@ def get_curriculum() -> dict:
 
         # Cooperation (phases 6-8)
         6: CoopFoodScenario(distance=1),
-        7: CoopFoodScenario(distance=2),
+        7: CoopFoodScenario(distance=2, n_rich_food=2),
         8: CoopFoodScenario(distance=3),
 
         # Low-HP cooperation (phase 9) - teaches cooperation when wounded
         # Prevents "desperation aggression" where low-HP agents attack allies
-        9: CoopFoodLowHPScenario(distance=3, hp_fraction=0.5),
+        # Multiple rich foods (center + 4 corners) for more cooperation opportunities
+        9: CoopFoodLowHPScenario(distance=3, hp_fraction=0.5, n_rich_food=5),
 
         # Social pretraining (phases 10-12)
         # Phase 10: 2 agents - 50% scripted friend (like phase 9), 50% neutral stranger (learning)

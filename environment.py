@@ -21,25 +21,15 @@ from ledger import Ledger
 # Scenarios are applied via apply_scenario() after reset()
 
 
-# Unified action space (15 actions total - move OR interact per step)
-# Movement actions (0-4)
-ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT = 0, 1, 2, 3
-ACTION_STAY = 4
+# Factored action space: Direction + Action Type
+# Direction head (5 outputs)
+DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
 
-# Interaction actions (5-14)
-ACTION_ATTACK_UP, ACTION_ATTACK_DOWN, ACTION_ATTACK_LEFT, ACTION_ATTACK_RIGHT = 5, 6, 7, 8
-ACTION_GIVE_UP, ACTION_GIVE_DOWN, ACTION_GIVE_LEFT, ACTION_GIVE_RIGHT = 9, 10, 11, 12
-ACTION_SIGNAL = 13
-ACTION_COOPERATE = 14
+# Action type head (5 outputs)
+ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
 
-# Legacy constants for internal use (relative to interact action base)
-# Used when decomposing unified actions for processing
-INTERACT_BASE = 5  # First interact action index
-ATTACK_DIR_OFFSET = 0   # ATTACK_UP is at INTERACT_BASE + 0
-GIVE_DIR_OFFSET = 4     # GIVE_UP is at INTERACT_BASE + 4
-
-# Direction deltas: UP, DOWN, LEFT, RIGHT
-DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+# Direction deltas: UP, DOWN, LEFT, RIGHT, STAY
+DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]
 
 
 class GridWorld:
@@ -72,6 +62,7 @@ class GridWorld:
 
         # State tensors (initialized in reset)
         self.agent_positions: torch.Tensor = None  # [n_agents, 2] (row, col)
+        self.prev_agent_positions: torch.Tensor = None  # [n_agents, 2] previous positions for velocity
         self.agent_hp: torch.Tensor = None         # [n_agents]
         self.agent_alive: torch.Tensor = None      # [n_agents] bool
         self.agent_inventory: torch.Tensor = None  # [n_agents] stored food units
@@ -199,6 +190,9 @@ class GridWorld:
         # Initialize signals (none active)
         self.signals = torch.zeros(self.n_agents, device=self.device, dtype=torch.bool)
 
+        # Initialize previous positions for velocity computation (same as current at reset)
+        self.prev_agent_positions = self.agent_positions.clone()
+
         return self._get_all_observations()
 
     def apply_scenario(self, scenario: 'Scenario') -> None:
@@ -221,43 +215,39 @@ class GridWorld:
         self.rich_food.zero_()
         scenario.spawn_food(self)
 
-    def step(self, actions: torch.Tensor) -> Tuple[
+    def step(self, directions: torch.Tensor, action_types: torch.Tensor) -> Tuple[
         Dict[str, torch.Tensor],  # observations (batched)
         torch.Tensor,              # rewards [n_agents]
         torch.Tensor,              # dones [n_agents]
         dict                       # infos
     ]:
         """
-        Execute one environment step with unified actions.
+        Execute one environment step with factored actions.
 
-        Each agent chooses ONE action per step (move OR interact, not both).
+        Factored action space:
+            directions: [n_agents] int tensor (0-4: UP, DOWN, LEFT, RIGHT, STAY)
+            action_types: [n_agents] int tensor (0-4: MOVE, ATTACK, GIVE, SIGNAL, COOPERATE)
 
-        Action space (15 total):
-            0-4: Movement (UP, DOWN, LEFT, RIGHT, STAY)
-            5-8: ATTACK (UP, DOWN, LEFT, RIGHT)
-            9-12: GIVE (UP, DOWN, LEFT, RIGHT)
-            13: SIGNAL
-            14: COOPERATE
+        Direction is used for MOVE, ATTACK, GIVE. Ignored for SIGNAL and COOPERATE.
 
         Args:
-            actions: [n_agents] int tensor of unified actions (0-14)
+            directions: [n_agents] direction (0-4)
+            action_types: [n_agents] action type (0-4)
 
         Returns:
             observations, rewards, dones, infos
         """
         self.step_count += 1
 
-        # === Decompose unified actions into move vs interact ===
-        # Actions 0-4 are movement, 5-14 are interactions
-        is_move = actions < INTERACT_BASE  # Actions 0-4 are moves
-        is_interact = ~is_move
+        # Store previous positions for velocity calculation (before any movement)
+        self.prev_agent_positions = self.agent_positions.clone()
 
-        # For movement: use action directly if moving, else STAY
-        move_actions = torch.where(is_move, actions, torch.tensor(ACTION_STAY, device=self.device))
-
-        # For interactions: convert to relative index (0-9)
-        # Actions 5-14 map to interact indices 0-9
-        interact_actions = torch.where(is_interact, actions - INTERACT_BASE, torch.tensor(-1, device=self.device))
+        # === Decompose factored actions ===
+        is_move = (action_types == ACT_MOVE)
+        is_attack = (action_types == ACT_ATTACK)
+        is_give = (action_types == ACT_GIVE)
+        is_signal = (action_types == ACT_SIGNAL)
+        is_coop = (action_types == ACT_COOPERATE)
 
         # === Track HP at start ===
         hp_before = self.agent_hp.clone()
@@ -268,22 +258,23 @@ class GridWorld:
         # 1. Process interactions FIRST (attack, give food, signal)
         #    This happens from CURRENT position before movement
         #    So agent attacks what they SEE in their observation
-        #    Only process if agent chose an interact action
-        attack_rewards, damage_taken, defense_rewards, revenge_rewards = self._resolve_interactions(interact_actions, is_interact)
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards = self._resolve_interactions(
+            directions, action_types, is_attack, is_give, is_signal
+        )
 
         # 2. Resolve movement (Heavyweight Rule)
-        #    Only process if agent chose a move action
-        self._resolve_movement(move_actions, is_move)
+        #    Only process if agent chose MOVE action
+        self._resolve_movement(directions, is_move)
         self._update_occupancy()
 
         # 3. Apply HP decay (vectorized)
         self._apply_hp_decay()
 
         # 4. Process food eating (agents on food cells after movement)
-        food_rewards = self._process_food_eating(actions)
+        food_rewards = self._process_food_eating(action_types)
 
         # 4a. Compute intrinsic reward for attempting COOP near rich food + ally
-        intrinsic_coop_rewards = self._compute_intrinsic_coop_rewards(actions)
+        intrinsic_coop_rewards = self._compute_intrinsic_coop_rewards(action_types)
 
         # 4b. Auto-consume inventory to heal (if HP < max and have inventory)
         self._consume_inventory()
@@ -317,6 +308,7 @@ class GridWorld:
             + attack_rewards        # Attack bonus
             + defense_rewards       # Defense bonus (for protecting allies)
             + revenge_rewards       # Revenge bonus (for retaliating against attackers)
+            + betrayal_rewards      # Betrayal penalty (for attacking benefactors)
             + damage_pain           # Damage pain (non-linear)
             + low_hp_penalty        # Low HP penalty (constant per tick)
         )
@@ -340,7 +332,16 @@ class GridWorld:
             self._check_curriculum_advance(self.current_episode_reward)
             self.current_episode_reward = 0.0
 
-        infos = {}
+        # Group reward components for auxiliary value heads
+        survival_rewards = damage_pain + low_hp_penalty + death_rewards
+        resource_rewards = food_rewards
+        social_rewards = attack_rewards + defense_rewards + revenge_rewards + betrayal_rewards + intrinsic_coop_rewards
+
+        infos = {
+            'reward_survival': survival_rewards,   # [n_agents] tensor
+            'reward_resource': resource_rewards,   # [n_agents] tensor
+            'reward_social': social_rewards,       # [n_agents] tensor
+        }
 
         return observations, rewards, dones, infos
 
@@ -362,6 +363,32 @@ class GridWorld:
         adjacent.fill_diagonal_(False)
 
         return adjacent
+
+    def _fourier_encode(self, rel_pos: torch.Tensor) -> torch.Tensor:
+        """
+        Encode relative positions using Fourier features (multi-frequency sin/cos).
+
+        Args:
+            rel_pos: [..., 2] tensor of (dx, dy) normalized to [-1, 1]
+
+        Returns:
+            [..., 16] tensor of Fourier features (4 bands × 4 features per band)
+        """
+        # Frequency bands: 1, 2, 4, 8 (coarse to fine)
+        bands = [1.0, 2.0, 4.0, 8.0]
+
+        dx = rel_pos[..., 0:1]  # [..., 1]
+        dy = rel_pos[..., 1:2]  # [..., 1]
+
+        features = []
+        for freq in bands:
+            # Each band produces 4 features: sin(dx), cos(dx), sin(dy), cos(dy)
+            features.append(torch.sin(freq * torch.pi * dx))
+            features.append(torch.cos(freq * torch.pi * dx))
+            features.append(torch.sin(freq * torch.pi * dy))
+            features.append(torch.cos(freq * torch.pi * dy))
+
+        return torch.cat(features, dim=-1)  # [..., 16]
 
     def _compute_nearest_food_info(self, positions: torch.Tensor, poor_only: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -496,72 +523,83 @@ class GridWorld:
             self.agent_positions
         )
 
-    def _resolve_interactions(self, interact_actions: torch.Tensor, is_interact: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _resolve_interactions(
+        self,
+        directions: torch.Tensor,
+        action_types: torch.Tensor,
+        is_attack: torch.Tensor,
+        is_give: torch.Tensor,
+        is_signal: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process attack, give food, and signal actions with direction targeting.
 
         Args:
-            interact_actions: [n_agents] relative interact action indices (0-9)
-                0-3: ATTACK (UP, DOWN, LEFT, RIGHT)
-                4-7: GIVE (UP, DOWN, LEFT, RIGHT)
-                8: SIGNAL
-                9: COOPERATE
-                -1: Not interacting (chose movement)
-            is_interact: [n_agents] bool mask - only process agents where True
+            directions: [n_agents] direction indices (0-4: UP, DOWN, LEFT, RIGHT, STAY)
+            action_types: [n_agents] action type indices (0-4: MOVE, ATTACK, GIVE, SIGNAL, COOPERATE)
+            is_attack: [n_agents] bool mask for agents choosing ATTACK
+            is_give: [n_agents] bool mask for agents choosing GIVE
+            is_signal: [n_agents] bool mask for agents choosing SIGNAL
 
         Returns:
             attack_rewards: [n_agents] reward for damage dealt
             damage_taken: [n_agents] damage received by each agent
             defense_rewards: [n_agents] reward for defending allies
             revenge_rewards: [n_agents] reward for retaliating against attackers
+            betrayal_rewards: [n_agents] penalty for attacking benefactors
         """
-        # Only process agents who chose interact actions and are alive
-        active_mask = is_interact & self.agent_alive
-
-        # Signal actions (relative action 8)
-        signal_mask = (interact_actions == 8) & active_mask
+        # Signal actions - only process alive agents who chose SIGNAL
+        signal_mask = is_signal & self.agent_alive
         self.signals = signal_mask
 
-        # Attack actions (relative 0-3: 4 cardinal directions)
-        attack_mask = (interact_actions >= 0) & (interact_actions <= 3) & active_mask
-        attack_rewards, damage_taken, defense_rewards, revenge_rewards = self._resolve_attacks(interact_actions, attack_mask)
+        # Attack actions - only process alive agents who chose ATTACK
+        attack_mask = is_attack & self.agent_alive
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards = self._resolve_attacks(directions, attack_mask)
 
-        # Give food actions (relative 4-7: 4 cardinal directions)
-        give_mask = (interact_actions >= 4) & (interact_actions <= 7) & active_mask
-        self._resolve_give_food(interact_actions, give_mask)
+        # Give food actions - only process alive agents who chose GIVE
+        give_mask = is_give & self.agent_alive
+        self._resolve_give_food(directions, give_mask)
 
-        return attack_rewards, damage_taken, defense_rewards, revenge_rewards
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
 
-    def _resolve_attacks(self, interact_actions: torch.Tensor, attack_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _resolve_attacks(self, directions: torch.Tensor, attack_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Resolve attacks with direction targeting and defense tracking - FULLY VECTORIZED.
 
         Each attacker targets ONE cell in their chosen direction.
         Defense: if C attacks A who attacked B in last 3 steps, C defended B.
         Revenge: if C attacks A who attacked C recently, C gets revenge reward.
+        Betrayal: if C attacks A who helped C before (food/coop), C gets betrayal penalty.
         Attack costs 5% of max HP regardless of whether it hits.
+
+        Args:
+            directions: [n_agents] direction indices (0-4: UP, DOWN, LEFT, RIGHT, STAY)
+            attack_mask: [n_agents] bool mask for agents choosing ATTACK
 
         Returns:
             attack_rewards: [n_agents] reward for damage dealt
             damage_taken: [n_agents] damage received by each agent
             defense_rewards: [n_agents] reward for defending allies
             revenge_rewards: [n_agents] reward for retaliating
+            betrayal_rewards: [n_agents] penalty for attacking benefactors
         """
         # Initialize return tensors
         attack_rewards = torch.zeros(self.n_agents, device=self.device)
         damage_taken = torch.zeros(self.n_agents, device=self.device)
         defense_rewards = torch.zeros(self.n_agents, device=self.device)
         revenge_rewards = torch.zeros(self.n_agents, device=self.device)
+        betrayal_rewards = torch.zeros(self.n_agents, device=self.device)
 
         # Early exit if no attackers
         if not attack_mask.any():
-            return attack_rewards, damage_taken, defense_rewards, revenge_rewards
+            return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
 
         # === STEP 1: Apply attack cost to ALL attackers at once ===
         attack_cost = self.config.max_hp * 0.05
         self.agent_hp = self.agent_hp - attack_cost * attack_mask.float()
 
         # === STEP 2: Compute target positions for ALL agents ===
-        attack_dirs = interact_actions.clamp(0, 3)
+        # Use only the first 4 directions (UP, DOWN, LEFT, RIGHT) - clamp to handle STAY
+        attack_dirs = directions.clamp(0, 3)
         deltas = self.dir_deltas_4[attack_dirs]  # [n_agents, 2]
         target_positions = self.agent_positions + deltas
         target_rows = target_positions[:, 0]
@@ -636,6 +674,14 @@ class GridWorld:
                 if recent_victims[a, c]:  # A attacked C recently
                     revenge_rewards[c] += dmg * self.config.r_revenge
 
+                # === Betrayal: Did A help ME (C) before? ===
+                food_from_a = self.ledger.tensor[a, c, Ledger.FOOD_GIVEN]
+                coop_with_a = self.ledger.tensor[a, c, Ledger.COOP_COUNT]
+                help_from_a = food_from_a + coop_with_a
+                if help_from_a > 0:
+                    # Penalty for attacking someone who helped you
+                    betrayal_rewards[c] += help_from_a * self.config.r_betrayal
+
                 # === Defense: Get all B that A attacked recently (excluding C) ===
                 victims_of_a = recent_victims[a].clone()
                 victims_of_a[c] = False  # Exclude self (revenge handled separately)
@@ -656,15 +702,19 @@ class GridWorld:
         # Damage taken per agent (sum over attackers) - still tracks all damage for pain calculation
         damage_taken = damage_matrix.sum(dim=0)
 
-        return attack_rewards, damage_taken, defense_rewards, revenge_rewards
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
 
-    def _resolve_give_food(self, interact_actions: torch.Tensor, give_mask: torch.Tensor) -> None:
+    def _resolve_give_food(self, directions: torch.Tensor, give_mask: torch.Tensor) -> None:
         """
         Resolve food giving from INVENTORY - FULLY VECTORIZED.
 
         Giver transfers from their INVENTORY (no HP cost!).
         Target receives to their INVENTORY.
         Only transfers if giver has inventory AND valid target exists.
+
+        Args:
+            directions: [n_agents] direction indices (0-4: UP, DOWN, LEFT, RIGHT, STAY)
+            give_mask: [n_agents] bool mask for agents choosing GIVE
         """
         food_value = self.config.poor_food_value
 
@@ -683,8 +733,8 @@ class GridWorld:
         valid_giver = give_mask & (give_amount > 0)
 
         # === STEP 2: Compute target positions ===
-        # Relative interact actions 4-7 are GIVE directions (UP, DOWN, LEFT, RIGHT)
-        give_dirs = (interact_actions - 4).clamp(0, 3)
+        # Use direction directly - clamp to handle STAY (would be invalid anyway)
+        give_dirs = directions.clamp(0, 3)
         deltas = self.dir_deltas_4[give_dirs]
         target_positions = self.agent_positions + deltas
         target_rows = target_positions[:, 0]
@@ -728,14 +778,14 @@ class GridWorld:
             ledger_food = self.ledger.tensor[:, :, Ledger.FOOD_GIVEN].view(-1)
             ledger_food.scatter_add_(0, flat_indices, transfer_values)
 
-    def _process_food_eating(self, actions: torch.Tensor) -> torch.Tensor:
+    def _process_food_eating(self, action_types: torch.Tensor) -> torch.Tensor:
         """Process agents eating food on their cells.
 
         Poor food: picked up automatically by stepping on it -> goes to INVENTORY
         Rich food: requires 2+ adjacent agents who both chose COOPERATE action -> goes to INVENTORY
 
         Args:
-            actions: [n_agents] unified action indices (0-14)
+            action_types: [n_agents] action type indices (0-4: MOVE, ATTACK, GIVE, SIGNAL, COOPERATE)
 
         Returns:
             food_rewards: [n_agents] explicit reward for picking up food
@@ -762,8 +812,7 @@ class GridWorld:
         poor_food_flat[eat_indices] = False
 
         # Rich food - requires 2+ adjacent agents who BOTH chose COOPERATE (vectorized)
-        # ACTION_COOPERATE = 14 in unified action space
-        coop_mask = (actions == ACTION_COOPERATE) & self.agent_alive
+        coop_mask = (action_types == ACT_COOPERATE) & self.agent_alive
 
         rich_rewards = self._process_rich_food_vectorized(coop_mask)
         food_rewards += rich_rewards
@@ -818,6 +867,17 @@ class GridWorld:
         eligible_consumed = eligible[:, consumed_food_indices].float()  # [N, C]
         coop_pairs = eligible_consumed @ eligible_consumed.T  # [N, N]
         coop_pairs.fill_diagonal_(0)  # No self-cooperation
+
+        # === Reciprocity bonus: reward cooperating with agents who helped you before ===
+        # Prior help from each agent BEFORE updating ledger (food given + prior coop count)
+        prior_food = self.ledger.tensor[:, :, Ledger.FOOD_GIVEN]  # [N, N]
+        prior_coop = self.ledger.tensor[:, :, Ledger.COOP_COUNT]  # [N, N]
+        prior_help = prior_food + prior_coop  # prior_help[i,j] = help agent i received from j
+
+        # For each agent, sum over partners: coop_pairs[i,j] * prior_help[i,j]
+        # This rewards cooperating with agents who previously helped you
+        reciprocity_bonus = (coop_pairs * prior_help).sum(dim=1) * self.config.r_reciprocity
+
         self.ledger.tensor[:, :, Ledger.COOP_COUNT] += coop_pairs
 
         # Remove consumed food
@@ -826,11 +886,13 @@ class GridWorld:
         self.rich_food[consumed_rows, consumed_cols] = False
 
         # Return explicit reward for participating in rich food consumption (100x during warmup)
+        # Plus reciprocity bonus for cooperating with those who helped you
         reward_multiplier = 100.0 if self.episode_count <= self.warmup_episodes else 1.0
         participated = (foods_per_agent > 0).float()
-        return participated * self.config.r_large * reward_multiplier
+        food_reward = participated * self.config.r_large * reward_multiplier
+        return food_reward + reciprocity_bonus
 
-    def _compute_intrinsic_coop_rewards(self, actions: torch.Tensor) -> torch.Tensor:
+    def _compute_intrinsic_coop_rewards(self, action_types: torch.Tensor) -> torch.Tensor:
         """
         Compute intrinsic reward for attempting COOP when conditions are right.
 
@@ -842,13 +904,12 @@ class GridWorld:
         This encourages agents to try COOP even before they coordinate successfully.
 
         Args:
-            actions: [n_agents] unified action indices (0-14)
+            action_types: [n_agents] action type indices (0-4)
         """
         intrinsic_rewards = torch.zeros(self.n_agents, device=self.device)
 
         # Get agents who chose COOP and are alive
-        # ACTION_COOPERATE = 14 in unified action space
-        coop_mask = (actions == ACTION_COOPERATE) & self.agent_alive
+        coop_mask = (action_types == ACT_COOPERATE) & self.agent_alive
 
         # Early exit if no cooperators or no rich food
         if not coop_mask.any():
@@ -1229,7 +1290,7 @@ class GridWorld:
         """Build batched observations for all agents."""
         entity_tokens, entity_mask = self._get_entity_tokens()
         return {
-            'entity_tokens': entity_tokens,    # [n_agents, max_entities, 8]
+            'entity_tokens': entity_tokens,    # [n_agents, max_entities, 25]
             'entity_mask': entity_mask,        # [n_agents, max_entities]
             'signals': self.signals.float().unsqueeze(0).expand(self.n_agents, -1),
             'self_hp': (self.agent_hp / self.config.max_hp).unsqueeze(1),
@@ -1237,38 +1298,39 @@ class GridWorld:
             'agent_id': torch.arange(self.n_agents, device=self.device)
         }
 
-    def get_action_masks(self) -> torch.Tensor:
+    def get_action_masks(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute valid action mask for unified action space.
+        Compute valid action masks for factored action space.
 
         Returns:
-            action_mask: [n_agents, 15] bool - which actions are valid
+            direction_mask: [n_agents, 5] bool - which directions are valid
+            action_type_mask: [n_agents, 5] bool - which action types are valid
 
-        Action space:
-            0-4: Movement (UP, DOWN, LEFT, RIGHT, STAY)
-            5-8: ATTACK (UP, DOWN, LEFT, RIGHT) - needs adjacent agent
-            9-12: GIVE (UP, DOWN, LEFT, RIGHT) - needs adjacent agent
-            13: SIGNAL - always valid
-            14: COOPERATE - needs rich food within distance 1
+        Direction mask (5 outputs): UP, DOWN, LEFT, RIGHT, STAY
+            - For MOVE: direction valid if in bounds
+            - For ATTACK/GIVE: direction valid if adjacent agent exists
+            - STAY (direction 4) is always valid
+
+        Action type mask (5 outputs): MOVE, ATTACK, GIVE, SIGNAL, COOPERATE
+            - MOVE: always valid for alive agents
+            - ATTACK: valid if any adjacent agent exists
+            - GIVE: valid if any adjacent agent exists
+            - SIGNAL: always valid for alive agents
+            - COOPERATE: valid if rich food within distance 1
         """
         n = self.n_agents
         gs = self.grid_size
 
-        # Initialize all actions as valid
-        action_mask = torch.ones(n, 15, dtype=torch.bool, device=self.device)
-
-        # === MOVEMENT (0-4) ===
-        # Check each direction: in bounds?
+        # === DIRECTION MASK [n, 5] ===
+        # Check each direction for movement bounds
         intended = self.agent_positions.unsqueeze(1) + self.direction_deltas.unsqueeze(0)  # [n, 5, 2]
         in_bounds = (
             (intended[..., 0] >= 0) & (intended[..., 0] < gs) &
             (intended[..., 1] >= 0) & (intended[..., 1] < gs)
         )
-        move_mask = in_bounds & self.agent_alive.unsqueeze(1)  # [n, 5]
-        action_mask[:, 0:5] = move_mask
+        direction_mask = in_bounds & self.agent_alive.unsqueeze(1)  # [n, 5]
 
-        # === DIRECTION TARGETS (for attack/give) [n, 4] ===
-        # Check each of 4 cardinal directions: is there a living agent?
+        # === Check for adjacent agents (for ATTACK/GIVE validity) ===
         target_pos = self.agent_positions.unsqueeze(1) + self.dir_deltas_4.unsqueeze(0)  # [n, 4, 2]
         target_in_bounds = (
             (target_pos[..., 0] >= 0) & (target_pos[..., 0] < gs) &
@@ -1280,18 +1342,27 @@ class GridWorld:
 
         has_target = (occupants >= 0)
         target_alive = self.agent_alive[occupants.clamp(min=0)] & has_target
-        direction_valid = target_in_bounds & target_alive & self.agent_alive.unsqueeze(1)  # [n, 4]
+        direction_has_agent = target_in_bounds & target_alive  # [n, 4] - which directions have adjacent agent
 
-        # === ATTACK (5-8) ===
-        action_mask[:, 5:9] = direction_valid
+        # Any adjacent agent? (for enabling ATTACK/GIVE action types)
+        any_adjacent_agent = direction_has_agent.any(dim=1)  # [n]
 
-        # === GIVE (9-12) ===
-        action_mask[:, 9:13] = direction_valid
+        # === ACTION TYPE MASK [n, 5] ===
+        action_type_mask = torch.zeros(n, 5, dtype=torch.bool, device=self.device)
 
-        # === SIGNAL (13) - always valid for alive agents ===
-        action_mask[:, 13] = self.agent_alive
+        # MOVE (type 0) - always valid for alive agents
+        action_type_mask[:, ACT_MOVE] = self.agent_alive
 
-        # === COOPERATE (14) - valid if rich food within distance 1 ===
+        # ATTACK (type 1) - valid if any adjacent agent exists
+        action_type_mask[:, ACT_ATTACK] = any_adjacent_agent & self.agent_alive
+
+        # GIVE (type 2) - valid if any adjacent agent exists
+        action_type_mask[:, ACT_GIVE] = any_adjacent_agent & self.agent_alive
+
+        # SIGNAL (type 3) - always valid for alive agents
+        action_type_mask[:, ACT_SIGNAL] = self.agent_alive
+
+        # COOPERATE (type 4) - valid if rich food within distance 1
         rich_coords = torch.nonzero(self.rich_food, as_tuple=False)  # [F, 2]
         if rich_coords.numel() > 0:
             pos = self.agent_positions.float()
@@ -1300,47 +1371,62 @@ class GridWorld:
             rich_nearby = (dist <= 1).any(dim=1)  # [n]
         else:
             rich_nearby = torch.zeros(n, dtype=torch.bool, device=self.device)
-        action_mask[:, 14] = rich_nearby & self.agent_alive
+        action_type_mask[:, ACT_COOPERATE] = rich_nearby & self.agent_alive
 
-        return action_mask
+        return direction_mask, action_type_mask
 
     def _get_entity_tokens(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Create unified entity tokens for agents AND food.
+        Create unified entity tokens for agents AND food using Fourier positional encoding.
 
-        Token format (8 features):
-            - dx, dy: relative position (normalized by grid size)
-            - entity_type: 0=food, 1=agent
-            - value: quality (food) or hp (agent)
+        Token format (25 features):
+            - fourier_spatial[16]: 4 freq bands × (sin_dx, cos_dx, sin_dy, cos_dy)
+            - velocity[2]: (dv_x, dv_y) × 10.0 scaling
+            - type_onehot[2]: [is_food, is_agent]
+            - value[1]: quality (food) or hp (agent)
             - social[4]: interaction history (zeros for food)
 
         Returns:
-            tokens: [n_agents, max_entities, 8] - padded to max_entities
+            tokens: [n_agents, max_entities, 25] - padded to max_entities
             mask: [n_agents, max_entities] - True if token is valid
         """
         n = self.n_agents
         gs = self.config.grid_size
         max_food = self.config.max_food_tokens
         max_ent = self.config.max_entities  # n_agents + max_food_tokens
+        token_dim = self.config.entity_token_dim  # 25
 
         # Initialize output tensors
-        tokens = torch.zeros(n, max_ent, 8, device=self.device)
+        tokens = torch.zeros(n, max_ent, token_dim, device=self.device)
         mask = torch.zeros(n, max_ent, device=self.device, dtype=torch.bool)
 
         # === AGENT TOKENS (first n_agents slots) ===
-        # Relative positions: pos[j] - pos[i] for all pairs
-        # Scale by 5x after normalization so positions have stronger signal in embeddings
-        rel_pos_agents = (self.agent_positions.unsqueeze(0) - self.agent_positions.unsqueeze(1)).float()
-        rel_pos_agents = (rel_pos_agents / gs) * 5.0  # Normalize and scale up
+        # Current relative positions normalized to [-1, 1]
+        rel_pos_curr = (self.agent_positions.unsqueeze(0) - self.agent_positions.unsqueeze(1)).float()
+        rel_pos_norm = rel_pos_curr / gs  # [n, n, 2]
 
-        # Agent features
-        agent_type = torch.ones(n, n, 1, device=self.device)  # type=1 for agents
+        # Previous relative positions (for velocity)
+        rel_pos_prev = (self.prev_agent_positions.unsqueeze(0) - self.prev_agent_positions.unsqueeze(1)).float()
+        rel_pos_prev_norm = rel_pos_prev / gs  # [n, n, 2]
+
+        # Fourier encode current position [n, n, 16]
+        fourier_agents = self._fourier_encode(rel_pos_norm)
+
+        # Velocity = (current - previous) * 10.0 for visibility [n, n, 2]
+        velocity_agents = (rel_pos_norm - rel_pos_prev_norm) * 10.0
+
+        # One-hot type: [is_food=0, is_agent=1] for all agent tokens [n, n, 2]
+        type_onehot_agents = torch.zeros(n, n, 2, device=self.device)
+        type_onehot_agents[:, :, 1] = 1  # is_agent = 1
+
+        # HP normalized [n, n, 1]
         agent_hp = (self.agent_hp / self.config.max_hp).view(1, n, 1).expand(n, n, 1)
-        # Scale social features by 5x to match position feature magnitude
-        social = self.ledger.get_normalized_tensor() * 5.0  # [n, n, 4] scaled to [0, 5]
 
-        # Combine: [n, n, 8] = dx, dy, type, hp, social[4]
-        agent_tokens = torch.cat([rel_pos_agents, agent_type, agent_hp, social], dim=-1)
+        # Social features [n, n, 4] scaled by 5.0 for stronger signal
+        social = self.ledger.get_normalized_tensor() * 5.0
+
+        # Combine: [n, n, 25] = fourier[16] + velocity[2] + type[2] + hp[1] + social[4]
+        agent_tokens = torch.cat([fourier_agents, velocity_agents, type_onehot_agents, agent_hp, social], dim=-1)
         tokens[:, :n, :] = agent_tokens
 
         # Agent mask: alive agents are valid
@@ -1389,15 +1475,27 @@ class GridWorld:
             nearest_rel_pos = rel_pos_food[batch_idx, nearest_idx]  # [n, k, 2]
             nearest_quality = food_quality[nearest_idx]  # [n, k]
 
-            # Normalize and scale up positions (5x for stronger signal)
-            nearest_rel_pos = (nearest_rel_pos / gs) * 5.0
+            # Normalize positions for Fourier encoding
+            nearest_rel_norm = nearest_rel_pos / gs  # [n, k, 2]
 
-            # Build food tokens: [dx, dy, type=0, quality, 0, 0, 0, 0]
-            food_type = torch.zeros(n, k, 1, device=self.device)  # type=0 for food
-            food_val = nearest_quality.unsqueeze(-1)  # [n, k, 1]
-            food_social = torch.zeros(n, k, 4, device=self.device)  # No social for food
+            # Fourier encode food positions [n, k, 16]
+            fourier_food = self._fourier_encode(nearest_rel_norm)
 
-            food_tokens = torch.cat([nearest_rel_pos, food_type, food_val, food_social], dim=-1)
+            # Velocity for food = 0 (food doesn't move) [n, k, 2]
+            velocity_food = torch.zeros(n, k, 2, device=self.device)
+
+            # One-hot type: [is_food=1, is_agent=0] [n, k, 2]
+            type_onehot_food = torch.zeros(n, k, 2, device=self.device)
+            type_onehot_food[:, :, 0] = 1  # is_food = 1
+
+            # Quality [n, k, 1]
+            food_val = nearest_quality.unsqueeze(-1)
+
+            # No social for food [n, k, 4]
+            food_social = torch.zeros(n, k, 4, device=self.device)
+
+            # Combine: [n, k, 25] = fourier[16] + velocity[2] + type[2] + value[1] + social[4]
+            food_tokens = torch.cat([fourier_food, velocity_food, type_onehot_food, food_val, food_social], dim=-1)
 
             # Place in output (after agent tokens)
             tokens[:, n:n+k, :] = food_tokens
@@ -1410,7 +1508,7 @@ class GridWorld:
 class GridWorldCompat(GridWorld):
     """Wrapper providing backward-compatible dict-based API."""
 
-    def step(self, actions: Dict[int, int]) -> Tuple[
+    def step(self, directions: Dict[int, int], action_types: Dict[int, int]) -> Tuple[
         Dict[int, Dict[str, torch.Tensor]],
         Dict[int, float],
         Dict[int, bool],
@@ -1419,16 +1517,21 @@ class GridWorldCompat(GridWorld):
         """Dict-based step for backward compatibility.
 
         Args:
-            actions: Dict mapping agent_id -> unified action (0-14)
+            directions: Dict mapping agent_id -> direction (0-4)
+            action_types: Dict mapping agent_id -> action type (0-4)
         """
-        # Convert dict to tensor
-        action_tensor = torch.tensor(
-            [actions[i] for i in range(self.n_agents)],
+        # Convert dicts to tensors
+        direction_tensor = torch.tensor(
+            [directions[i] for i in range(self.n_agents)],
+            device=self.device, dtype=torch.long
+        )
+        action_type_tensor = torch.tensor(
+            [action_types[i] for i in range(self.n_agents)],
             device=self.device, dtype=torch.long
         )
 
         # Call vectorized step
-        obs, rewards, dones, infos = super().step(action_tensor)
+        obs, rewards, dones, infos = super().step(direction_tensor, action_type_tensor)
 
         # Convert outputs to dicts
         obs_dict = {}

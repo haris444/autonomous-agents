@@ -14,15 +14,14 @@ class Config:
     hp_decay_rate: float = 0.01   # Fraction of max HP lost per tick (1 HP/tick)
     max_steps_per_episode: int = 128
 
-    # Actions - unified action space (move OR interact, not both)
-    n_actions: int = 15          # 5 move + 10 interact (no IDLE)
-    n_move_actions: int = 5      # UP, DOWN, LEFT, RIGHT, STAY (actions 0-4)
-    n_interact_actions: int = 10 # ATTACK x4, GIVE x4, SIGNAL, COOPERATE (actions 5-14, no IDLE)
-    n_directions: int = 4        # 4 cardinal directions for ATTACK/GIVE
+    # Factored action space - direction + action type heads
+    n_directions: int = 5        # UP=0, DOWN=1, LEFT=2, RIGHT=3, STAY=4
+    n_action_types: int = 5      # MOVE=0, ATTACK=1, GIVE=2, SIGNAL=3, COOPERATE=4
 
     # Entity tokens (unified agents + food representation)
     max_food_tokens: int = 16    # Limit food tokens to K nearest
-    entity_token_dim: int = 8    # dx, dy, type, quality/hp, social[4]
+    entity_token_dim: int = 25   # fourier[16] + velocity[2] + type_onehot[2] + value[1] + social[4]
+    fourier_bands: int = 4       # Number of frequency octaves (1, 2, 4, 8)
 
     # Attention/Transformer parameters
     attention_embed_dim: int = 64
@@ -42,7 +41,9 @@ class Config:
     r_damage_taken: float = -1.0  # Penalty per HP lost (scaled by HP ratio)
     r_low_hp: float = -3.125    # Per-tick penalty when HP is low (50x original)
     r_food_share: float = 0.0   # No bonus - giving food already transfers HP naturally
-    r_defense: float = 0.0      # No bonus - defense value is in the OBSERVATION, not reward
+    r_betrayal: float = -0.5    # Penalty for attacking agents who helped you
+    r_reciprocity: float = 0.2  # Bonus for cooperating with agents who helped you
+    r_defense: float = 0.2      # Bonus for defending allies (attacking their attackers)
     r_revenge: float = 0.5      # Bonus for retaliating against attackers (50% of damage dealt)
     r_survival: float = 0.0     # No survival bonus
     r_death: float = 0.0        # No death penalty (survival incentive from HP decay)
@@ -55,7 +56,8 @@ class Config:
     clip_coef: float = 0.2
     ent_coef: float = 0.001     # Very low entropy for solo curriculum (confident actions)
     ent_coef_coop: float = 0.05 # Higher entropy for coop phases (explore COOP action)
-    vf_coef: float = 0.5        # Value function loss coefficient
+    vf_coef: float = 1.0        # Value function loss coefficient (higher = stronger value learning)
+    aux_vf_coef: float = 0.5    # Weight for auxiliary value losses (survival, resource, social)
     max_grad_norm: float = 0.5
 
     # Training

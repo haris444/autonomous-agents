@@ -4,7 +4,15 @@
       "Bash(python:*)",
       "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force\")",
       "Bash(powershell -Command:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(taskkill:*)",
+      "Bash(git add:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(timeout:*)",
+      "Bash(xargs:*)",
+      "Bash(cd:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

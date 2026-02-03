@@ -73,11 +73,13 @@ class PPO:
 
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> tuple:
         """Compute combined PPO loss for one minibatch."""
-        # Get current policy outputs (with action mask for correct log prob computation)
-        _, new_log_prob, entropy, new_value = self.network.get_action_and_value(
+        # Get current policy outputs (with action masks for correct log prob computation)
+        _, _, new_log_prob, entropy, new_value = self.network.get_action_and_value(
             batch['obs'],
-            batch['actions'],
-            action_mask=batch.get('action_mask')
+            direction=batch['directions'],
+            action_type=batch['action_types'],
+            direction_mask=batch.get('direction_mask'),
+            action_type_mask=batch.get('action_type_mask')
         )
 
         # Policy ratio
@@ -178,22 +180,26 @@ class IndependentPPO:
     def get_actions_and_values(
         self,
         obs: Dict[str, torch.Tensor],
-        action_mask: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get actions and values from each agent's network.
 
         Args:
             obs: Batched observations [n_agents, ...]
-            action_mask: Optional batched action mask [n_agents, 15]
+            direction_mask: Optional batched direction mask [n_agents, 5]
+            action_type_mask: Optional batched action type mask [n_agents, 5]
 
         Returns:
-            actions: [n_agents]
+            directions: [n_agents]
+            action_types: [n_agents]
             log_probs: [n_agents]
             entropies: [n_agents]
             values: [n_agents]
         """
-        actions = []
+        directions = []
+        action_types = []
         log_probs = []
         entropies = []
         values = []
@@ -205,29 +211,37 @@ class IndependentPPO:
             # Extract single agent observation (add batch dim)
             obs_i = {k: v[i:i+1] for k, v in obs.items()}
 
-            # Extract single agent action mask if provided
-            mask_i = None
-            if action_mask is not None:
-                mask_i = action_mask[i:i+1]
+            # Extract single agent action masks if provided
+            dir_mask_i = None
+            act_mask_i = None
+            if direction_mask is not None:
+                dir_mask_i = direction_mask[i:i+1]
+            if action_type_mask is not None:
+                act_mask_i = action_type_mask[i:i+1]
 
-            # Get action and value from this agent's network
-            act, log_p, ent, val = net.get_action_and_value(obs_i, action_mask=mask_i)
+            # Get actions and value from this agent's network
+            dir_i, act_i, log_p, ent, val = net.get_action_and_value(
+                obs_i, direction_mask=dir_mask_i, action_type_mask=act_mask_i
+            )
 
-            actions.append(act)
+            directions.append(dir_i)
+            action_types.append(act_i)
             log_probs.append(log_p)
             entropies.append(ent)
             values.append(val)
 
         # For inactive agents, return dummy values (they're dead anyway)
         for i in range(self.n_active, self.n_agents):
-            actions.append(torch.tensor([4], device=self.device))  # STAY
+            directions.append(torch.tensor([4], device=self.device))  # STAY
+            action_types.append(torch.tensor([0], device=self.device))  # MOVE
             log_probs.append(torch.tensor([0.0], device=self.device))
             entropies.append(torch.tensor([0.0], device=self.device))
             values.append(torch.tensor([0.0], device=self.device))
 
         # Stack results back to [n_agents] tensors
         return (
-            torch.cat(actions),
+            torch.cat(directions),
+            torch.cat(action_types),
             torch.cat(log_probs),
             torch.cat(entropies),
             torch.cat(values)
@@ -272,6 +286,7 @@ class IndependentPPO:
         all_metrics = {
             'policy_loss': torch.tensor(0.0, device=self.device),
             'value_loss': torch.tensor(0.0, device=self.device),
+            'aux_value_loss': torch.tensor(0.0, device=self.device),
             'entropy': torch.tensor(0.0, device=self.device),
             'total_loss': torch.tensor(0.0, device=self.device),
             'approx_kl': torch.tensor(0.0, device=self.device),
@@ -325,6 +340,7 @@ class IndependentPPO:
         metric_sums = {
             'policy_loss': torch.tensor(0.0, device=self.device),
             'value_loss': torch.tensor(0.0, device=self.device),
+            'aux_value_loss': torch.tensor(0.0, device=self.device),
             'entropy': torch.tensor(0.0, device=self.device),
             'total_loss': torch.tensor(0.0, device=self.device),
             'approx_kl': torch.tensor(0.0, device=self.device),
@@ -366,6 +382,7 @@ class IndependentPPO:
         metric_sums = {
             'policy_loss': torch.tensor(0.0, device=self.device),
             'value_loss': torch.tensor(0.0, device=self.device),
+            'aux_value_loss': torch.tensor(0.0, device=self.device),
             'entropy': torch.tensor(0.0, device=self.device),
             'total_loss': torch.tensor(0.0, device=self.device),
             'approx_kl': torch.tensor(0.0, device=self.device),
@@ -402,10 +419,12 @@ class IndependentPPO:
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute combined PPO loss for one minibatch."""
         # Get current policy outputs
-        _, new_log_prob, entropy, new_value = network.get_action_and_value(
+        _, _, new_log_prob, entropy, new_value = network.get_action_and_value(
             batch['obs'],
-            batch['actions'],
-            action_mask=batch.get('action_mask')
+            direction=batch['directions'],
+            action_type=batch['action_types'],
+            direction_mask=batch.get('direction_mask'),
+            action_type_mask=batch.get('action_type_mask')
         )
 
         # Policy ratio
@@ -433,16 +452,26 @@ class IndependentPPO:
         # Value loss
         v_loss = 0.5 * ((new_value - batch['returns']) ** 2).mean()
 
+        # Auxiliary value losses for decomposed reward streams
+        aux_v_loss = torch.tensor(0.0, device=self.device)
+        if 'returns_survival' in batch and batch['returns_survival'].abs().sum() > 0:
+            aux_values = network.get_auxiliary_values(batch['obs'])
+            v_loss_survival = 0.5 * ((aux_values['survival'] - batch['returns_survival']) ** 2).mean()
+            v_loss_resource = 0.5 * ((aux_values['resource'] - batch['returns_resource']) ** 2).mean()
+            v_loss_social = 0.5 * ((aux_values['social'] - batch['returns_social']) ** 2).mean()
+            aux_v_loss = v_loss_survival + v_loss_resource + v_loss_social
+
         # Entropy bonus
         entropy_loss = entropy.mean()
 
         # Total loss - use higher entropy in coop phases to encourage exploration of COOP action
         ent_coef = self.config.ent_coef_coop if self.clone_mode else self.config.ent_coef
-        loss = pg_loss + self.config.vf_coef * v_loss - ent_coef * entropy_loss
+        loss = pg_loss + self.config.vf_coef * v_loss + self.config.aux_vf_coef * aux_v_loss - ent_coef * entropy_loss
 
         batch_metrics = {
             'policy_loss': pg_loss.detach(),
             'value_loss': v_loss.detach(),
+            'aux_value_loss': aux_v_loss.detach(),
             'entropy': entropy_loss.detach(),
             'total_loss': loss.detach(),
             'approx_kl': approx_kl,
@@ -514,23 +543,25 @@ class VmapPPO:
     def get_actions_and_values(
         self,
         obs: Dict[str, torch.Tensor],
-        action_mask: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get actions and values from all agents in parallel using vmap.
 
         Args:
             obs: Batched observations [n_agents, ...]
-            action_mask: Optional batched action mask [n_agents, 15]
+            direction_mask: Optional batched direction mask [n_agents, 5]
+            action_type_mask: Optional batched action type mask [n_agents, 5]
 
         Returns:
-            actions, log_probs, entropies, values: all [n_agents]
+            directions, action_types, log_probs, entropies, values: all [n_agents]
         """
         from torch.distributions import Categorical
 
         # In clone mode, fall back to sequential processing with shared network
         if self.clone_mode:
-            return self._get_actions_and_values_sequential(obs, action_mask)
+            return self._get_actions_and_values_sequential(obs, direction_mask, action_type_mask)
 
         # Stack parameters from all active networks
         params, buffers = self._get_stacked_params()
@@ -538,9 +569,9 @@ class VmapPPO:
         # Add batch dimension for vmap: [n_agents, ...] -> [n_agents, 1, ...]
         stacked_obs = {k: v[:self.n_active].unsqueeze(1) for k, v in obs.items()}
 
-        # Stateless forward function - returns logits and value
+        # Stateless forward function - returns direction_logits, action_type_logits, value
         def forward_single(params, buffers, obs_i):
-            # functional_call calls forward() which returns (action_logits, value)
+            # functional_call calls forward() which returns (dir_logits, act_logits, value)
             return func.functional_call(
                 self.base_network,
                 (params, buffers),
@@ -551,43 +582,55 @@ class VmapPPO:
         batched_forward = func.vmap(forward_single, in_dims=(0, 0, 0))
 
         # Execute batched forward pass - get logits [n_active, 1, ...]
-        action_logits, values = batched_forward(params, buffers, stacked_obs)
+        direction_logits, action_type_logits, values = batched_forward(params, buffers, stacked_obs)
 
         # Squeeze batch dim: [n_active, 1, ...] -> [n_active, ...]
-        action_logits = action_logits.squeeze(1)  # [n_active, 15]
+        direction_logits = direction_logits.squeeze(1)  # [n_active, 5]
+        action_type_logits = action_type_logits.squeeze(1)  # [n_active, 5]
         values = values.squeeze(1).squeeze(-1)    # [n_active]
 
-        # Apply action mask if provided (batched)
-        if action_mask is not None:
-            LARGE_NEG = -1e8
-            mask = action_mask[:self.n_active]
-            action_logits = action_logits.masked_fill(~mask, LARGE_NEG)
+        LARGE_NEG = -1e8
 
-        # Create distribution and sample (batched)
-        action_dist = Categorical(logits=action_logits)
-        actions = action_dist.sample()  # [n_active]
+        # Apply direction mask if provided (batched)
+        if direction_mask is not None:
+            mask = direction_mask[:self.n_active]
+            direction_logits = direction_logits.masked_fill(~mask, LARGE_NEG)
 
-        # Compute log probs and entropy
-        log_probs = action_dist.log_prob(actions)
-        entropies = action_dist.entropy()
+        # Apply action type mask if provided (batched)
+        if action_type_mask is not None:
+            mask = action_type_mask[:self.n_active]
+            action_type_logits = action_type_logits.masked_fill(~mask, LARGE_NEG)
+
+        # Create distributions and sample (batched)
+        direction_dist = Categorical(logits=direction_logits)
+        action_type_dist = Categorical(logits=action_type_logits)
+        directions = direction_dist.sample()  # [n_active]
+        action_types = action_type_dist.sample()  # [n_active]
+
+        # Compute combined log probs and entropy
+        log_probs = direction_dist.log_prob(directions) + action_type_dist.log_prob(action_types)
+        entropies = direction_dist.entropy() + action_type_dist.entropy()
 
         # Handle inactive agents (pad with dummy values)
         if self.n_active < self.n_agents:
             pad_size = self.n_agents - self.n_active
-            actions = torch.cat([actions, torch.full((pad_size,), 4, device=self.device)])  # STAY
+            directions = torch.cat([directions, torch.full((pad_size,), 4, device=self.device)])  # STAY
+            action_types = torch.cat([action_types, torch.zeros(pad_size, dtype=torch.long, device=self.device)])  # MOVE
             log_probs = torch.cat([log_probs, torch.zeros(pad_size, device=self.device)])
             entropies = torch.cat([entropies, torch.zeros(pad_size, device=self.device)])
             values = torch.cat([values, torch.zeros(pad_size, device=self.device)])
 
-        return actions, log_probs, entropies, values
+        return directions, action_types, log_probs, entropies, values
 
     def _get_actions_and_values_sequential(
         self,
         obs: Dict[str, torch.Tensor],
-        action_mask: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sequential fallback for clone mode - all agents use network[0]."""
-        actions = []
+        directions = []
+        action_types = []
         log_probs = []
         entropies = []
         values = []
@@ -596,26 +639,34 @@ class VmapPPO:
 
         for i in range(self.n_active):
             obs_i = {k: v[i:i+1] for k, v in obs.items()}
-            mask_i = None
-            if action_mask is not None:
-                mask_i = action_mask[i:i+1]
+            dir_mask_i = None
+            act_mask_i = None
+            if direction_mask is not None:
+                dir_mask_i = direction_mask[i:i+1]
+            if action_type_mask is not None:
+                act_mask_i = action_type_mask[i:i+1]
 
-            act, log_p, ent, val = net.get_action_and_value(obs_i, action_mask=mask_i)
+            dir_i, act_i, log_p, ent, val = net.get_action_and_value(
+                obs_i, direction_mask=dir_mask_i, action_type_mask=act_mask_i
+            )
 
-            actions.append(act)
+            directions.append(dir_i)
+            action_types.append(act_i)
             log_probs.append(log_p)
             entropies.append(ent)
             values.append(val)
 
         # Pad for inactive agents
         for i in range(self.n_active, self.n_agents):
-            actions.append(torch.tensor([4], device=self.device))  # STAY
+            directions.append(torch.tensor([4], device=self.device))  # STAY
+            action_types.append(torch.tensor([0], device=self.device))  # MOVE
             log_probs.append(torch.tensor([0.0], device=self.device))
             entropies.append(torch.tensor([0.0], device=self.device))
             values.append(torch.tensor([0.0], device=self.device))
 
         return (
-            torch.cat(actions),
+            torch.cat(directions),
+            torch.cat(action_types),
             torch.cat(log_probs),
             torch.cat(entropies),
             torch.cat(values)
@@ -638,9 +689,9 @@ class VmapPPO:
         params, buffers = self._get_stacked_params()
         stacked_obs = {k: v[:self.n_active].unsqueeze(1) for k, v in obs.items()}
 
-        # Use forward() and extract just the value (2nd output)
+        # Use forward() and extract just the value (3rd output now)
         def get_value_via_forward(params, buffers, obs_i):
-            _, val = func.functional_call(
+            _, _, val = func.functional_call(
                 self.base_network,
                 (params, buffers),
                 args=(obs_i,)
@@ -656,6 +707,42 @@ class VmapPPO:
             values = torch.cat([values, torch.zeros(pad_size, device=self.device)])
 
         return values
+
+    def get_auxiliary_values(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Get auxiliary value estimates from all agents.
+
+        Args:
+            obs: Batched observations [n_agents, ...]
+
+        Returns:
+            Dict with 'survival', 'resource', 'social' keys, each [n_agents] tensor
+        """
+        # Sequential processing for simplicity (auxiliary values are cheap)
+        survival_values = []
+        resource_values = []
+        social_values = []
+
+        for i in range(self.n_active):
+            net_idx = 0 if self.clone_mode else i
+            net = self.networks[net_idx]
+            obs_i = {k: v[i:i+1] for k, v in obs.items()}
+            aux_vals = net.get_auxiliary_values(obs_i)
+            survival_values.append(aux_vals['survival'])
+            resource_values.append(aux_vals['resource'])
+            social_values.append(aux_vals['social'])
+
+        # Pad for inactive agents
+        for i in range(self.n_active, self.n_agents):
+            survival_values.append(torch.tensor([0.0], device=self.device))
+            resource_values.append(torch.tensor([0.0], device=self.device))
+            social_values.append(torch.tensor([0.0], device=self.device))
+
+        return {
+            'survival': torch.cat(survival_values),
+            'resource': torch.cat(resource_values),
+            'social': torch.cat(social_values),
+        }
 
     def _get_values_sequential(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Sequential fallback for clone mode - all agents use network[0]."""
@@ -676,21 +763,25 @@ class VmapPPO:
     def get_action_probs(
         self,
         obs: Dict[str, torch.Tensor],
-        action_mask: torch.Tensor = None
-    ) -> torch.Tensor:
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get action probabilities for all active agents (for visualization).
 
         Args:
             obs: Batched observations [n_agents, ...]
-            action_mask: Optional batched action mask [n_agents, 15]
+            direction_mask: Optional batched direction mask [n_agents, 5]
+            action_type_mask: Optional batched action type mask [n_agents, 5]
 
         Returns:
-            action_probs: [n_agents, 15] - probabilities for all actions
+            direction_probs: [n_agents, 5] - probabilities for directions
+            action_type_probs: [n_agents, 5] - probabilities for action types
         """
         import torch.nn.functional as F
 
-        action_probs_list = []
+        direction_probs_list = []
+        action_type_probs_list = []
 
         for i in range(self.n_active):
             # Get the network for this agent (shared in clone mode)
@@ -700,29 +791,37 @@ class VmapPPO:
             # Extract single agent observation
             obs_i = {k: v[i:i+1] for k, v in obs.items()}
 
-            # Extract single agent action mask if provided
-            mask_i = None
-            if action_mask is not None:
-                mask_i = action_mask[i:i+1]
+            # Extract single agent action masks if provided
+            dir_mask_i = None
+            act_mask_i = None
+            if direction_mask is not None:
+                dir_mask_i = direction_mask[i:i+1]
+            if action_type_mask is not None:
+                act_mask_i = action_type_mask[i:i+1]
 
             with torch.no_grad():
                 # Forward pass to get logits
-                action_logits, _ = net.forward(obs_i)
+                direction_logits, action_type_logits, _ = net.forward(obs_i)
 
-                # Apply mask
+                # Apply masks
                 LARGE_NEG = -1e8
-                if mask_i is not None:
-                    action_logits = action_logits.masked_fill(~mask_i, LARGE_NEG)
+                if dir_mask_i is not None:
+                    direction_logits = direction_logits.masked_fill(~dir_mask_i, LARGE_NEG)
+                if act_mask_i is not None:
+                    action_type_logits = action_type_logits.masked_fill(~act_mask_i, LARGE_NEG)
 
                 # Convert to probabilities
-                action_probs = F.softmax(action_logits, dim=-1)
-                action_probs_list.append(action_probs)
+                direction_probs = F.softmax(direction_logits, dim=-1)
+                action_type_probs = F.softmax(action_type_logits, dim=-1)
+                direction_probs_list.append(direction_probs)
+                action_type_probs_list.append(action_type_probs)
 
         # Pad for inactive agents with uniform distributions
         for i in range(self.n_active, self.n_agents):
-            action_probs_list.append(torch.ones(1, 15, device=self.device) / 15)
+            direction_probs_list.append(torch.ones(1, 5, device=self.device) / 5)
+            action_type_probs_list.append(torch.ones(1, 5, device=self.device) / 5)
 
-        return torch.cat(action_probs_list)
+        return torch.cat(direction_probs_list), torch.cat(action_type_probs_list)
 
     def update(self, buffers: List[SingleAgentBuffer]) -> Dict[str, float]:
         """
@@ -738,6 +837,7 @@ class VmapPPO:
         all_metrics = {
             'policy_loss': torch.tensor(0.0, device=self.device),
             'value_loss': torch.tensor(0.0, device=self.device),
+            'aux_value_loss': torch.tensor(0.0, device=self.device),
             'entropy': torch.tensor(0.0, device=self.device),
             'total_loss': torch.tensor(0.0, device=self.device),
             'approx_kl': torch.tensor(0.0, device=self.device),
@@ -782,6 +882,7 @@ class VmapPPO:
         metric_sums = {
             'policy_loss': torch.tensor(0.0, device=self.device),
             'value_loss': torch.tensor(0.0, device=self.device),
+            'aux_value_loss': torch.tensor(0.0, device=self.device),
             'entropy': torch.tensor(0.0, device=self.device),
             'total_loss': torch.tensor(0.0, device=self.device),
             'approx_kl': torch.tensor(0.0, device=self.device),
@@ -818,6 +919,7 @@ class VmapPPO:
         metric_sums = {
             'policy_loss': torch.tensor(0.0, device=self.device),
             'value_loss': torch.tensor(0.0, device=self.device),
+            'aux_value_loss': torch.tensor(0.0, device=self.device),
             'entropy': torch.tensor(0.0, device=self.device),
             'total_loss': torch.tensor(0.0, device=self.device),
             'approx_kl': torch.tensor(0.0, device=self.device),
@@ -849,10 +951,12 @@ class VmapPPO:
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute combined PPO loss for one minibatch."""
-        _, new_log_prob, entropy, new_value = network.get_action_and_value(
+        _, _, new_log_prob, entropy, new_value = network.get_action_and_value(
             batch['obs'],
-            batch['actions'],
-            action_mask=batch.get('action_mask')
+            direction=batch['directions'],
+            action_type=batch['action_types'],
+            direction_mask=batch.get('direction_mask'),
+            action_type_mask=batch.get('action_type_mask')
         )
 
         log_ratio = new_log_prob - batch['log_probs']
@@ -874,15 +978,26 @@ class VmapPPO:
         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
         v_loss = 0.5 * ((new_value - batch['returns']) ** 2).mean()
+
+        # Auxiliary value losses for decomposed reward streams
+        aux_v_loss = torch.tensor(0.0, device=self.device)
+        if 'returns_survival' in batch and batch['returns_survival'].abs().sum() > 0:
+            aux_values = network.get_auxiliary_values(batch['obs'])
+            v_loss_survival = 0.5 * ((aux_values['survival'] - batch['returns_survival']) ** 2).mean()
+            v_loss_resource = 0.5 * ((aux_values['resource'] - batch['returns_resource']) ** 2).mean()
+            v_loss_social = 0.5 * ((aux_values['social'] - batch['returns_social']) ** 2).mean()
+            aux_v_loss = v_loss_survival + v_loss_resource + v_loss_social
+
         entropy_loss = entropy.mean()
 
         # Use higher entropy in coop phases to encourage exploration of COOP action
         ent_coef = self.config.ent_coef_coop if self.clone_mode else self.config.ent_coef
-        loss = pg_loss + self.config.vf_coef * v_loss - ent_coef * entropy_loss
+        loss = pg_loss + self.config.vf_coef * v_loss + self.config.aux_vf_coef * aux_v_loss - ent_coef * entropy_loss
 
         batch_metrics = {
             'policy_loss': pg_loss.detach(),
             'value_loss': v_loss.detach(),
+            'aux_value_loss': aux_v_loss.detach(),
             'entropy': entropy_loss.detach(),
             'total_loss': loss.detach(),
             'approx_kl': approx_kl,
