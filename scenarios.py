@@ -196,9 +196,6 @@ class CoopFoodScenario(Scenario):
         env.ledger.tensor[1, 0, Ledger.DEFENSE_SCORE] = 30.0  # Agent 1 defended agent 0
         env.ledger.tensor[1, 0, Ledger.COOP_COUNT] = 5.0      # They've cooperated before
 
-        # Store expected food count for partner flee behavior
-        env._coop_n_foods = self.n_rich_food
-
     def spawn_food(self, env: 'GridWorld') -> None:
         """Spawn rich food(s) - center + 4 corners."""
         center = env.grid_size // 2
@@ -219,44 +216,42 @@ class CoopFoodScenario(Scenario):
                 env.rich_food[r, c] = True
 
     def respawn_food(self, env: 'GridWorld') -> None:
-        """Respawn rich food if below target count."""
-        current_count = env.rich_food.sum().item()
-        if current_count >= self.n_rich_food:
+        """Respawn rich food immediately, reachable by both agents."""
+        current_count = int(env.rich_food.sum().item())
+        missing = self.n_rich_food - current_count
+        if missing <= 0:
             return
 
-        # Bound distance
         max_dist = env.grid_size - 1
         distance = min(self.distance, max_dist)
 
-        # Get positions of both agents
         r0, c0 = env.agent_positions[0][0].item(), env.agent_positions[0][1].item()
         r1, c1 = env.agent_positions[1][0].item(), env.agent_positions[1][1].item()
 
-        # Find center point between agents
         center_r = (r0 + r1) // 2
         center_c = (c0 + c1) // 2
 
         # Find positions within 'distance' of BOTH agents
         valid_positions = []
-        for dr in range(-distance * 2, distance * 2 + 1):
-            for dc in range(-distance * 2, distance * 2 + 1):
+        search_range = distance * 2
+        for dr in range(-search_range, search_range + 1):
+            for dc in range(-search_range, search_range + 1):
                 nr, nc = center_r + dr, center_c + dc
                 if 0 <= nr < env.grid_size and 0 <= nc < env.grid_size:
                     dist0 = abs(nr - r0) + abs(nc - c0)
                     dist1 = abs(nr - r1) + abs(nc - c1)
                     if dist0 <= distance and dist1 <= distance:
-                        # Check empty and no existing food
                         if env.occupancy[nr, nc] == -1 and not env.rich_food[nr, nc]:
                             valid_positions.append((nr, nc))
 
-        # Spawn foods up to target count
-        foods_needed = self.n_rich_food - int(current_count)
-        for _ in range(min(foods_needed, len(valid_positions))):
-            if not valid_positions:
-                break
-            idx = torch.randint(len(valid_positions), (1,)).item()
-            nr, nc = valid_positions.pop(idx)
-            env.rich_food[nr, nc] = True
+        for _ in range(missing):
+            if valid_positions:
+                idx = torch.randint(len(valid_positions), (1,)).item()
+                nr, nc = valid_positions.pop(idx)
+                env.rich_food[nr, nc] = True
+            elif 0 <= center_r < env.grid_size and 0 <= center_c < env.grid_size:
+                if env.occupancy[center_r, center_c] == -1:
+                    env.rich_food[center_r, center_c] = True
 
     def _get_positions_at_distance(
         self, env: 'GridWorld', r: int, c: int, distance: int
@@ -309,6 +304,8 @@ class SocialScenario(Scenario):
         coherent_histories: bool = False,
         neutral_prob: float = 0.2,
         always_one_ally: bool = False,  # Ensure agent 1 is always an ally
+        friend_foe: bool = False,       # Agent 1 = scripted friend, agent 2 = scripted foe
+        n_rich_food: int = 0,           # Fixed rich food count (center + corners, like CoopFoodScenario)
     ):
         self.n_agents = n_agents
         self.inject_histories = inject_histories
@@ -317,6 +314,8 @@ class SocialScenario(Scenario):
         self.coherent_histories = coherent_histories
         self.neutral_prob = neutral_prob
         self.always_one_ally = always_one_ally
+        self.friend_foe = friend_foe
+        self.n_rich_food = n_rich_food
 
     def get_config(self) -> ScenarioConfig:
         return ScenarioConfig(
@@ -330,6 +329,25 @@ class SocialScenario(Scenario):
     def setup(self, env: 'GridWorld') -> None:
         """Position agents in interaction range, optionally inject histories."""
         self._position_agents(env)
+
+        if self.friend_foe:
+            # Spawn enemy (agent 2) far from agent 0 so it has to chase
+            pos0 = env.agent_positions[0]
+            min_dist = 5
+            candidates = []
+            for r in range(env.grid_size):
+                for c in range(env.grid_size):
+                    dist = abs(r - pos0[0].item()) + abs(c - pos0[1].item())
+                    if dist >= min_dist and env.occupancy[r, c] == -1:
+                        candidates.append((r, c))
+            if candidates:
+                r, c = candidates[random.randint(0, len(candidates) - 1)]
+                env.agent_positions[2] = torch.tensor([r, c], device=env.device)
+                env._update_occupancy()
+
+            env.partner_relationship = 'mixed'
+            self._inject_friend_foe_histories(env)
+            return
 
         if self.scripted_partners:
             if self.n_agents == 2 and self.neutral_prob > 0:
@@ -523,6 +541,34 @@ class SocialScenario(Scenario):
                     env.ledger.tensor[i, j, Ledger.DEFENSE_SCORE] = random.uniform(15, 35)
                     env.ledger.tensor[i, j, Ledger.DAMAGE_DEALT] = 0.0
 
+    def _inject_friend_foe_histories(self, env: 'GridWorld') -> None:
+        """Inject friend history for agent 1 and foe history for agent 2.
+
+        Used with scripted partners: agent 1 cooperates, agent 2 attacks.
+        Histories match the scripted behavior so agent 0 learns to discriminate.
+        """
+        from ledger import Ledger
+
+        # Agent 1: ally history (symmetric positive)
+        env.ledger.tensor[1, 0, Ledger.FOOD_GIVEN] = random.uniform(40, 60)
+        env.ledger.tensor[1, 0, Ledger.COOP_COUNT] = random.uniform(3, 7)
+        env.ledger.tensor[1, 0, Ledger.DEFENSE_SCORE] = random.uniform(20, 40)
+        env.ledger.tensor[1, 0, Ledger.DAMAGE_DEALT] = 0.0
+        env.ledger.tensor[0, 1, Ledger.FOOD_GIVEN] = random.uniform(20, 40)
+        env.ledger.tensor[0, 1, Ledger.COOP_COUNT] = random.uniform(3, 7)
+        env.ledger.tensor[0, 1, Ledger.DEFENSE_SCORE] = random.uniform(10, 30)
+        env.ledger.tensor[0, 1, Ledger.DAMAGE_DEALT] = 0.0
+
+        # Agent 2: foe history (symmetric hostile)
+        env.ledger.tensor[2, 0, Ledger.DAMAGE_DEALT] = random.uniform(40, 70)
+        env.ledger.tensor[2, 0, Ledger.FOOD_GIVEN] = 0.0
+        env.ledger.tensor[2, 0, Ledger.COOP_COUNT] = random.uniform(0, 1)
+        env.ledger.tensor[2, 0, Ledger.DEFENSE_SCORE] = 0.0
+        env.ledger.tensor[0, 2, Ledger.DAMAGE_DEALT] = random.uniform(20, 50)
+        env.ledger.tensor[0, 2, Ledger.FOOD_GIVEN] = 0.0
+        env.ledger.tensor[0, 2, Ledger.COOP_COUNT] = random.uniform(0, 1)
+        env.ledger.tensor[0, 2, Ledger.DEFENSE_SCORE] = 0.0
+
     def _inject_coherent_histories(self, env: 'GridWorld') -> None:
         """Inject coherent friend/foe relationships (not mixed signals).
 
@@ -595,13 +641,29 @@ class SocialScenario(Scenario):
                     if random.random() < 0.25:  # 25% defense history
                         env.ledger.tensor[i, j, Ledger.DEFENSE_SCORE] = random.uniform(10, 40)
 
+    def _get_rich_food_positions(self, env: 'GridWorld') -> List[Tuple[int, int]]:
+        """Return fixed rich food positions (center + 4 corners), same as CoopFoodScenario."""
+        center = env.grid_size // 2
+        edge = env.grid_size - 1
+        return [
+            (center, center),
+            (1, 1),
+            (1, edge - 1),
+            (edge - 1, 1),
+            (edge - 1, edge - 1),
+        ][:self.n_rich_food]
+
     def spawn_food(self, env: 'GridWorld') -> None:
         """Spawn both poor and rich food for social scenarios."""
+        # Place fixed rich foods at known positions if configured
+        if self.n_rich_food > 0:
+            for r, c in self._get_rich_food_positions(env):
+                env.rich_food[r, c] = True
         total_cells = env.grid_size * env.grid_size
         cap_cells = int(total_cells * env.config.food_coverage_cap)
 
-        # Get empty cells
-        empty = (env.occupancy == -1)
+        # Get empty cells (exclude cells with rich food already placed)
+        empty = (env.occupancy == -1) & ~env.rich_food
         empty_indices = empty.flatten().nonzero(as_tuple=True)[0]
 
         if len(empty_indices) == 0:
@@ -617,24 +679,39 @@ class SocialScenario(Scenario):
             row, col = idx // env.grid_size, idx % env.grid_size
             env.poor_food[row, col] = True
 
-        # Place rich food
-        rich_start = poor_count
-        rich_count = min(cap_cells // 4, len(shuffled_indices) - rich_start)
-        for i in range(rich_count):
-            idx = shuffled_indices[rich_start + i].item()
-            row, col = idx // env.grid_size, idx % env.grid_size
-            env.rich_food[row, col] = True
+        # Place additional random rich food only if no fixed rich food configured
+        if self.n_rich_food == 0:
+            rich_start = poor_count
+            rich_count = min(cap_cells // 4, len(shuffled_indices) - rich_start)
+            for i in range(rich_count):
+                idx = shuffled_indices[rich_start + i].item()
+                row, col = idx // env.grid_size, idx % env.grid_size
+                env.rich_food[row, col] = True
 
     def respawn_food(self, env: 'GridWorld') -> None:
-        """Standard food respawning like normal gameplay."""
-        # Use the environment's normal food spawning logic
+        """Food respawning — rich food respawns at random locations after a delay."""
+        # Rich food: respawn at random empty cells with delay (not instant, not fixed position)
+        if self.n_rich_food > 0:
+            current_rich = int(env.rich_food.sum().item())
+            missing = self.n_rich_food - current_rich
+            if missing > 0:
+                empty = (env.occupancy == -1) & ~env.poor_food & ~env.rich_food
+                empty_indices = empty.flatten().nonzero(as_tuple=True)[0]
+                if len(empty_indices) > 0:
+                    # ~5% chance per tick per missing food -> avg 20 ticks delay
+                    for _ in range(missing):
+                        if random.random() < 0.05:
+                            idx = empty_indices[torch.randint(len(empty_indices), (1,)).item()].item()
+                            r, c = idx // env.grid_size, idx % env.grid_size
+                            env.rich_food[r, c] = True
+
+        # Standard poor food respawn
         empty = (env.occupancy == -1) & ~env.poor_food & ~env.rich_food
 
         total_cells = env.grid_size * env.grid_size
         cap_cells = int(total_cells * env.config.food_coverage_cap)
 
         poor_count = env.poor_food.sum().item()
-        rich_count = env.rich_food.sum().item()
 
         # Spawn poor food
         if poor_count < cap_cells:
@@ -643,13 +720,15 @@ class SocialScenario(Scenario):
             spawn_poor = empty & (rand < poor_rate)
             env.poor_food = env.poor_food | spawn_poor
 
-        # Spawn rich food
-        if rich_count < cap_cells:
-            empty_after_poor = (env.occupancy == -1) & ~env.poor_food & ~env.rich_food
-            rich_rate = min(1.0, env.config.rich_food_spawn_rate * 2.0)
-            rand2 = torch.rand((env.grid_size, env.grid_size), device=env.device)
-            spawn_rich = empty_after_poor & (rand2 < rich_rate)
-            env.rich_food = env.rich_food | spawn_rich
+        # Spawn additional random rich food only if no fixed rich food configured
+        if self.n_rich_food == 0:
+            rich_count = env.rich_food.sum().item()
+            if rich_count < cap_cells:
+                empty_after_poor = (env.occupancy == -1) & ~env.poor_food & ~env.rich_food
+                rich_rate = min(1.0, env.config.rich_food_spawn_rate * 2.0)
+                rand2 = torch.rand((env.grid_size, env.grid_size), device=env.device)
+                spawn_rich = empty_after_poor & (rand2 < rich_rate)
+                env.rich_food = env.rich_food | spawn_rich
 
 
 # =============================================================================
@@ -935,39 +1014,37 @@ def get_curriculum() -> dict:
         # Social pretraining (phases 10-12)
         # Phase 10: 2 agents - 50% scripted friend (like phase 9), 50% neutral stranger (learning)
         # Teaches agent 0 to handle both cooperative allies and unknown strangers
-        10: SocialScenario(n_agents=2, inject_histories=True, scripted_partners=True, neutral_prob=0.5),
-        # Phase 11: Cloned weights, coherent friend/foe histories (learn to discriminate)
-        11: SocialScenario(n_agents=4, inject_histories=True, clone_weights=True, coherent_histories=True),
-        12: SocialScenario(n_agents=8, inject_histories=False),
+        10: SocialScenario(n_agents=2, inject_histories=True, scripted_partners=True, neutral_prob=0.5, n_rich_food=5),
+        # Phase 11: Scripted friend + foe - agent 0 learns to discriminate
+        11: SocialScenario(n_agents=3, scripted_partners=True, friend_foe=True, n_rich_food=5),
+        12: SocialScenario(n_agents=8, inject_histories=False, n_rich_food=5),
     }
 
 
 def get_thresholds() -> dict:
-    """Return advancement thresholds for each phase.
-
-    Thresholds are set at ~35% of theoretical max (lowered from 70%)
-    to allow faster curriculum progression with reward shaping.
-    """
+    """Return advancement thresholds for each phase."""
     return {
-        # Solo phases: 35% of theoretical max (halved from original 70%)
-        1: 200,   # dist 1: was 448, now faster with approach reward
-        2: 100,   # dist 2: was 224
-        3: 70,    # dist 3: was 147
-        4: 30,    # dist 7: was 63
-        5: 15,    # dist 14: was 32
+        # Solo phases: 70% of theoretical max
+        # floor(128/distance) * 5 food reward
+        1: 448,   # dist 1: 128 foods * 5 = 640, 70% = 448
+        2: 224,   # dist 2: 64 foods * 5 = 320, 70% = 224
+        3: 147,   # dist 3: 42 foods * 5 = 210, 70% = 147
+        4: 63,    # dist 7: 18 foods * 5 = 90, 70% = 63
+        5: 32,    # dist 14: 9 foods * 5 = 45, 70% = 32
 
-        # Coop phases: halved thresholds
-        6: 400,   # was 896
-        7: 200,   # was 448
-        8: 150,   # was 294
+        # Coop phases: per-agent average
+        6: 896,   # 2 agents, rich food (20 reward each)
+        7: 448,
+        8: 294,
 
-        # Low-HP coop phase: slightly lowered
-        9: 120,   # was 250
+        # Low-HP coop phase: same mission as phase 8 but at 50% HP
+        # Slightly lower threshold since survival is harder
+        9: 250,   # 2 agents at 50% HP, must cooperate without attacking ally
 
-        # Social phases: more aggressive lowering
-        10: 400,  # was 800
-        11: 250,  # was 500
-        12: 30,   # was 60
+        # Social phases
+        10: 800,  # 3-agent with scripted ally - must learn reliable cooperation
+        11: 500,  # 3-agent with scripted friend + foe, learn to discriminate
+        12: 60,   # Full population emergent learning
     }
 
 

@@ -137,6 +137,7 @@ def visualize_checkpoint(checkpoint_path: str, output_name: str = "checkpoint_vi
         save_gif=True,
         gif_path=gif_path,
         ledger_snapshots=recorder.ledger_snapshots,
+        predator_ledger_snapshots=recorder.predator_ledger_snapshots,
         show_ledger=True
     )
     print("Done!")

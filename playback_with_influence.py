@@ -31,14 +31,21 @@ def load_model(checkpoint_path: str, config: Config, agent_id: int = 0):
     """Load trained model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model = ActorCritic(config)
-    model.load_state_dict(ckpt['network_state_dicts'][agent_id])
+    
+    if 'network_state_dicts' in ckpt:
+        model.load_state_dict(ckpt['network_state_dicts'][agent_id])
+    elif 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'])
+    else:
+        raise ValueError(f"Unknown checkpoint format. Keys: {ckpt.keys()}")
+        
     model.eval()
     return model
 
 
-def fourier_encode(dx, dy):
+def fourier_encode(dx, dy, n_bands=4):
     """Encode position using Fourier features (matching environment)."""
-    bands = [1.0, 2.0, 4.0, 8.0]
+    bands = [2.0 ** i for i in range(n_bands)]
     features = []
     for freq in bands:
         features.extend([
@@ -53,8 +60,8 @@ def fourier_encode(dx, dy):
 def reconstruct_observation(step, ledger, config, agent_id: int = 0):
     """Reconstruct observation tensor from saved step data.
 
-    Token format (25 features):
-        - fourier[16]: 4 freq bands × (sin_dx, cos_dx, sin_dy, cos_dy)
+    Token format (config.entity_token_dim features):
+        - fourier[4*bands]: fourier_bands freq bands × (sin_dx, cos_dx, sin_dy, cos_dy)
         - velocity[2]: (dv_x, dv_y)
         - type_onehot[2]: [is_food, is_agent]
         - value[1]: HP or quality
@@ -62,9 +69,17 @@ def reconstruct_observation(step, ledger, config, agent_id: int = 0):
     """
     n_agents = config.n_agents
     gs = config.grid_size
+    n_bands = config.fourier_bands
+    fourier_dim = 4 * n_bands
     max_food = config.max_food_tokens
     max_entities = n_agents + max_food
-    token_dim = config.entity_token_dim  # 25
+    token_dim = config.entity_token_dim
+
+    # Compute offsets: fourier | velocity | type | value | social
+    o_vel = fourier_dim
+    o_type = o_vel + 2
+    o_val = o_type + 2
+    o_social = o_val + 1
 
     entity_tokens = torch.zeros(max_entities, token_dim)
     entity_mask = torch.zeros(max_entities, dtype=torch.bool)
@@ -78,17 +93,21 @@ def reconstruct_observation(step, ledger, config, agent_id: int = 0):
     for i in range(n_agents):
         if step.alive[i]:
             rel_pos = (step.positions[i] - my_pos).astype(float)
-            rel_pos_norm = rel_pos / gs  # Normalized for Fourier encoding
+            rel_pos_norm = rel_pos / gs
             hp_norm = float(step.hp[i] / config.max_hp)
-            social = ledger[i, agent_id, :] / 100.0 * 5.0
 
-            # Fourier encode position
-            fourier = fourier_encode(rel_pos_norm[0], rel_pos_norm[1])
-            entity_tokens[i, 0:16] = torch.from_numpy(fourier)  # fourier[16]
-            entity_tokens[i, 16:18] = 0.0                       # velocity[2]
-            entity_tokens[i, 18:20] = torch.tensor([0.0, 1.0])  # type: [is_food, is_agent]
-            entity_tokens[i, 20] = hp_norm                      # value
-            entity_tokens[i, 21:25] = torch.from_numpy(social.astype(np.float32))  # social[4]
+            damage = ledger[i, agent_id, 0] / 100.0
+            food = ledger[i, agent_id, 1] / 5.0
+            coop = ledger[i, agent_id, 2] / 10.0
+            defense = ledger[i, agent_id, 3] / 5.0
+            social_features = torch.tensor([damage, food, coop, defense], dtype=torch.float32)
+
+            fourier = fourier_encode(rel_pos_norm[0], rel_pos_norm[1], n_bands)
+            entity_tokens[i, 0:fourier_dim] = torch.from_numpy(fourier)
+            entity_tokens[i, o_vel:o_vel+2] = 0.0
+            entity_tokens[i, o_type:o_type+2] = torch.tensor([0.0, 1.0])
+            entity_tokens[i, o_val] = hp_norm
+            entity_tokens[i, o_social:o_social+4] = social_features
             entity_mask[i] = True
 
     # Fill food tokens
@@ -108,13 +127,12 @@ def reconstruct_observation(step, ledger, config, agent_id: int = 0):
         rel_pos = np.array([r - my_pos[0], c - my_pos[1]], dtype=float)
         rel_pos_norm = rel_pos / gs
 
-        # Fourier encode position
-        fourier = fourier_encode(rel_pos_norm[0], rel_pos_norm[1])
-        entity_tokens[food_idx, 0:16] = torch.from_numpy(fourier)  # fourier[16]
-        entity_tokens[food_idx, 16:18] = 0.0                       # velocity[2]
-        entity_tokens[food_idx, 18:20] = torch.tensor([1.0, 0.0])  # type: [is_food, is_agent]
-        entity_tokens[food_idx, 20] = float(quality)               # value
-        entity_tokens[food_idx, 21:25] = 0.0                       # social[4]
+        fourier = fourier_encode(rel_pos_norm[0], rel_pos_norm[1], n_bands)
+        entity_tokens[food_idx, 0:fourier_dim] = torch.from_numpy(fourier)
+        entity_tokens[food_idx, o_vel:o_vel+2] = 0.0
+        entity_tokens[food_idx, o_type:o_type+2] = torch.tensor([1.0, 0.0])
+        entity_tokens[food_idx, o_val] = float(quality)
+        entity_tokens[food_idx, o_social:o_social+4] = 0.0
         entity_mask[food_idx] = True
         food_idx += 1
 
@@ -136,9 +154,18 @@ def reconstruct_observation(step, ledger, config, agent_id: int = 0):
 def get_attention_weights(model, obs):
     """Get attention weights from the model."""
     with torch.no_grad():
-        tokens = model.encoder.entity_embed(obs['entity_tokens'])
+        enc = model.encoder
+        my_tokens = obs['entity_tokens']  # [1, max_entities, token_dim]
+        f = enc.fourier_dim
+        fourier_proj = enc.fourier_embed(my_tokens[..., :f])
+        velocity_proj = enc.velocity_embed(my_tokens[..., f:f+2])
+        type_proj = enc.type_embed(my_tokens[..., f+2:f+4])
+        value_proj = enc.value_embed(my_tokens[..., f+4:f+5])
+        social_proj = enc.social_embed(my_tokens[..., f+5:f+9])
+        grouped = torch.cat([fourier_proj, velocity_proj, type_proj, value_proj, social_proj], dim=-1)
+        tokens = enc.entity_embed(grouped)
         attn_mask = ~obs['entity_mask']
-        _, attn_weights = model.encoder.entity_attention(
+        _, attn_weights = enc.entity_attention(
             tokens, tokens, tokens,
             key_padding_mask=attn_mask,
             average_attn_weights=True
@@ -168,6 +195,17 @@ def playback_with_influence(episode_path: str, checkpoint_path: str, speed: floa
     ax_dir = fig.add_axes([0.02, 0.08, 0.28, 0.28])
     ax_act = fig.add_axes([0.36, 0.08, 0.28, 0.28])
     ax_summary = fig.add_axes([0.70, 0.08, 0.28, 0.28])
+
+    # Pre-compute cumulative rewards per agent
+    cumulative_rewards = np.zeros((len(steps), n_agents))
+    step_rewards = np.zeros((len(steps), n_agents))
+    for fi in range(len(steps)):
+        if fi > 0:
+            cumulative_rewards[fi] = cumulative_rewards[fi - 1].copy()
+        if steps[fi].rewards:
+            for aid, rew in steps[fi].rewards.items():
+                cumulative_rewards[fi, aid] += rew
+                step_rewards[fi, aid] = rew
 
     # Animation state
     is_paused = [False]
@@ -329,40 +367,30 @@ def playback_with_influence(episode_path: str, checkpoint_path: str, speed: floa
             bars_act[chosen_act].set_edgecolor('lime')
             bars_act[chosen_act].set_linewidth(4)
 
-        # === DECISION SUMMARY ===
-        ax_summary.axis('off')
-        ax_summary.set_title('Decision Analysis', fontsize=10, fontweight='bold')
+        # === REWARD PLOT ===
+        ax_summary.set_title('Cumulative Rewards', fontsize=10, fontweight='bold')
+        for aid in range(n_agents):
+            if any(steps[f].alive[aid] for f in range(min(frame_idx + 1, len(steps)))):
+                color = agent_colors[aid % len(agent_colors)]
+                ax_summary.plot(range(frame_idx + 1), cumulative_rewards[:frame_idx + 1, aid],
+                               color=color, linewidth=1.5, alpha=0.8, label=f'A{aid}')
+        ax_summary.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+        ax_summary.axvline(x=frame_idx, color='black', linestyle=':', alpha=0.3)
+        ax_summary.set_xlim(0, len(steps) - 1)
+        ax_summary.set_xlabel('Step', fontsize=8)
+        ax_summary.set_ylabel('Cumulative Reward', fontsize=8)
+        ax_summary.legend(fontsize=7, loc='upper left', ncol=2)
+        ax_summary.grid(True, alpha=0.2)
 
-        summary = []
+        # Add chosen action + value as text annotation
+        action_text = ""
         if chosen_dir >= 0 and chosen_act >= 0:
-            summary.append(f"CHOSEN: {dir_names[chosen_dir]} + {act_names[chosen_act]}")
-            summary.append("")
-
-        # Most attended agent
-        agent_attns = attn_from_agent0[1:n_agents]
-        if len(agent_attns) > 0 and agent_attns.max() > 0.05:
-            max_agent = np.argmax(agent_attns) + 1
-            if step.alive[max_agent]:
-                score = ledger[max_agent, 0, 1] + ledger[max_agent, 0, 2] + ledger[max_agent, 0, 3] - ledger[max_agent, 0, 0]
-                summary.append(f"Focus: Agent {max_agent} ({attn_from_agent0[max_agent]:.0%})")
-                summary.append(f"  Relationship: {'FRIEND' if score > 20 else 'ENEMY' if score < -20 else 'NEUTRAL'}")
-                summary.append("")
-
-        if chosen_act == 4:
-            summary.append("-> COOPERATING on rich food")
-        elif chosen_act == 1:
-            summary.append("-> ATTACKING")
-        elif chosen_act == 2:
-            summary.append("-> GIVING food")
-        elif chosen_act == 0:
-            summary.append(f"-> MOVING {dir_names[chosen_dir]}")
-
-        summary.append("")
-        summary.append(f"Value: {value[0].item():.1f}")
-
-        ax_summary.text(0.05, 0.95, '\n'.join(summary), transform=ax_summary.transAxes,
-                       fontfamily='monospace', fontsize=10, verticalalignment='top',
-                       bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.3))
+            action_text = f"{dir_names[chosen_dir]}+{act_names[chosen_act]}  V={value[0].item():.1f}"
+            r0 = step_rewards[frame_idx, 0]
+            action_text += f"  r={r0:+.2f}"
+        ax_summary.text(0.98, 0.02, action_text, transform=ax_summary.transAxes,
+                       fontfamily='monospace', fontsize=8, ha='right', va='bottom',
+                       bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
 
         fig.canvas.draw_idle()
 

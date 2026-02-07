@@ -86,6 +86,15 @@ class GridWorld:
         # Shape: [3, n_agents, n_agents] - recent_attacks[t, attacker, victim] = damage
         self.recent_attacks = torch.zeros((3, config.n_agents, config.n_agents), device=device)
 
+        # Predator state (environmental enemy)
+        self.n_predators = config.n_predators
+        self.predator_positions: torch.Tensor = None   # [n_predators, 2]
+        self.predator_hp: torch.Tensor = None          # [n_predators]
+        self.predator_alive: torch.Tensor = None       # [n_predators] bool
+        self.predator_prev_positions: torch.Tensor = None  # [n_predators, 2]
+        self.predator_respawn_timer: torch.Tensor = None   # [n_predators]
+        self.predator_ledger: torch.Tensor = None   # [n_agents, n_predators, 2]
+
         # Cooperation tracking for diagnostics
         self.last_coop_success_count = 0  # Number of successful cooperations in last step
 
@@ -93,20 +102,63 @@ class GridWorld:
         self._current_scenario = None
 
     def _update_occupancy(self) -> None:
-        """Update occupancy grid from agent positions - FULLY VECTORIZED."""
+        """Update occupancy grid from agent and predator positions - FULLY VECTORIZED."""
         self.occupancy.fill_(-1)
         alive_mask = self.agent_alive
 
-        if not alive_mask.any():
-            return
+        if alive_mask.any():
+            alive_indices = torch.where(alive_mask)[0]
+            alive_positions = self.agent_positions[alive_indices]
+            rows = alive_positions[:, 0]
+            cols = alive_positions[:, 1]
+            # Advanced indexing: write all at once
+            self.occupancy[rows, cols] = alive_indices
 
-        alive_indices = torch.where(alive_mask)[0]
-        alive_positions = self.agent_positions[alive_indices]
-        rows = alive_positions[:, 0]
-        cols = alive_positions[:, 1]
+        # Predators occupy cells as n_agents + pred_idx (>= n_agents means predator)
+        if self.n_predators > 0 and self.predator_alive is not None:
+            alive_pred = torch.where(self.predator_alive)[0]
+            if alive_pred.numel() > 0:
+                pred_pos = self.predator_positions[alive_pred]
+                pred_rows = pred_pos[:, 0]
+                pred_cols = pred_pos[:, 1]
+                self.occupancy[pred_rows, pred_cols] = self.n_agents + alive_pred
 
-        # Advanced indexing: write all at once
-        self.occupancy[rows, cols] = alive_indices
+    def _init_predators(self) -> None:
+        """Initialize all predators at random grid edges with full HP."""
+        n_pred = self.n_predators
+        self.predator_hp = torch.full((n_pred,), self.config.max_hp * self.config.predator_hp_mult, device=self.device)
+        self.predator_alive = torch.ones(n_pred, device=self.device, dtype=torch.bool)
+        self.predator_respawn_timer = torch.zeros(n_pred, device=self.device, dtype=torch.long)
+        self.predator_positions = torch.zeros((n_pred, 2), device=self.device, dtype=torch.long)
+        for p in range(n_pred):
+            self._respawn_predator(p)
+        self.predator_prev_positions = self.predator_positions.clone()
+        self.predator_ledger = torch.zeros(self.n_agents, n_pred, 2, device=self.device)
+
+    def _respawn_predator(self, p: int) -> None:
+        """Respawn predator at a random grid edge cell that's unoccupied."""
+        gs = self.grid_size
+        self.predator_hp[p] = self.config.max_hp * self.config.predator_hp_mult
+        self.predator_alive[p] = True
+        self.predator_respawn_timer[p] = 0
+
+        # Collect all edge cells
+        edge_cells = []
+        for c in range(gs):
+            edge_cells.extend([(0, c), (gs - 1, c)])  # top and bottom rows
+        for r in range(1, gs - 1):
+            edge_cells.extend([(r, 0), (r, gs - 1)])  # left and right cols
+
+        # Shuffle and find first unoccupied
+        perm = torch.randperm(len(edge_cells))
+        for idx in perm:
+            r, c = edge_cells[idx.item()]
+            if self.occupancy[r, c] == -1:
+                self.predator_positions[p] = torch.tensor([r, c], device=self.device)
+                return
+
+        # Fallback: place at corner even if occupied
+        self.predator_positions[p] = torch.tensor([0, 0], device=self.device)
 
     def reset(self) -> Dict[str, torch.Tensor]:
         """Reset environment and return initial observations for all agents."""
@@ -160,6 +212,7 @@ class GridWorld:
         self.agent_hp = torch.full((self.n_agents,), self.config.max_hp, device=self.device)
         self.agent_alive = torch.ones(self.n_agents, device=self.device, dtype=torch.bool)
         self.agent_inventory = torch.zeros(self.n_agents, device=self.device)  # Start with no stored food
+        self.food_eaten_total = torch.zeros(self.n_agents, device=self.device)
 
         # Pretraining mode: only keep appropriate number of agents alive
         if self.config.pretrain_mode:
@@ -192,6 +245,11 @@ class GridWorld:
 
         # Initialize previous positions for velocity computation (same as current at reset)
         self.prev_agent_positions = self.agent_positions.clone()
+
+        # Initialize predator state
+        if self.n_predators > 0:
+            self._init_predators()
+            self._update_occupancy()
 
         return self._get_all_observations()
 
@@ -261,42 +319,53 @@ class GridWorld:
         # 1. Process interactions FIRST (attack, give food, signal)
         #    This happens from CURRENT position before movement
         #    So agent attacks what they SEE in their observation
-        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards = self._resolve_interactions(
+        #    Now also handles agent-vs-predator attacks
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, give_rewards, predator_kill_rewards = self._resolve_interactions(
             directions, action_types, is_attack, is_give, is_signal
         )
 
         # 2. Resolve movement (Heavyweight Rule)
         #    Only process if agent chose MOVE action
+        #    Predators block cells (treated as stationary)
         self._resolve_movement(directions, is_move)
         self._update_occupancy()
 
-        # 3. Apply HP decay (vectorized)
+        # 3. Predator movement + attack (after agent movement)
+        predator_damage = self._predator_step()
+
+        # 4. Apply HP decay (agents only, predators don't decay)
         self._apply_hp_decay()
 
-        # 4. Process food eating (agents on food cells after movement)
+        # 5. Process food eating (agents on food cells after movement)
         food_rewards = self._process_food_eating(action_types)
 
-        # 4a. Compute intrinsic reward for attempting COOP near rich food + ally
+        # 5a. Compute intrinsic reward for attempting COOP near rich food + ally
         intrinsic_coop_rewards = self._compute_intrinsic_coop_rewards(action_types)
 
-        # 4b. Auto-consume inventory to heal (if HP < max and have inventory)
+        # 5b. Auto-consume inventory to heal (if HP < max and have inventory)
         self._consume_inventory()
 
-        # 5. Spawn new food
+        # 5c. Hierarchy rewards (competitive ranking bonus)
+        hierarchy_rewards = self._compute_hierarchy_rewards()
+
+        # 6. Spawn new food
         self._spawn_food()
 
-        # 6. Check deaths (HP <= 0)
+        # 7. Check deaths (agents + predators)
         death_rewards = self._check_deaths()
         self._update_occupancy()
 
         # === EXPLICIT REWARD COMPUTATION ===
         hp_after = self.agent_hp.clone()
 
+        # Include predator damage in total damage taken
+        total_damage_taken = damage_taken + predator_damage
+
         # Non-linear damage pain (lower HP = hurts more)
         # At full HP: multiplier ≈ 1, at 10% HP: multiplier ≈ 10
         hp_ratio = hp_before / self.config.max_hp
         pain_multiplier = 1.0 / (hp_ratio + 0.1)
-        damage_pain = damage_taken * pain_multiplier * self.config.r_damage_taken
+        damage_pain = total_damage_taken * pain_multiplier * self.config.r_damage_taken
 
         # Low HP penalty (constant per tick, scales with how low HP is)
         # At full HP: penalty ≈ 0, at 10% HP: penalty ≈ 0.9 * r_low_hp
@@ -328,6 +397,9 @@ class GridWorld:
             + defense_rewards       # Defense bonus (for protecting allies)
             + revenge_rewards       # Revenge bonus (for retaliating against attackers)
             + betrayal_rewards      # Betrayal penalty (for attacking benefactors)
+            + give_rewards          # Food sharing bonus
+            + predator_kill_rewards # Reward for killing predators
+            + hierarchy_rewards     # Social hierarchy ranking bonus
             + damage_pain           # Damage pain (non-linear)
             + low_hp_penalty        # Low HP penalty (constant per tick)
             + approach_reward       # Reward for moving closer to food
@@ -356,7 +428,7 @@ class GridWorld:
         # Group reward components for auxiliary value heads
         survival_rewards = damage_pain + low_hp_penalty + death_rewards
         resource_rewards = food_rewards + approach_reward
-        social_rewards = attack_rewards + defense_rewards + revenge_rewards + betrayal_rewards + intrinsic_coop_rewards
+        social_rewards = attack_rewards + defense_rewards + revenge_rewards + betrayal_rewards + intrinsic_coop_rewards + give_rewards + predator_kill_rewards + hierarchy_rewards
 
         infos = {
             'reward_survival': survival_rewards,   # [n_agents] tensor
@@ -503,8 +575,11 @@ class GridWorld:
 
         # Check if occupant exists and is staying
         has_occupant = occupant_at_dest >= 0
-        safe_occupant_idx = occupant_at_dest.clamp(min=0)
-        occupant_is_staying = is_staying[safe_occupant_idx] & has_occupant
+        safe_occupant_idx = occupant_at_dest.clamp(min=0, max=n - 1)  # Clamp to agent range for indexing
+        is_predator_occupant = occupant_at_dest >= n  # Predators are stored as n_agents + pred_idx
+        # For agent occupants, check if they're staying; predators always block
+        agent_occupant_staying = is_staying[safe_occupant_idx] & has_occupant & ~is_predator_occupant
+        occupant_is_staying = agent_occupant_staying | (is_predator_occupant & has_occupant)
 
         # Agent cannot block itself
         agent_ids = torch.arange(n, device=self.device)
@@ -551,7 +626,7 @@ class GridWorld:
         is_attack: torch.Tensor,
         is_give: torch.Tensor,
         is_signal: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process attack, give food, and signal actions with direction targeting.
 
         Args:
@@ -567,6 +642,8 @@ class GridWorld:
             defense_rewards: [n_agents] reward for defending allies
             revenge_rewards: [n_agents] reward for retaliating against attackers
             betrayal_rewards: [n_agents] penalty for attacking benefactors
+            give_rewards: [n_agents] reward for giving food
+            predator_kill_rewards: [n_agents] reward for killing predators
         """
         # Signal actions - only process alive agents who chose SIGNAL
         signal_mask = is_signal & self.agent_alive
@@ -574,15 +651,15 @@ class GridWorld:
 
         # Attack actions - only process alive agents who chose ATTACK
         attack_mask = is_attack & self.agent_alive
-        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards = self._resolve_attacks(directions, attack_mask)
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, predator_kill_rewards = self._resolve_attacks(directions, attack_mask)
 
         # Give food actions - only process alive agents who chose GIVE
         give_mask = is_give & self.agent_alive
-        self._resolve_give_food(directions, give_mask)
+        give_rewards = self._resolve_give_food(directions, give_mask)
 
-        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, give_rewards, predator_kill_rewards
 
-    def _resolve_attacks(self, directions: torch.Tensor, attack_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _resolve_attacks(self, directions: torch.Tensor, attack_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Resolve attacks with direction targeting and defense tracking - FULLY VECTORIZED.
 
@@ -602,6 +679,7 @@ class GridWorld:
             defense_rewards: [n_agents] reward for defending allies
             revenge_rewards: [n_agents] reward for retaliating
             betrayal_rewards: [n_agents] penalty for attacking benefactors
+            predator_kill_rewards: [n_agents] reward for killing predators
         """
         # Initialize return tensors
         attack_rewards = torch.zeros(self.n_agents, device=self.device)
@@ -609,10 +687,11 @@ class GridWorld:
         defense_rewards = torch.zeros(self.n_agents, device=self.device)
         revenge_rewards = torch.zeros(self.n_agents, device=self.device)
         betrayal_rewards = torch.zeros(self.n_agents, device=self.device)
+        predator_kill_rewards = torch.zeros(self.n_agents, device=self.device)
 
         # Early exit if no attackers
         if not attack_mask.any():
-            return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
+            return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, predator_kill_rewards
 
         # === STEP 1: Apply attack cost to ALL attackers at once ===
         attack_cost = self.config.max_hp * 0.05
@@ -640,14 +719,18 @@ class GridWorld:
         # === STEP 5: Look up targets from occupancy grid ===
         target_ids = self.occupancy[safe_rows, safe_cols]  # [n_agents]
 
-        # Valid hit: in bounds, attacking, target exists, target alive
+        # Separate agent targets from predator targets
         has_target = target_ids >= 0
-        valid_target_ids = target_ids.clamp(min=0)
-        target_alive = self.agent_alive[valid_target_ids] & has_target
-        valid_hit = valid_attack & has_target & target_alive
+        is_predator_target = target_ids >= self.n_agents  # Predator IDs are n_agents + pred_idx
+        is_agent_target = has_target & ~is_predator_target
+
+        # === Agent-vs-Agent attacks ===
+        valid_target_ids = target_ids.clamp(min=0, max=self.n_agents - 1)
+        target_alive = self.agent_alive[valid_target_ids] & is_agent_target
+        valid_hit = valid_attack & is_agent_target & target_alive
 
         # === STEP 6: Compute damage ===
-        damage = (self.agent_hp / 2) * valid_hit.float()
+        damage = (self.agent_hp * self.config.attack_damage_fraction) * valid_hit.float()
 
         # === STEP 7: Build damage matrix and apply damage ===
         damage_matrix = torch.zeros((self.n_agents, self.n_agents), device=self.device)
@@ -664,6 +747,30 @@ class GridWorld:
             damage_per_target = torch.zeros(self.n_agents, device=self.device)
             damage_per_target.scatter_add_(0, hit_targets, hit_damage)
             self.agent_hp = self.agent_hp - damage_per_target
+
+        # === Agent-vs-Predator attacks ===
+        if self.n_predators > 0:
+            valid_pred_hit = valid_attack & is_predator_target
+            pred_hit_indices = torch.where(valid_pred_hit)[0]
+            if pred_hit_indices.numel() > 0:
+                pred_target_ids = target_ids[pred_hit_indices] - self.n_agents  # Convert to predator index
+                pred_damage = (self.agent_hp[pred_hit_indices] * self.config.attack_damage_fraction)
+
+                # Apply damage to each predator
+                for i in range(pred_hit_indices.numel()):
+                    p_idx = pred_target_ids[i].item()
+                    if self.predator_alive[p_idx]:
+                        self.predator_hp[p_idx] -= pred_damage[i]
+                        # Record in predator ledger: agent dealt damage to predator
+                        if self.predator_ledger is not None:
+                            self.predator_ledger[pred_hit_indices[i], p_idx, 0] += pred_damage[i]
+                        # Attack reward for hitting predator
+                        attack_rewards[pred_hit_indices[i]] += pred_damage[i] * self.config.r_attack_mult
+                        # Check if predator died
+                        if self.predator_hp[p_idx] <= 0:
+                            self.predator_alive[p_idx] = False
+                            self.predator_respawn_timer[p_idx] = self.config.predator_respawn_steps
+                            predator_kill_rewards[pred_hit_indices[i]] += self.config.predator_kill_reward
 
         # === STEP 8: Update ledger ===
         self.ledger.tensor[:, :, Ledger.DAMAGE_DEALT] += damage_matrix
@@ -716,16 +823,16 @@ class GridWorld:
                         defense_rewards[c] += dmg * self.config.r_defense
 
         # === STEP 11: Compute rewards and damage taken ===
-        # Attack rewards = 50% of ALL damage dealt (incentivizes combat)
+        # Attack rewards for agent-vs-agent (predator rewards already added above)
         total_damage_dealt = damage_matrix.sum(dim=1)  # Sum over all targets
-        attack_rewards = total_damage_dealt * self.config.r_attack_mult
+        attack_rewards += total_damage_dealt * self.config.r_attack_mult
 
         # Damage taken per agent (sum over attackers) - still tracks all damage for pain calculation
         damage_taken = damage_matrix.sum(dim=0)
 
-        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, predator_kill_rewards
 
-    def _resolve_give_food(self, directions: torch.Tensor, give_mask: torch.Tensor) -> None:
+    def _resolve_give_food(self, directions: torch.Tensor, give_mask: torch.Tensor) -> torch.Tensor:
         """
         Resolve food giving from INVENTORY - FULLY VECTORIZED.
 
@@ -736,12 +843,16 @@ class GridWorld:
         Args:
             directions: [n_agents] direction indices (0-4: UP, DOWN, LEFT, RIGHT, STAY)
             give_mask: [n_agents] bool mask for agents choosing GIVE
+
+        Returns:
+            give_rewards: [n_agents] reward for giving food
         """
+        give_rewards = torch.zeros(self.n_agents, device=self.device)
         food_value = self.config.poor_food_value
 
         # Early exit if no givers
         if not give_mask.any():
-            return
+            return give_rewards
 
         # === STEP 1: Compute transfer amount for each giver ===
         # Can only give what you have in inventory (up to food_value per action)
@@ -794,10 +905,98 @@ class GridWorld:
             inventory_gain.scatter_add_(0, transfer_targets, transfer_values)
             self.agent_inventory = self.agent_inventory + inventory_gain
 
-            # === STEP 6: Update ledger ===
+            # === STEP 6: Reward givers ===
+            give_rewards[transfer_indices] = transfer_values * self.config.r_food_share
+
+            # === STEP 7: Update ledger ===
             flat_indices = transfer_indices * self.n_agents + transfer_targets
             ledger_food = self.ledger.tensor[:, :, Ledger.FOOD_GIVEN].view(-1)
             ledger_food.scatter_add_(0, flat_indices, transfer_values)
+
+        return give_rewards
+
+    def _predator_step(self) -> torch.Tensor:
+        """Move predators toward closest agent, attack adjacent agents, handle respawn.
+
+        Returns:
+            predator_damage_to_agents: [n_agents] damage dealt by predators this step
+        """
+        predator_damage_to_agents = torch.zeros(self.n_agents, device=self.device)
+        if self.n_predators == 0:
+            return predator_damage_to_agents
+
+        for p in range(self.n_predators):
+            # Handle respawn timer for dead predators
+            if not self.predator_alive[p]:
+                self.predator_respawn_timer[p] -= 1
+                if self.predator_respawn_timer[p] <= 0:
+                    self._update_occupancy()
+                    self._respawn_predator(p)
+                    self._update_occupancy()
+                continue
+
+            # Store previous position for velocity
+            self.predator_prev_positions[p] = self.predator_positions[p].clone()
+
+            # Find closest alive agent (Manhattan distance)
+            alive_indices = torch.where(self.agent_alive)[0]
+            if alive_indices.numel() == 0:
+                continue
+
+            alive_pos = self.agent_positions[alive_indices].float()  # [K, 2]
+            pred_pos = self.predator_positions[p].float()  # [2]
+            dists = (alive_pos - pred_pos.unsqueeze(0)).abs().sum(dim=1)  # [K]
+            closest_idx = alive_indices[dists.argmin()]
+            closest_pos = self.agent_positions[closest_idx]
+
+            # Move one step toward closest agent (primary axis first)
+            diff = closest_pos.float() - pred_pos
+            abs_diff = diff.abs()
+
+            # Choose primary axis (larger absolute difference)
+            new_pos = self.predator_positions[p].clone()
+            if abs_diff[0] >= abs_diff[1] and abs_diff[0] > 0:
+                # Move along row axis
+                step = 1 if diff[0] > 0 else -1
+                candidate = new_pos.clone()
+                candidate[0] += step
+            elif abs_diff[1] > 0:
+                # Move along col axis
+                step = 1 if diff[1] > 0 else -1
+                candidate = new_pos.clone()
+                candidate[1] += step
+            else:
+                candidate = new_pos  # Already at target
+
+            # Check bounds and occupancy before moving
+            candidate = candidate.clamp(0, self.grid_size - 1)
+            cr, cc = candidate[0].item(), candidate[1].item()
+            if self.occupancy[cr, cc] == -1:
+                # Clear old occupancy
+                old_r, old_c = self.predator_positions[p][0].item(), self.predator_positions[p][1].item()
+                if self.occupancy[old_r, old_c] == self.n_agents + p:
+                    self.occupancy[old_r, old_c] = -1
+                # Move predator
+                self.predator_positions[p] = candidate
+                self.occupancy[cr, cc] = self.n_agents + p
+
+            # Attack closest adjacent alive agent (fixed damage)
+            pred_pos_now = self.predator_positions[p]
+            for ai in range(self.n_agents):
+                if not self.agent_alive[ai]:
+                    continue
+                agent_pos = self.agent_positions[ai]
+                manhattan = (pred_pos_now.float() - agent_pos.float()).abs().sum()
+                if manhattan <= 1.0:
+                    dmg = self.config.predator_damage
+                    self.agent_hp[ai] -= dmg
+                    predator_damage_to_agents[ai] += dmg
+                    # Record in predator ledger: predator dealt damage to agent
+                    if self.predator_ledger is not None:
+                        self.predator_ledger[ai, p, 1] += dmg
+                    break  # Only attack one agent per step
+
+        return predator_damage_to_agents
 
     def _process_food_eating(self, action_types: torch.Tensor) -> torch.Tensor:
         """Process agents eating food on their cells.
@@ -826,6 +1025,7 @@ class GridWorld:
 
         # Add poor food to INVENTORY (not HP directly)
         self.agent_inventory = self.agent_inventory + on_poor.float() * self.config.poor_food_value
+        self.food_eaten_total = self.food_eaten_total + on_poor.float()
 
         # Remove eaten poor food
         poor_food_flat = self.poor_food.view(-1)
@@ -882,6 +1082,7 @@ class GridWorld:
         foods_per_agent = eligible.float() @ consumed_mask.float()  # [N]
         inventory_gain = foods_per_agent * self.config.rich_food_value
         self.agent_inventory = self.agent_inventory + inventory_gain
+        self.food_eaten_total = self.food_eaten_total + (foods_per_agent > 0).float()
 
         # Ledger update: cooperation pairs via outer product
         consumed_food_indices = torch.where(consumed_mask)[0]  # [C]
@@ -969,23 +1170,62 @@ class GridWorld:
 
         return intrinsic_rewards
 
+    def _compute_hierarchy_rewards(self) -> torch.Tensor:
+        """Compute per-step hierarchy bonus based on agent ranking.
+
+        Agents ranked by weighted sum of: cumulative food eaten, total damage
+        dealt, and current HP ratio. Top agent gets r_hierarchy, bottom gets 0.
+        """
+        cfg = self.config
+        if cfg.r_hierarchy == 0.0:
+            return torch.zeros(self.n_agents, device=self.device)
+
+        alive = self.agent_alive.float()
+        n_active = alive.sum()
+        if n_active < 2:
+            return torch.zeros(self.n_agents, device=self.device)
+
+        eps = 1e-8
+
+        # Component scores (normalize each by max across agents)
+        food = self.food_eaten_total * alive
+        food_max = food.max().clamp(min=eps)
+        food_norm = food / food_max
+
+        # Total damage dealt (sum over all targets from ledger)
+        damage = self.ledger.tensor[:, :, Ledger.DAMAGE_DEALT].sum(dim=1) * alive
+        damage_max = damage.max().clamp(min=eps)
+        damage_norm = damage / damage_max
+
+        hp_ratio = (self.agent_hp / cfg.max_hp) * alive
+        hp_max = hp_ratio.max().clamp(min=eps)
+        hp_norm = hp_ratio / hp_max
+
+        # Weighted hierarchy score
+        score = (cfg.hierarchy_food_weight * food_norm
+                 + cfg.hierarchy_damage_weight * damage_norm
+                 + cfg.hierarchy_hp_weight * hp_norm) * alive
+
+        # Rank via argsort of argsort (rank 0 = lowest score)
+        ranks = score.argsort().argsort().float()
+
+        # Reward: linear from 0 (bottom) to r_hierarchy (top)
+        denom = (n_active - 1).clamp(min=1.0)
+        rewards = (ranks / denom) * cfg.r_hierarchy * alive
+
+        return rewards
+
     def _apply_hp_decay(self) -> None:
         """Apply HP decay to all alive agents - fully vectorized."""
         decay = self.config.max_hp * self.config.hp_decay_rate
         self.agent_hp = self.agent_hp - decay * self.agent_alive.float()
 
     def _consume_inventory(self) -> None:
-        """Auto-consume inventory to heal. 1 inventory = 1 HP restored."""
-        # How much HP is missing?
+        """Auto-consume inventory to heal, capped at heal_per_tick."""
         hp_missing = self.config.max_hp - self.agent_hp
-
-        # Heal amount is minimum of: missing HP, available inventory
-        heal_amount = torch.minimum(hp_missing, self.agent_inventory)
-
-        # Only heal alive agents with missing HP
+        cap = torch.full_like(self.agent_inventory, self.config.heal_per_tick)
+        heal_amount = torch.minimum(torch.minimum(hp_missing, self.agent_inventory), cap)
         heal_amount = heal_amount * self.agent_alive.float() * (hp_missing > 0).float()
-
-        # Apply healing and deduct from inventory
         self.agent_hp = self.agent_hp + heal_amount
         self.agent_inventory = self.agent_inventory - heal_amount
 
@@ -1362,11 +1602,16 @@ class GridWorld:
         occupants = self.occupancy[safe_rows, safe_cols]  # [n, 4]
 
         has_target = (occupants >= 0)
-        target_alive = self.agent_alive[occupants.clamp(min=0)] & has_target
+        is_agent_occ = has_target & (occupants < n)
+        target_alive = self.agent_alive[occupants.clamp(min=0, max=n-1)] & is_agent_occ
         direction_has_agent = target_in_bounds & target_alive  # [n, 4] - which directions have adjacent agent
 
-        # Any adjacent agent? (for enabling ATTACK/GIVE action types)
+        # Check for adjacent predators too (for ATTACK validity)
+        direction_has_predator = target_in_bounds & has_target & (occupants >= n)  # [n, 4]
+
+        # Any adjacent attackable entity? (agent or predator)
         any_adjacent_agent = direction_has_agent.any(dim=1)  # [n]
+        any_adjacent_target = (direction_has_agent | direction_has_predator).any(dim=1)  # [n]
 
         # === ACTION TYPE MASK [n, 5] ===
         action_type_mask = torch.zeros(n, 5, dtype=torch.bool, device=self.device)
@@ -1374,10 +1619,10 @@ class GridWorld:
         # MOVE (type 0) - always valid for alive agents
         action_type_mask[:, ACT_MOVE] = self.agent_alive
 
-        # ATTACK (type 1) - valid if any adjacent agent exists
-        action_type_mask[:, ACT_ATTACK] = any_adjacent_agent & self.agent_alive
+        # ATTACK (type 1) - valid if any adjacent agent OR predator exists
+        action_type_mask[:, ACT_ATTACK] = any_adjacent_target & self.agent_alive
 
-        # GIVE (type 2) - valid if any adjacent agent exists
+        # GIVE (type 2) - valid if any adjacent agent exists (can't give to predator)
         action_type_mask[:, ACT_GIVE] = any_adjacent_agent & self.agent_alive
 
         # SIGNAL (type 3) - always valid for alive agents
@@ -1444,7 +1689,10 @@ class GridWorld:
         agent_hp = (self.agent_hp / self.config.max_hp).view(1, n, 1).expand(n, n, 1)
 
         # Social features [n, n, 4] scaled by 5.0 for stronger signal
-        social = self.ledger.get_normalized_tensor() * 5.0
+        if self.config.ablate_ledger:
+            social = torch.zeros(n, n, 4, device=self.device)
+        else:
+            social = self.ledger.get_normalized_tensor() * 5.0
 
         # Combine: [n, n, 25] = fourier[16] + velocity[2] + type[2] + hp[1] + social[4]
         agent_tokens = torch.cat([fourier_agents, velocity_agents, type_onehot_agents, agent_hp, social], dim=-1)
@@ -1521,6 +1769,43 @@ class GridWorld:
             # Place in output (after agent tokens)
             tokens[:, n:n+k, :] = food_tokens
             mask[:, n:n+k] = True
+
+        # === PREDATOR TOKENS (after food tokens) ===
+        if self.n_predators > 0 and self.predator_alive is not None:
+            pred_start = n + max_food  # Slot index where predator tokens begin
+            for p in range(self.n_predators):
+                if not self.predator_alive[p]:
+                    continue
+
+                slot = pred_start + p
+                if slot >= max_ent:
+                    break
+
+                # Relative position normalized to [-1, 1]
+                rel_pos_pred = (self.predator_positions[p].float() - self.agent_positions.float()) / gs  # [n, 2]
+                fourier_pred = self._fourier_encode(rel_pos_pred)  # [n, 16]
+
+                # Velocity
+                rel_prev_pred = (self.predator_prev_positions[p].float() - self.prev_agent_positions.float()) / gs
+                velocity_pred = (rel_pos_pred - rel_prev_pred) * 10.0  # [n, 2]
+
+                # Type: agent-like [0, 1]
+                type_pred = torch.zeros(n, 2, device=self.device)
+                type_pred[:, 1] = 1  # is_agent
+
+                # Value: predator HP normalized by max_hp (>1.0 distinguishes from agents)
+                hp_pred = torch.full((n, 1), self.predator_hp[p].item() / self.config.max_hp, device=self.device)
+
+                # Social: from predator ledger (damage dealt/received)
+                social_pred = torch.zeros(n, 4, device=self.device)
+                if self.predator_ledger is not None:
+                    social_pred[:, 0] = (self.predator_ledger[:, p, 0] / 100.0).clamp(0, 1) * 5.0
+                    social_pred[:, 1] = (self.predator_ledger[:, p, 1] / 100.0).clamp(0, 1) * 5.0
+
+                # Combine: [n, 25]
+                pred_token = torch.cat([fourier_pred, velocity_pred, type_pred, hp_pred, social_pred], dim=-1)
+                tokens[:, slot, :] = pred_token
+                mask[:, slot] = True
 
         return tokens, mask
 

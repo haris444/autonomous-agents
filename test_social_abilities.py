@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from config import Config
 from environment import GridWorld
+from batched_env import BatchedGridWorld
 from network import ActorCritic
 from ppo import VmapPPO
 from utils import get_device
@@ -142,6 +143,29 @@ class ScriptedAgent:
         else:  # PASSIVE
             return DIR_STAY, ACT_MOVE  # Stay in place
 
+    def get_action_from_diff(self, diff: torch.Tensor, target_alive: bool) -> Tuple[int, int]:
+        """Return (direction, action_type) based on role and position diff to target.
+
+        Used by batched episode runner where we don't have a GridWorld env reference.
+        """
+        ACT_MOVE, ACT_ATTACK, ACT_GIVE = 0, 1, 2
+        DIR_STAY = 4
+
+        direction = self._get_direction_to(diff)
+
+        if self.role == ScriptedRole.ENEMY or self.role == ScriptedRole.ATTACKER:
+            if direction is not None and target_alive:
+                return direction, ACT_ATTACK
+            return DIR_STAY, ACT_MOVE
+
+        elif self.role == ScriptedRole.ALLY:
+            if direction is not None and target_alive:
+                return direction, ACT_GIVE
+            return DIR_STAY, ACT_MOVE
+
+        else:  # PASSIVE
+            return DIR_STAY, ACT_MOVE
+
     def _get_direction_to(self, diff: torch.Tensor) -> Optional[int]:
         """Get direction index (0-3) to reach target, or None if not adjacent."""
         dr, dc = diff[0].item(), diff[1].item()
@@ -211,10 +235,12 @@ class SocialTestRunner:
         self.config = config
         self.device = device
         self.model_path = model_path
+        self.agent_idx = 0  # Which agent's weights to test
 
         # Detect checkpoint n_agents on first load
         self._checkpoint_n_agents: Optional[int] = None
         self._checkpoint_config: Optional[Config] = None
+        self._n_independent_agents: int = 1  # How many distinct networks in checkpoint
         self._detect_checkpoint_config()
 
         # Will be initialized per scenario
@@ -236,12 +262,21 @@ class SocialTestRunner:
         return fixed
 
     def _detect_checkpoint_config(self):
-        """Detect the config used to train the checkpoint."""
+        """Detect the config used to train the checkpoint and cache it."""
         checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+        self._checkpoint_data = checkpoint  # Cache to avoid re-loading
+
+        # Detect number of independent networks
+        if 'network_state_dicts' in checkpoint:
+            self._n_independent_agents = len(checkpoint['network_state_dicts'])
 
         # Check if config is saved in checkpoint
         if 'config' in checkpoint:
-            self._checkpoint_config = checkpoint['config']
+            raw_cfg = checkpoint['config']
+            if isinstance(raw_cfg, dict):
+                self._checkpoint_config = Config.from_dict(raw_cfg)
+            else:
+                self._checkpoint_config = raw_cfg
             self._checkpoint_n_agents = self._checkpoint_config.n_agents
             return
 
@@ -265,36 +300,39 @@ class SocialTestRunner:
         n_agents_for_test specifies how many agents are active in the test.
         """
         # Create test config based on checkpoint's n_agents
-        test_config = Config()
-        test_config.n_agents = self._checkpoint_n_agents
-
-        # Disable pretraining/curriculum for testing - we want full control
-        test_config.pretrain_mode = False
-        test_config.curriculum_enabled = False
+        self._test_config = Config()
+        self._test_config.n_agents = self._checkpoint_n_agents
+        self._test_config.pretrain_mode = False
+        self._test_config.curriculum_enabled = False
 
         # Store the number of agents we'll actually use in tests
-        self.active_agents = min(n_agents_for_test, test_config.n_agents)
+        self.active_agents = min(n_agents_for_test, self._test_config.n_agents)
+        self._loaded_n_agents_for_test = n_agents_for_test
 
-        # Create environment and policy with checkpoint's n_agents
-        self.env = GridWorld(test_config, self.device)
-        self.multi_agent = VmapPPO(test_config, self.device)
+        # Create environment and policy
+        self.env = GridWorld(self._test_config, self.device)
+        self.multi_agent = VmapPPO(self._test_config, self.device)
 
-        # Load checkpoint
-        checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+        # Use cached checkpoint data
+        checkpoint = self._checkpoint_data
         if 'network_state_dicts' in checkpoint:
-            state_dict = checkpoint['network_state_dicts'][0]
+            state_dict = checkpoint['network_state_dicts'][self.agent_idx]
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
 
-        # Handle architecture mismatches (e.g., older checkpoints)
         state_dict = self._fix_state_dict_compatibility(state_dict)
 
         for net in self.multi_agent.networks:
             net.load_state_dict(state_dict, strict=False)
-
-        # Set to eval mode
-        for net in self.multi_agent.networks:
             net.eval()
+
+    def _ensure_model_loaded(self, n_agents_for_test: int):
+        """Load model only if not already loaded with correct settings."""
+        if (self.multi_agent is None or
+                getattr(self, '_loaded_n_agents_for_test', None) != n_agents_for_test):
+            self.load_model(n_agents_for_test)
 
     def inject_social_history(self, histories: Dict[Tuple[int, int], Dict[str, float]]):
         """Inject pre-set ledger values after env.reset()."""
@@ -409,13 +447,159 @@ class SocialTestRunner:
 
         return metrics
 
+    def run_episodes_batched(
+        self,
+        num_episodes: int,
+        test_agent_id: int,
+        scripted_agents: List[ScriptedAgent],
+        initial_positions: Dict[int, Tuple[int, int]],
+        social_histories: Dict[Tuple[int, int], Dict[str, float]],
+        max_steps: int = 50,
+        provocation_step: Optional[int] = None,
+    ) -> List[EpisodeMetrics]:
+        """Run multiple test episodes in parallel using BatchedGridWorld."""
+        n_agents = self._test_config.n_agents
+        corner_positions = [(0, 0), (0, 14), (14, 0), (14, 14), (0, 7), (14, 7), (7, 0), (7, 14)]
+
+        # Create batched env
+        vec_env = BatchedGridWorld(self._test_config, self.device, n_envs=num_episodes)
+        vec_env.reset()
+
+        # Set positions for all envs (broadcast identical positions)
+        corner_idx = 0
+        for agent_id in range(n_agents):
+            if agent_id in initial_positions:
+                r, c = initial_positions[agent_id]
+                vec_env.agent_positions[:, agent_id] = torch.tensor([r, c], device=self.device)
+                vec_env.agent_alive[:, agent_id] = True
+                vec_env.agent_hp[:, agent_id] = self._test_config.max_hp
+            else:
+                cr, cc = corner_positions[corner_idx % len(corner_positions)]
+                vec_env.agent_positions[:, agent_id] = torch.tensor([cr, cc], device=self.device)
+                vec_env.agent_alive[:, agent_id] = False
+                vec_env.agent_hp[:, agent_id] = 0
+                corner_idx += 1
+
+        # Inject social histories for all envs
+        for (src, tgt), values in social_histories.items():
+            vec_env.ledger_tensor[:, src, tgt, LEDGER_DAMAGE_DEALT] = values.get('damage_dealt', 0) * LEDGER_MAX[0]
+            vec_env.ledger_tensor[:, src, tgt, LEDGER_FOOD_GIVEN] = values.get('food_given', 0) * LEDGER_MAX[1]
+            vec_env.ledger_tensor[:, src, tgt, LEDGER_COOP_COUNT] = values.get('coop_count', 0) * LEDGER_MAX[2]
+            vec_env.ledger_tensor[:, src, tgt, LEDGER_DEFENSE_SCORE] = values.get('defense_score', 0) * LEDGER_MAX[3]
+
+        vec_env._update_occupancy()
+        obs = vec_env._get_all_observations()
+
+        # Per-env metrics tracking tensors
+        attacks_by_dir = torch.zeros(num_episodes, 4, dtype=torch.long, device=self.device)
+        gives_by_dir = torch.zeros(num_episodes, 4, dtype=torch.long, device=self.device)
+        coop_attempts = torch.zeros(num_episodes, dtype=torch.long, device=self.device)
+        total_actions = torch.zeros(num_episodes, dtype=torch.long, device=self.device)
+        attacks_total = torch.zeros(num_episodes, dtype=torch.long, device=self.device)
+        gives_total = torch.zeros(num_episodes, dtype=torch.long, device=self.device)
+        # Retaliation tracking
+        attacks_at_provocation = torch.zeros(num_episodes, dtype=torch.long, device=self.device)
+        provoked = False
+
+        net = self.multi_agent.networks[0]
+
+        # Precompute scripted actions (same for all envs since positions are identical)
+        # We'll recompute per-step since positions may change
+        for step in range(max_steps):
+            # Check provocation
+            if provocation_step is not None and step >= provocation_step and not provoked:
+                provoked = True
+                attacks_at_provocation = attacks_total.clone()
+
+            # Get action masks [n_envs, n_agents, 5]
+            direction_mask, action_type_mask = vec_env.get_action_masks()
+
+            # Forward pass: flatten [n_envs, n_agents, ...] → [n_envs*n_agents, ...]
+            with torch.no_grad():
+                flat_obs = {k: v.reshape(-1, *v.shape[2:]) for k, v in obs.items()}
+                dir_logits, act_logits, _ = net.forward(flat_obs)
+
+                # Reshape back: [n_envs*n_agents, 5] → [n_envs, n_agents, 5]
+                dir_logits = dir_logits.reshape(num_episodes, n_agents, -1)
+                act_logits = act_logits.reshape(num_episodes, n_agents, -1)
+
+                # Apply masks
+                LARGE_NEG = -1e8
+                if direction_mask is not None:
+                    dir_logits = dir_logits.masked_fill(~direction_mask, LARGE_NEG)
+                if action_type_mask is not None:
+                    act_logits = act_logits.masked_fill(~action_type_mask, LARGE_NEG)
+
+                # Sample actions
+                from torch.distributions import Categorical
+                directions = Categorical(logits=dir_logits).sample()  # [n_envs, n_agents]
+                action_types = Categorical(logits=act_logits).sample()
+
+            # Override scripted agents (same action for all envs)
+            for scripted in scripted_agents:
+                # Compute scripted action using env 0's state (identical across envs)
+                my_pos = vec_env.agent_positions[0, scripted.agent_id]
+                target_pos = vec_env.agent_positions[0, scripted.target_id]
+                diff = target_pos - my_pos
+                alive = vec_env.agent_alive[0, scripted.agent_id]
+
+                if alive:
+                    s_dir, s_act = scripted.get_action_from_diff(diff, vec_env.agent_alive[0, scripted.target_id])
+                    directions[:, scripted.agent_id] = s_dir
+                    action_types[:, scripted.agent_id] = s_act
+
+            # Record test agent metrics (vectorized across envs)
+            alive_mask = vec_env.agent_alive[:, test_agent_id]  # [n_envs]
+            test_dirs = directions[:, test_agent_id]   # [n_envs]
+            test_acts = action_types[:, test_agent_id]  # [n_envs]
+
+            total_actions += alive_mask.long()
+
+            # Attacks: action_type == 1 and direction < 4
+            is_attack = alive_mask & (test_acts == 1) & (test_dirs < 4)
+            attacks_total += is_attack.long()
+            for d in range(4):
+                attacks_by_dir[:, d] += (is_attack & (test_dirs == d)).long()
+
+            # Gives: action_type == 2 and direction < 4
+            is_give = alive_mask & (test_acts == 2) & (test_dirs < 4)
+            gives_total += is_give.long()
+            for d in range(4):
+                gives_by_dir[:, d] += (is_give & (test_dirs == d)).long()
+
+            # Coop: action_type == 4
+            coop_attempts += (alive_mask & (test_acts == 4)).long()
+
+            # Step
+            obs, rewards, dones, infos = vec_env.step(directions, action_types)
+
+        # Build per-episode EpisodeMetrics
+        results = []
+        for e in range(num_episodes):
+            m = EpisodeMetrics()
+            m.total_actions = total_actions[e].item()
+            m.attacks_total = attacks_total[e].item()
+            m.gives_total = gives_total[e].item()
+            m.coop_attempts = coop_attempts[e].item()
+            for d in range(4):
+                m.attacks_by_direction[d] = attacks_by_dir[e, d].item()
+                m.gives_by_direction[d] = gives_by_dir[e, d].item()
+            if provocation_step is not None:
+                m.attacks_before_provocation = attacks_at_provocation[e].item()
+                m.steps_before_provocation = provocation_step
+                m.attacks_after_provocation = attacks_total[e].item() - attacks_at_provocation[e].item()
+                m.steps_after_provocation = max_steps - provocation_step
+            results.append(m)
+
+        return results
+
     # =========================================================================
     # Test Scenarios
     # =========================================================================
 
     def test_enemy_recognition(self, num_episodes: int) -> ScenarioResult:
         """Test 1: Does agent attack enemies more than neutrals?"""
-        self.load_model(n_agents_for_test=2)
+        self._ensure_model_loaded(n_agents_for_test=2)
 
         result = ScenarioResult(
             name="Enemy Recognition",
@@ -425,26 +609,22 @@ class SocialTestRunner:
         )
 
         # Run episodes with enemy history
-        enemy_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
-                initial_positions={0: (7, 7), 1: (7, 8)},  # Adjacent horizontally
-                social_histories={(1, 0): make_enemy_history()},  # Agent 1 was enemy to agent 0
-            )
-            enemy_metrics.append(m)
+        enemy_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
+            initial_positions={0: (7, 7), 1: (7, 8)},
+            social_histories={(1, 0): make_enemy_history()},
+        )
 
         # Run episodes with neutral history
-        neutral_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
-                initial_positions={0: (7, 7), 1: (7, 8)},
-                social_histories={(1, 0): make_neutral_history()},
-            )
-            neutral_metrics.append(m)
+        neutral_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
+            initial_positions={0: (7, 7), 1: (7, 8)},
+            social_histories={(1, 0): make_neutral_history()},
+        )
 
         # Calculate attack rates (RIGHT direction = toward agent 1)
         enemy_attack_rates = [m.attacks_by_direction[3] / max(m.total_actions, 1) for m in enemy_metrics]
@@ -469,7 +649,7 @@ class SocialTestRunner:
 
     def test_ally_recognition(self, num_episodes: int) -> ScenarioResult:
         """Test 2: Does agent give to allies and avoid attacking them?"""
-        self.load_model(n_agents_for_test=2)
+        self._ensure_model_loaded(n_agents_for_test=2)
 
         result = ScenarioResult(
             name="Ally Recognition",
@@ -478,15 +658,13 @@ class SocialTestRunner:
             description="Give rate toward ally vs attack rate"
         )
 
-        ally_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
-                initial_positions={0: (7, 7), 1: (7, 8)},
-                social_histories={(1, 0): make_ally_history()},
-            )
-            ally_metrics.append(m)
+        ally_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
+            initial_positions={0: (7, 7), 1: (7, 8)},
+            social_histories={(1, 0): make_ally_history()},
+        )
 
         # Calculate rates
         give_rates = [m.gives_by_direction[3] / max(m.total_actions, 1) for m in ally_metrics]
@@ -511,7 +689,7 @@ class SocialTestRunner:
 
     def test_discrimination(self, num_episodes: int) -> ScenarioResult:
         """Test 3: Can agent discriminate enemy (RIGHT) from ally (LEFT)?"""
-        self.load_model(n_agents_for_test=3)
+        self._ensure_model_loaded(n_agents_for_test=3)
 
         result = ScenarioResult(
             name="Enemy vs Ally Discrimination",
@@ -520,21 +698,19 @@ class SocialTestRunner:
             description="Attack right (enemy) vs left (ally)"
         )
 
-        metrics_list = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[
-                    ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),  # Enemy on RIGHT
-                    ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),  # Ally on LEFT
-                ],
-                initial_positions={0: (7, 7), 1: (7, 8), 2: (7, 6)},  # Test in center
-                social_histories={
-                    (1, 0): make_enemy_history(),  # Agent 1 was enemy
-                    (2, 0): make_ally_history(),   # Agent 2 was ally
-                },
-            )
-            metrics_list.append(m)
+        metrics_list = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[
+                ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),  # Enemy on RIGHT
+                ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),  # Ally on LEFT
+            ],
+            initial_positions={0: (7, 7), 1: (7, 8), 2: (7, 6)},
+            social_histories={
+                (1, 0): make_enemy_history(),
+                (2, 0): make_ally_history(),
+            },
+        )
 
         # Attack direction: RIGHT=3 (enemy), LEFT=2 (ally)
         attacks_toward_enemy = [m.attacks_by_direction[3] for m in metrics_list]
@@ -558,7 +734,7 @@ class SocialTestRunner:
 
     def test_cooperation_preference(self, num_episodes: int) -> ScenarioResult:
         """Test 4: Does agent cooperate more with past cooperators?"""
-        self.load_model(n_agents_for_test=3)
+        self._ensure_model_loaded(n_agents_for_test=3)
 
         result = ScenarioResult(
             name="Cooperation with Cooperators",
@@ -568,39 +744,34 @@ class SocialTestRunner:
         )
 
         # With past cooperator nearby
-        coop_metrics = []
-        for _ in range(num_episodes):
-            # Place rich food and agents near it
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[
-                    ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),  # Past cooperator
-                    ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),  # Stranger
-                ],
-                initial_positions={0: (7, 7), 1: (7, 8), 2: (7, 6)},
-                social_histories={
-                    (1, 0): make_cooperator_history(),  # Agent 1 cooperated before
-                    (2, 0): make_neutral_history(),     # Agent 2 is stranger
-                },
-            )
-            coop_metrics.append(m)
+        coop_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[
+                ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),
+                ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),
+            ],
+            initial_positions={0: (7, 7), 1: (7, 8), 2: (7, 6)},
+            social_histories={
+                (1, 0): make_cooperator_history(),
+                (2, 0): make_neutral_history(),
+            },
+        )
 
         # With stranger only (no cooperator history)
-        stranger_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[
-                    ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),
-                    ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),
-                ],
-                initial_positions={0: (7, 7), 1: (7, 8), 2: (7, 6)},
-                social_histories={
-                    (1, 0): make_neutral_history(),
-                    (2, 0): make_neutral_history(),
-                },
-            )
-            stranger_metrics.append(m)
+        stranger_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[
+                ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),
+                ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),
+            ],
+            initial_positions={0: (7, 7), 1: (7, 8), 2: (7, 6)},
+            social_histories={
+                (1, 0): make_neutral_history(),
+                (2, 0): make_neutral_history(),
+            },
+        )
 
         coop_rates = [m.coop_attempts / max(m.total_actions, 1) for m in coop_metrics]
         stranger_rates = [m.coop_attempts / max(m.total_actions, 1) for m in stranger_metrics]
@@ -623,7 +794,7 @@ class SocialTestRunner:
 
     def test_defense_behavior(self, num_episodes: int) -> ScenarioResult:
         """Test 5: Does agent defend allies from attackers?"""
-        self.load_model(n_agents_for_test=3)
+        self._ensure_model_loaded(n_agents_for_test=3)
 
         result = ScenarioResult(
             name="Defense Behavior",
@@ -633,39 +804,34 @@ class SocialTestRunner:
         )
 
         # Scenario: Attacker (agent 2) attacks ally (agent 1), test agent (0) should attack attacker
-        defense_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[
-                    ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),   # Ally being attacked
-                    ScriptedAgent(2, ScriptedRole.ATTACKER, target_id=1), # Attacks the ally
-                ],
-                # Position: test(0) - ally(1) - attacker(2) in a row
-                initial_positions={0: (7, 6), 1: (7, 7), 2: (7, 8)},
-                social_histories={
-                    (1, 0): make_ally_history(),   # Agent 1 is ally
-                    (2, 0): make_neutral_history(), # Agent 2 starts neutral
-                },
-            )
-            defense_metrics.append(m)
+        defense_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[
+                ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),
+                ScriptedAgent(2, ScriptedRole.ATTACKER, target_id=1),
+            ],
+            initial_positions={0: (7, 6), 1: (7, 7), 2: (7, 8)},
+            social_histories={
+                (1, 0): make_ally_history(),
+                (2, 0): make_neutral_history(),
+            },
+        )
 
         # Baseline: no one attacking
-        baseline_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[
-                    ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),
-                    ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),
-                ],
-                initial_positions={0: (7, 6), 1: (7, 7), 2: (7, 8)},
-                social_histories={
-                    (1, 0): make_ally_history(),
-                    (2, 0): make_neutral_history(),
-                },
-            )
-            baseline_metrics.append(m)
+        baseline_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[
+                ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0),
+                ScriptedAgent(2, ScriptedRole.PASSIVE, target_id=0),
+            ],
+            initial_positions={0: (7, 6), 1: (7, 7), 2: (7, 8)},
+            social_histories={
+                (1, 0): make_ally_history(),
+                (2, 0): make_neutral_history(),
+            },
+        )
 
         # Test agent attacks RIGHT to defend (direction 3)
         defense_attacks = [m.attacks_total for m in defense_metrics]
@@ -689,7 +855,7 @@ class SocialTestRunner:
 
     def test_retaliation(self, num_episodes: int) -> ScenarioResult:
         """Test 6: Does agent retaliate after being attacked?"""
-        self.load_model(n_agents_for_test=2)
+        self._ensure_model_loaded(n_agents_for_test=2)
 
         result = ScenarioResult(
             name="Retaliation",
@@ -698,17 +864,14 @@ class SocialTestRunner:
             description="Attack rate increase after being attacked"
         )
 
-        retaliation_metrics = []
-        for _ in range(num_episodes):
-            # Provocation starts at step 10
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[ScriptedAgent(1, ScriptedRole.ATTACKER, target_id=0)],
-                initial_positions={0: (7, 7), 1: (7, 8)},
-                social_histories={(1, 0): make_neutral_history()},  # Starts neutral
-                provocation_step=10,
-            )
-            retaliation_metrics.append(m)
+        retaliation_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[ScriptedAgent(1, ScriptedRole.ATTACKER, target_id=0)],
+            initial_positions={0: (7, 7), 1: (7, 8)},
+            social_histories={(1, 0): make_neutral_history()},
+            provocation_step=10,
+        )
 
         # Calculate attack rates before and after provocation
         rates_before = []
@@ -742,7 +905,7 @@ class SocialTestRunner:
 
     def test_neutral_baseline(self, num_episodes: int) -> ScenarioResult:
         """Test 7: Establish baseline behavior rates with neutral agent."""
-        self.load_model(n_agents_for_test=2)
+        self._ensure_model_loaded(n_agents_for_test=2)
 
         result = ScenarioResult(
             name="Neutral Baseline",
@@ -751,15 +914,13 @@ class SocialTestRunner:
             description="Baseline interaction rates with neutral agents"
         )
 
-        neutral_metrics = []
-        for _ in range(num_episodes):
-            m = self.run_episode(
-                test_agent_id=0,
-                scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
-                initial_positions={0: (7, 7), 1: (7, 8)},
-                social_histories={(1, 0): make_neutral_history()},
-            )
-            neutral_metrics.append(m)
+        neutral_metrics = self.run_episodes_batched(
+            num_episodes,
+            test_agent_id=0,
+            scripted_agents=[ScriptedAgent(1, ScriptedRole.PASSIVE, target_id=0)],
+            initial_positions={0: (7, 7), 1: (7, 8)},
+            social_histories={(1, 0): make_neutral_history()},
+        )
 
         attack_rates = [m.attacks_total / max(m.total_actions, 1) for m in neutral_metrics]
         give_rates = [m.gives_total / max(m.total_actions, 1) for m in neutral_metrics]
@@ -1084,52 +1245,107 @@ def main():
 
     # Create runner
     runner = SocialTestRunner(config, device, args.model)
-
-    # Run feature distinctness analysis first
-    feature_result = None
-    if not args.skip_features:
-        print("Running Feature Distinctness Analysis...")
-        analyzer = FeatureDistinctnessAnalyzer(runner)
-        feature_result = analyzer.analyze()
-        print(format_feature_analysis(feature_result))
-
-        if args.features_only:
-            return 0 if feature_result.features_distinct else 1
-
-    # Run behavioral scenarios
-    print(f"\nRunning {num_episodes} episodes per behavioral scenario...")
-    results = []
-
-    print("Running Scenario 1: Enemy Recognition...")
-    results.append(runner.test_enemy_recognition(num_episodes))
-
-    print("Running Scenario 2: Ally Recognition...")
-    results.append(runner.test_ally_recognition(num_episodes))
-
-    print("Running Scenario 3: Enemy vs Ally Discrimination...")
-    results.append(runner.test_discrimination(num_episodes))
-
-    print("Running Scenario 4: Cooperation with Cooperators...")
-    results.append(runner.test_cooperation_preference(num_episodes))
-
-    print("Running Scenario 5: Defense Behavior...")
-    results.append(runner.test_defense_behavior(num_episodes))
-
-    print("Running Scenario 6: Retaliation...")
-    results.append(runner.test_retaliation(num_episodes))
-
-    print("Running Scenario 7: Neutral Baseline...")
-    results.append(runner.test_neutral_baseline(num_episodes))
-
+    n_agents = runner._n_independent_agents
+    print(f"Checkpoint has {n_agents} independent agent network(s)")
     print()
 
-    # Generate and print report
-    report = format_report(results)
-    print(report)
+    test_names = ["Enemy", "Ally", "Discrim", "Coop", "Defense", "Retal", "Baseline"]
 
-    # Return exit code based on pass rate
-    pass_rate = sum(1 for r in results if r.passed) / len(results)
-    return 0 if pass_rate >= 0.5 else 1
+    # Collect per-agent results: all_results[agent_idx] = list of ScenarioResult
+    all_results = {}
+    all_feature_results = {}
+
+    for agent_idx in range(n_agents):
+        runner.agent_idx = agent_idx
+        # Reset so load_model re-creates with new weights
+        runner.multi_agent = None
+
+        print("=" * 65)
+        print(f"  AGENT {agent_idx}")
+        print("=" * 65)
+
+        # Feature distinctness analysis
+        if not args.skip_features:
+            print(f"  Feature Distinctness Analysis (agent {agent_idx})...")
+            analyzer = FeatureDistinctnessAnalyzer(runner)
+            feature_result = analyzer.analyze()
+            all_feature_results[agent_idx] = feature_result
+            status = "PASS" if feature_result.features_distinct else "FAIL"
+            print(f"  Avg similarity: {feature_result.avg_similarity:.3f} [{status}]")
+
+            if args.features_only:
+                continue
+
+        # Behavioral scenarios
+        print(f"  Running {num_episodes} episodes per scenario...")
+        results = []
+
+        print(f"  1/7 Enemy Recognition...")
+        results.append(runner.test_enemy_recognition(num_episodes))
+
+        print(f"  2/7 Ally Recognition...")
+        results.append(runner.test_ally_recognition(num_episodes))
+
+        print(f"  3/7 Enemy vs Ally Discrimination...")
+        results.append(runner.test_discrimination(num_episodes))
+
+        print(f"  4/7 Cooperation with Cooperators...")
+        results.append(runner.test_cooperation_preference(num_episodes))
+
+        print(f"  5/7 Defense Behavior...")
+        results.append(runner.test_defense_behavior(num_episodes))
+
+        print(f"  6/7 Retaliation...")
+        results.append(runner.test_retaliation(num_episodes))
+
+        print(f"  7/7 Neutral Baseline...")
+        results.append(runner.test_neutral_baseline(num_episodes))
+
+        all_results[agent_idx] = results
+
+        # Print per-agent report
+        report = format_report(results)
+        print(report)
+
+    if args.features_only:
+        all_pass = all(fr.features_distinct for fr in all_feature_results.values())
+        return 0 if all_pass else 1
+
+    # ===== SUMMARY GRID =====
+    print()
+    print("=" * 75)
+    print("  SOCIAL ABILITIES SUMMARY (per agent)")
+    print("=" * 75)
+
+    # Header
+    header = f"  {'Agent':>5} |"
+    for tn in test_names:
+        header += f" {tn:>8} |"
+    header += f" {'Score':>6}"
+    print(header)
+    print(f"  {'-'*5}-|" + "".join(f"-{'-'*8}-|" for _ in test_names) + f"-{'-'*6}")
+
+    # Rows
+    total_pass = 0
+    total_tests = 0
+    for agent_idx in range(n_agents):
+        results = all_results[agent_idx]
+        row = f"  {agent_idx:>5} |"
+        agent_pass = 0
+        for r in results:
+            status = "PASS" if r.passed else "FAIL"
+            if r.passed:
+                agent_pass += 1
+            row += f" {status:>8} |"
+        row += f" {agent_pass}/{len(results)}"
+        print(row)
+        total_pass += agent_pass
+        total_tests += len(results)
+
+    print(f"\n  Total: {total_pass}/{total_tests} passed across {n_agents} agents")
+    print("=" * 75)
+
+    return 0 if total_pass / total_tests >= 0.5 else 1
 
 
 if __name__ == "__main__":

@@ -83,6 +83,10 @@ class StepData:
     action_type_probs: Optional[np.ndarray] = None   # [n_agents, 5] action type probs
     # Auxiliary value estimates for decomposed reward streams
     aux_values: Optional[Dict[str, np.ndarray]] = None  # {'survival': [n], 'resource': [n], 'social': [n]}
+    # Predator state
+    predator_positions: Optional[np.ndarray] = None  # [n_predators, 2]
+    predator_hp: Optional[np.ndarray] = None         # [n_predators]
+    predator_alive: Optional[np.ndarray] = None      # [n_predators]
 
 
 class GridRenderer:
@@ -171,6 +175,32 @@ class GridRenderer:
             if signals[agent_id]:
                 ax.text(col + 0.35, row - 0.35, '~', fontsize=12, color='blue', fontweight='bold')
 
+        # Draw predators
+        if hasattr(env, 'n_predators') and env.n_predators > 0 and env.predator_positions is not None:
+            pred_positions = env.predator_positions.cpu().numpy()
+            pred_hp = env.predator_hp.cpu().numpy()
+            pred_alive = env.predator_alive.cpu().numpy()
+            for p in range(env.n_predators):
+                if not pred_alive[p]:
+                    continue
+                row, col = pred_positions[p]
+                # Red diamond for predator
+                diamond = mpatches.RegularPolygon((col, row), numVertices=4, radius=0.4,
+                                             orientation=0, color='darkred', ec='black', linewidth=2, zorder=5)
+                ax.add_patch(diamond)
+                ax.text(col, row, 'P', ha='center', va='center',
+                       fontsize=10, fontweight='bold', color='white', zorder=6)
+                # HP bar
+                max_pred_hp = self.config.max_hp * self.config.predator_hp_mult
+                health_frac = pred_hp[p] / max_pred_hp
+                bar_w = 0.7
+                bar_h = 0.12
+                bar_y = row - 0.55
+                ax.add_patch(plt.Rectangle((col - bar_w/2, bar_y), bar_w, bar_h,
+                             color='darkgray', alpha=0.5, zorder=3))
+                ax.add_patch(plt.Rectangle((col - bar_w/2, bar_y), bar_w * health_frac, bar_h,
+                             color='darkred', zorder=4))
+
         # Title and labels
         ax.set_title(f'Multi-Agent Grid World (Step {env.step_count})', fontsize=14)
         ax.set_xlabel('Column')
@@ -183,6 +213,7 @@ class GridRenderer:
                       markersize=12, label='Rich Food'),
             mpatches.Patch(color='limegreen', label='Healthy Agent'),
             mpatches.Patch(color='red', label='Low HP Agent'),
+            mpatches.Patch(color='darkred', label='Predator'),
         ]
         ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.01, 1))
 
@@ -234,6 +265,7 @@ class GridRenderer:
 
 
 def render_ledger_heatmaps(ledger_tensor: torch.Tensor,
+                           predator_ledger=None,
                            show: bool = True,
                            figsize: Tuple[int, int] = (12, 10)) -> plt.Figure:
     """
@@ -241,6 +273,7 @@ def render_ledger_heatmaps(ledger_tensor: torch.Tensor,
 
     Args:
         ledger_tensor: [n_agents, n_agents, 4] tensor
+        predator_ledger: Optional [n_agents, n_predators, 2] tensor for predator interactions
         show: Whether to display immediately
         figsize: Figure size
 
@@ -254,6 +287,16 @@ def render_ledger_heatmaps(ledger_tensor: torch.Tensor,
 
     n_agents = data.shape[0]
 
+    # Handle predator ledger
+    pred_data = None
+    n_pred = 0
+    if predator_ledger is not None:
+        if isinstance(predator_ledger, torch.Tensor):
+            pred_data = predator_ledger.cpu().numpy()
+        else:
+            pred_data = predator_ledger
+        n_pred = pred_data.shape[1]
+
     fig, axes = plt.subplots(2, 2, figsize=figsize)
 
     channel_names = ['Damage Dealt', 'Food Given', 'Coop Count', 'Defense Score']
@@ -262,28 +305,55 @@ def render_ledger_heatmaps(ledger_tensor: torch.Tensor,
     for idx, (ax, name, cmap) in enumerate(zip(axes.flat, channel_names, cmaps)):
         channel_data = data[:, :, idx]
 
-        im = ax.imshow(channel_data, cmap=cmap, aspect='equal')
+        # Extend with predator rows for Damage Dealt (idx=0) and Defense Score (idx=3)
+        if pred_data is not None and n_pred > 0 and idx in (0, 3):
+            if idx == 0:
+                pred_rows = pred_data[:, :, 0].T  # [n_pred, n_agents]
+            else:
+                pred_rows = pred_data[:, :, 1].T  # [n_pred, n_agents]
+            extended = np.vstack([channel_data, pred_rows])
+            n_rows = n_agents + n_pred
+
+            im = ax.imshow(extended, cmap=cmap, aspect='equal')
+            # Dark background for predator rows
+            for pr in range(n_pred):
+                ax.axhspan(n_agents + pr - 0.5, n_agents + pr + 0.5,
+                           color='#333333', alpha=0.3, zorder=0)
+            # Separator line
+            ax.axhline(y=n_agents - 0.5, color='darkred', linewidth=2)
+            # Y-tick labels
+            labels = [f'A{i}' for i in range(n_agents)] + [f'P{p}' for p in range(n_pred)]
+            ax.set_yticks(range(n_rows))
+            ax.set_yticklabels(labels)
+            # Annotate cells
+            for i in range(n_rows):
+                for j in range(n_agents):
+                    val = extended[i, j]
+                    if val > 0:
+                        text_color = 'white' if val > extended.max() * 0.5 else 'black'
+                        ax.text(j, i, f'{val:.1f}', ha='center', va='center',
+                               fontsize=8, color=text_color)
+        else:
+            im = ax.imshow(channel_data, cmap=cmap, aspect='equal')
+            ax.set_yticks(range(n_agents))
+            ax.set_yticklabels([f'A{i}' for i in range(n_agents)])
+            # Annotate cells with values
+            for i in range(n_agents):
+                for j in range(n_agents):
+                    val = channel_data[i, j]
+                    if val > 0:
+                        text_color = 'white' if val > channel_data.max() * 0.5 else 'black'
+                        ax.text(j, i, f'{val:.1f}', ha='center', va='center',
+                               fontsize=8, color=text_color)
+
         ax.set_title(name, fontsize=12, fontweight='bold')
         ax.set_xlabel('Target Agent')
         ax.set_ylabel('Source Agent')
-
-        # Tick labels
         ax.set_xticks(range(n_agents))
-        ax.set_yticks(range(n_agents))
         ax.set_xticklabels([f'A{i}' for i in range(n_agents)])
-        ax.set_yticklabels([f'A{i}' for i in range(n_agents)])
 
         # Colorbar
         plt.colorbar(im, ax=ax, shrink=0.8)
-
-        # Annotate cells with values
-        for i in range(n_agents):
-            for j in range(n_agents):
-                val = channel_data[i, j]
-                if val > 0:
-                    text_color = 'white' if val > channel_data.max() * 0.5 else 'black'
-                    ax.text(j, i, f'{val:.1f}', ha='center', va='center',
-                           fontsize=8, color=text_color)
 
     plt.suptitle('Agent Interaction Ledger', fontsize=14, fontweight='bold')
     plt.tight_layout()
@@ -496,11 +566,13 @@ class EpisodeRecorder:
         self.config = config
         self.steps: List[StepData] = []
         self.ledger_snapshots: List[np.ndarray] = []
+        self.predator_ledger_snapshots: List[np.ndarray] = []
 
     def reset(self) -> None:
         """Clear recorded data."""
         self.steps = []
         self.ledger_snapshots = []
+        self.predator_ledger_snapshots = []
 
     def record(self, env, actions: Dict[int, tuple] = None,
                rewards: Dict[int, float] = None,
@@ -533,6 +605,15 @@ class EpisodeRecorder:
                 for k, v in aux_values.items()
             }
 
+        # Capture predator state if present
+        pred_positions = None
+        pred_hp = None
+        pred_alive = None
+        if hasattr(env, 'n_predators') and env.n_predators > 0 and env.predator_positions is not None:
+            pred_positions = env.predator_positions.cpu().numpy().copy()
+            pred_hp = env.predator_hp.cpu().numpy().copy()
+            pred_alive = env.predator_alive.cpu().numpy().copy()
+
         step_data = StepData(
             positions=env.agent_positions.cpu().numpy().copy(),
             hp=env.agent_hp.cpu().numpy().copy(),
@@ -545,10 +626,16 @@ class EpisodeRecorder:
             values=values.copy() if values is not None else None,
             direction_probs=direction_probs,
             action_type_probs=action_type_probs,
-            aux_values=aux_values_copy
+            aux_values=aux_values_copy,
+            predator_positions=pred_positions,
+            predator_hp=pred_hp,
+            predator_alive=pred_alive,
         )
         self.steps.append(step_data)
         self.ledger_snapshots.append(env.ledger.tensor.cpu().numpy().copy())
+        # Capture predator ledger if present
+        if hasattr(env, 'predator_ledger') and env.predator_ledger is not None:
+            self.predator_ledger_snapshots.append(env.predator_ledger.cpu().numpy().copy())
 
     def get_recording(self) -> List[StepData]:
         """Return recorded steps."""
@@ -559,6 +646,7 @@ class EpisodeRecorder:
         data = {
             'steps': self.steps,
             'ledger_snapshots': self.ledger_snapshots,
+            'predator_ledger_snapshots': self.predator_ledger_snapshots,
             'config': self.config
         }
         torch.save(data, filepath)
@@ -568,6 +656,7 @@ class EpisodeRecorder:
         data = torch.load(filepath, weights_only=False)
         self.steps = data['steps']
         self.ledger_snapshots = data['ledger_snapshots']
+        self.predator_ledger_snapshots = data.get('predator_ledger_snapshots', [])
         self.config = data['config']
 
 
@@ -575,6 +664,7 @@ def replay_episode(recording: List[StepData], config: Config,
                    speed: float = 1.0, save_gif: bool = False,
                    gif_path: str = 'episode.gif',
                    ledger_snapshots: List[np.ndarray] = None,
+                   predator_ledger_snapshots: List[np.ndarray] = None,
                    show_ledger: bool = True) -> None:
     """
     Replay a recorded episode with animation.
@@ -586,6 +676,7 @@ def replay_episode(recording: List[StepData], config: Config,
         save_gif: Whether to save as GIF
         gif_path: Path for GIF output
         ledger_snapshots: Optional list of ledger tensors per step
+        predator_ledger_snapshots: Optional list of predator ledger tensors per step
         show_ledger: Whether to show ledger heatmaps (if available)
     """
     if not recording:
@@ -622,6 +713,30 @@ def replay_episode(recording: List[StepData], config: Config,
     has_probs = (recording[0].direction_probs is not None and
                  recording[0].action_type_probs is not None)
 
+    # Pre-compute cumulative food eaten per agent per frame
+    # (detect when agent is on a food cell that disappears next frame)
+    cumulative_food = np.zeros((len(recording), n_agents))
+    for frame_idx in range(len(recording)):
+        if frame_idx > 0:
+            cumulative_food[frame_idx] = cumulative_food[frame_idx - 1].copy()
+            prev = recording[frame_idx - 1]
+            curr = recording[frame_idx]
+            for aid in range(n_agents):
+                if not prev.alive[aid]:
+                    continue
+                r, c = int(prev.positions[aid, 0]), int(prev.positions[aid, 1])
+                # Poor food eaten: was there, now gone
+                if prev.poor_food[r, c] and not curr.poor_food[r, c]:
+                    cumulative_food[frame_idx, aid] += 1
+                # Rich food eaten: was there, now gone, and agent was adjacent (dist<=1)
+                rich_diff = prev.rich_food.astype(int) - curr.rich_food.astype(int)
+                if rich_diff.any():
+                    for rr in range(gs):
+                        for cc in range(gs):
+                            if rich_diff[rr, cc] > 0 and abs(r - rr) + abs(c - cc) <= 1:
+                                cumulative_food[frame_idx, aid] += 1
+                                break
+
     # Pre-compute kills: track (killer, victim) pairs by checking when agents die
     # and who dealt damage to them (from ledger snapshots)
     kill_matrix = np.zeros((n_agents, n_agents), dtype=bool)  # kill_matrix[killer, victim] = True
@@ -639,49 +754,60 @@ def replay_episode(recording: List[StepData], config: Config,
 
     # Create figure layout based on whether we have ledger data and probabilities
     has_ledger = ledger_snapshots is not None and len(ledger_snapshots) > 0 and show_ledger
+    has_pred_ledger = (predator_ledger_snapshots is not None and
+                       len(predator_ledger_snapshots) > 0)
+
+    # Check if hierarchy is enabled
+    has_hierarchy = hasattr(config, 'r_hierarchy') and config.r_hierarchy > 0
 
     if has_ledger and has_probs:
         # Grid on left, probability matrices top-right, all 4 ledger heatmaps in bottom row
-        fig = plt.figure(figsize=(20, 12))
-        # Grid on left (main view)
-        ax_grid = fig.add_axes([0.02, 0.35, 0.38, 0.60])
-        # Probability matrices top-right (compact)
+        fig = plt.figure(figsize=(20, 16))
+        ax_grid = fig.add_axes([0.02, 0.45, 0.38, 0.50])
+        ax_reward = fig.add_axes([0.02, 0.33, 0.38, 0.10])
+        ax_hierarchy = fig.add_axes([0.42, 0.33, 0.56, 0.10]) if has_hierarchy else None
         ax_move_probs = fig.add_axes([0.42, 0.55, 0.27, 0.40])
         ax_interact_probs = fig.add_axes([0.71, 0.55, 0.27, 0.40])
-        # ALL 4 ledger heatmaps in bottom row
         ax_ledger = [
-            fig.add_axes([0.02, 0.05, 0.22, 0.28]),   # Damage
-            fig.add_axes([0.26, 0.05, 0.22, 0.28]),   # Food Given
-            fig.add_axes([0.52, 0.05, 0.22, 0.28]),   # Coop Count
-            fig.add_axes([0.76, 0.05, 0.22, 0.28]),   # Defense Score
+            fig.add_axes([0.02, 0.05, 0.22, 0.22]),
+            fig.add_axes([0.26, 0.05, 0.22, 0.22]),
+            fig.add_axes([0.52, 0.05, 0.22, 0.22]),
+            fig.add_axes([0.76, 0.05, 0.22, 0.22]),
         ]
         ledger_names = ['Damage Dealt', 'Food Given', 'Coop Count', 'Defense Score']
         ledger_cmaps = ['Reds', 'Greens', 'Blues', 'Purples']
     elif has_ledger:
-        # Grid on left, 4 ledger heatmaps on right (2x2)
-        fig = plt.figure(figsize=(18, 10))
-        ax_grid = fig.add_subplot(1, 2, 1)
+        # Grid top-left, reward plot below grid, 4 ledger heatmaps on right (2x2)
+        fig = plt.figure(figsize=(18, 14))
+        ax_grid = fig.add_axes([0.02, 0.38, 0.46, 0.57])
+        ax_reward = fig.add_axes([0.02, 0.22, 0.46, 0.13])
+        ax_hierarchy = fig.add_axes([0.02, 0.05, 0.46, 0.13]) if has_hierarchy else None
         ax_ledger = [
-            fig.add_subplot(2, 4, 3),  # Damage
-            fig.add_subplot(2, 4, 4),  # Food Given
-            fig.add_subplot(2, 4, 7),  # Coop
-            fig.add_subplot(2, 4, 8),  # Defense
+            fig.add_axes([0.54, 0.55, 0.21, 0.38]),   # Damage
+            fig.add_axes([0.77, 0.55, 0.21, 0.38]),   # Food Given
+            fig.add_axes([0.54, 0.05, 0.21, 0.38]),   # Coop
+            fig.add_axes([0.77, 0.05, 0.21, 0.38]),   # Defense
         ]
         ledger_names = ['Damage Dealt', 'Food Given', 'Coop Count', 'Defense Score']
         ledger_cmaps = ['Reds', 'Greens', 'Blues', 'Purples']
         ax_move_probs = None
         ax_interact_probs = None
     elif has_probs:
-        # Grid on left, probability panels on right
-        fig = plt.figure(figsize=(18, 10))
-        ax_grid = fig.add_axes([0.05, 0.12, 0.50, 0.83])
-        ax_move_probs = fig.add_axes([0.58, 0.12, 0.18, 0.83])
-        ax_interact_probs = fig.add_axes([0.79, 0.12, 0.18, 0.83])
+        # Grid on left, probability panels on right, reward below
+        fig = plt.figure(figsize=(18, 12))
+        ax_grid = fig.add_axes([0.05, 0.25, 0.50, 0.70])
+        ax_reward = fig.add_axes([0.05, 0.05, 0.50, 0.15])
+        ax_hierarchy = None
+        ax_move_probs = fig.add_axes([0.58, 0.25, 0.18, 0.70])
+        ax_interact_probs = fig.add_axes([0.79, 0.25, 0.18, 0.70])
         ax_ledger = None
         ledger_names = None
         ledger_cmaps = None
     else:
-        fig, ax_grid = plt.subplots(1, 1, figsize=(12, 10))
+        fig = plt.figure(figsize=(12, 12))
+        ax_grid = fig.add_axes([0.05, 0.25, 0.90, 0.70])
+        ax_reward = fig.add_axes([0.05, 0.05, 0.90, 0.15])
+        ax_hierarchy = None
         ax_ledger = None
         ax_move_probs = None
         ax_interact_probs = None
@@ -719,53 +845,50 @@ def replay_episode(recording: List[StepData], config: Config,
             row, col = step_data.positions[agent_id]
             health_frac = step_data.hp[agent_id] / config.max_hp
 
-            color = health_cmap(max(0, min(1, health_frac)))
+            color = agent_colors[agent_id]
             circle = plt.Circle((col, row), 0.35, color=color, ec='black', linewidth=2)
             ax_grid.add_patch(circle)
 
             ax_grid.text(col, row, str(agent_id), ha='center', va='center',
                         fontsize=10, fontweight='bold', color='black')
 
+            # HP bar above agent
+            bar_w = 0.7
+            bar_h = 0.12
+            bar_y = row - 0.55
+            ax_grid.add_patch(plt.Rectangle((col - bar_w/2, bar_y), bar_w, bar_h,
+                             color='darkgray', alpha=0.5, zorder=3))
+            hp_color = 'lime' if health_frac > 0.5 else ('orange' if health_frac > 0.25 else 'red')
+            ax_grid.add_patch(plt.Rectangle((col - bar_w/2, bar_y), bar_w * health_frac, bar_h,
+                             color=hp_color, zorder=4))
+
             if step_data.signals[agent_id]:
                 ax_grid.text(col + 0.35, row - 0.35, '~', fontsize=12, color='blue', fontweight='bold')
 
-        # Draw relationship lines between agents (friend=green, enemy=red)
-        relationship_info = {}  # Store for agent info text
-        if has_ledger:
-            ledger_data = ledger_snapshots[frame_idx]
 
-            for viewer_id in range(n_agents):
-                if not step_data.alive[viewer_id]:
+        # Draw predators
+        if step_data.predator_positions is not None:
+            n_pred = step_data.predator_positions.shape[0]
+            max_pred_hp = config.max_hp * config.predator_hp_mult
+            for p in range(n_pred):
+                if not step_data.predator_alive[p]:
                     continue
-
-                relationship_info[viewer_id] = []
-                viewer_row, viewer_col = step_data.positions[viewer_id]
-
-                for target_id in range(n_agents):
-                    if target_id == viewer_id or not step_data.alive[target_id]:
-                        continue
-
-                    rel, strength = classify_relationship(ledger_data, viewer_id, target_id)
-                    relationship_info[viewer_id].append((target_id, rel))
-
-                    # Only draw line once per pair (from lower to higher id)
-                    if viewer_id < target_id:
-                        target_row, target_col = step_data.positions[target_id]
-
-                        if rel == 'friend':
-                            color = 'limegreen'
-                            linewidth = min(1 + strength / 20, 4)
-                            alpha = 0.6
-                        elif rel == 'enemy':
-                            color = 'red'
-                            linewidth = min(1 + strength / 20, 4)
-                            alpha = 0.6
-                        else:
-                            continue  # Don't draw neutral lines
-
-                        ax_grid.plot([viewer_col, target_col], [viewer_row, target_row],
-                                    color=color, linewidth=linewidth, alpha=alpha,
-                                    linestyle='-', zorder=1)
+                row, col = step_data.predator_positions[p]
+                # Red diamond for predator
+                diamond = mpatches.RegularPolygon((col, row), numVertices=4, radius=0.4,
+                                             orientation=0, color='darkred', ec='black', linewidth=2, zorder=5)
+                ax_grid.add_patch(diamond)
+                ax_grid.text(col, row, 'P', ha='center', va='center',
+                            fontsize=10, fontweight='bold', color='white', zorder=6)
+                # HP bar
+                health_frac = step_data.predator_hp[p] / max_pred_hp
+                bar_w = 0.7
+                bar_h = 0.12
+                bar_y = row - 0.55
+                ax_grid.add_patch(plt.Rectangle((col - bar_w/2, bar_y), bar_w, bar_h,
+                                 color='darkgray', alpha=0.5, zorder=3))
+                ax_grid.add_patch(plt.Rectangle((col - bar_w/2, bar_y), bar_w * health_frac, bar_h,
+                                 color='darkred', zorder=4))
 
         # Draw attack, give, and cooperate interactions (factored action space)
         if step_data.actions:
@@ -805,8 +928,9 @@ def replay_episode(recording: List[StepData], config: Config,
 
                 target_row, target_col = target_pos
 
-                # CHECK: Is there actually a living agent at the target position?
+                # CHECK: Is there a living agent or predator at the target position?
                 target_agent_id = None
+                target_is_predator = False
                 for other_id in range(n_agents):
                     if other_id == agent_id:
                         continue
@@ -817,8 +941,18 @@ def replay_episode(recording: List[StepData], config: Config,
                         target_agent_id = other_id
                         break
 
-                if target_agent_id is None:
-                    continue  # No agent at target - don't draw arrow
+                # Also check predators
+                if target_agent_id is None and step_data.predator_positions is not None:
+                    for p in range(step_data.predator_positions.shape[0]):
+                        if not step_data.predator_alive[p]:
+                            continue
+                        pr, pc = step_data.predator_positions[p]
+                        if int(pr) == target_row and int(pc) == target_col:
+                            target_is_predator = True
+                            break
+
+                if target_agent_id is None and not target_is_predator:
+                    continue  # No entity at target - don't draw arrow
 
                 if action_type == ACT_ATTACK:
                     # Red arrow for attack
@@ -840,66 +974,93 @@ def replay_episode(recording: List[StepData], config: Config,
                     ax_grid.text(target_col + 0.3, target_row + 0.3, '♥',
                                 fontsize=10, color='green', fontweight='bold')
 
+        # Draw predator attack arrows (predator -> closest adjacent agent)
+        if step_data.predator_positions is not None:
+            n_pred = step_data.predator_positions.shape[0]
+            for p in range(n_pred):
+                if not step_data.predator_alive[p]:
+                    continue
+                pr, pc = step_data.predator_positions[p]
+                # Find closest adjacent alive agent (manhattan <= 1)
+                for aid in range(n_agents):
+                    if not step_data.alive[aid]:
+                        continue
+                    ar, ac = step_data.positions[aid]
+                    if abs(int(pr) - int(ar)) + abs(int(pc) - int(ac)) <= 1:
+                        ax_grid.annotate('',
+                            xy=(int(ac), int(ar)),
+                            xytext=(int(pc), int(pr)),
+                            arrowprops=dict(arrowstyle='->', color='darkred', lw=3, alpha=0.8))
+                        break  # Predator only attacks one agent
+
         ax_grid.set_title(f'Episode Replay - Step {frame_idx + 1}/{len(recording)}', fontsize=14)
         ax_grid.set_xlabel('Column')
         ax_grid.set_ylabel('Row')
 
-        # Draw per-agent info box in top-right corner
-        info_lines = []
-        for agent_id in range(n_agents):
-            cum_reward = cumulative_rewards[frame_idx, agent_id]
-
-            # Build relationship string (e.g., "A1:F A2:E")
-            rel_str = ""
-            if agent_id in relationship_info:
-                rel_parts = []
-                for target_id, rel in relationship_info[agent_id]:
-                    if rel == 'friend':
-                        rel_parts.append(f"A{target_id}:F")
-                    elif rel == 'enemy':
-                        rel_parts.append(f"A{target_id}:E")
-                if rel_parts:
-                    rel_str = " | " + " ".join(rel_parts)
-
-            # Build value string with main value and auxiliary values
-            value_str = ""
-            if has_values and step_data.values is not None:
-                value = step_data.values[agent_id]
-                value_str = f"  V={value:.1f}"
-
-            # Add auxiliary values (V_survival, V_resource, V_social)
-            aux_str = ""
-            if has_aux_values and step_data.aux_values is not None:
-                v_surv = step_data.aux_values['survival'][agent_id]
-                v_res = step_data.aux_values['resource'][agent_id]
-                v_soc = step_data.aux_values['social'][agent_id]
-                aux_str = f" [S:{v_surv:+.1f} R:{v_res:+.1f} C:{v_soc:+.1f}]"
-
-            info_lines.append(f'A{agent_id}: R={cum_reward:+.1f}{value_str}{aux_str}{rel_str}')
-
-        info_text = '\n'.join(info_lines)
-        # Position in upper right of grid (using axes coordinates)
-        ax_grid.text(0.98, 0.98, info_text, transform=ax_grid.transAxes,
-                    fontsize=8, fontfamily='monospace',
-                    verticalalignment='top', horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
+        # (Agent info now shown via reward plot and HP bars)
 
         # Draw ledger heatmaps
         if has_ledger and ax_ledger is not None:
             ledger_data = ledger_snapshots[frame_idx]
+            pred_ledger = None
+            n_pred = 0
+            if has_pred_ledger and frame_idx < len(predator_ledger_snapshots):
+                pred_ledger = predator_ledger_snapshots[frame_idx]  # [n_agents, n_pred, 2]
+                n_pred = pred_ledger.shape[1]
 
             for idx, (ax, name, cmap) in enumerate(zip(ax_ledger, ledger_names, ledger_cmaps)):
                 ax.clear()
                 channel_data = ledger_data[:, :, idx]
 
-                im = ax.imshow(channel_data, cmap=cmap, aspect='equal', vmin=0)
+                # Extend with predator rows for Damage Dealt (idx=0) and Defense Score (idx=3)
+                if pred_ledger is not None and n_pred > 0 and idx in (0, 3):
+                    if idx == 0:
+                        # Damage Dealt: append rows showing damage agents dealt TO each predator
+                        pred_rows = pred_ledger[:, :, 0].T  # [n_pred, n_agents]
+                    else:
+                        # Defense Score: append rows showing damage predators dealt TO each agent
+                        pred_rows = pred_ledger[:, :, 1].T  # [n_pred, n_agents]
+                    extended = np.vstack([channel_data, pred_rows])
+                    n_rows = n_agents + n_pred
+                    im = ax.imshow(extended, cmap=cmap, aspect='equal', vmin=0)
+                    # Dark background for predator rows
+                    for pr in range(n_pred):
+                        ax.axhspan(n_agents + pr - 0.5, n_agents + pr + 0.5,
+                                   color='#333333', alpha=0.3, zorder=0)
+                    # Separator line
+                    ax.axhline(y=n_agents - 0.5, color='darkred', linewidth=2)
+                    # Y-tick labels with predator labels
+                    labels = [f'{i}' for i in range(n_agents)] + [f'P{p}' for p in range(n_pred)]
+                    ax.set_yticks(range(n_rows))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    # Annotate all cells
+                    for i in range(n_rows):
+                        for j in range(n_agents):
+                            val = extended[i, j]
+                            if val > 0:
+                                max_val = extended.max()
+                                text_color = 'white' if max_val > 0 and val > max_val * 0.5 else 'black'
+                                ax.text(j, i, f'{val:.0f}', ha='center', va='center',
+                                       fontsize=7, color=text_color, fontweight='bold')
+                else:
+                    im = ax.imshow(channel_data, cmap=cmap, aspect='equal', vmin=0)
+                    ax.set_yticks(range(n_agents))
+                    ax.set_yticklabels([f'{i}' for i in range(n_agents)], fontsize=8)
+                    # Annotate non-zero cells with values
+                    for i in range(n_agents):
+                        for j in range(n_agents):
+                            val = channel_data[i, j]
+                            if val > 0:
+                                max_val = channel_data.max()
+                                text_color = 'white' if max_val > 0 and val > max_val * 0.5 else 'black'
+                                ax.text(j, i, f'{val:.0f}', ha='center', va='center',
+                                       fontsize=7, color=text_color, fontweight='bold')
+
                 ax.set_title(name, fontsize=10, fontweight='bold')
                 ax.set_xlabel('Target')
                 ax.set_ylabel('Source')
                 ax.set_xticks(range(n_agents))
-                ax.set_yticks(range(n_agents))
                 ax.set_xticklabels([f'{i}' for i in range(n_agents)], fontsize=8)
-                ax.set_yticklabels([f'{i}' for i in range(n_agents)], fontsize=8)
 
                 # Add X markers on Damage Dealt heatmap for kills
                 if idx == 0:  # Damage Dealt
@@ -958,6 +1119,85 @@ def replay_episode(recording: List[StepData], config: Config,
                     color = 'white' if val > 0.5 else 'black'
                     ax_interact_probs.text(j, i, f'{val:.2f}', ha='center', va='center',
                                           fontsize=7, color=color)
+
+        # Draw cumulative reward plot
+        ax_reward.clear()
+        agent_colors_reward = plt.cm.tab10(np.linspace(0, 1, n_agents))
+        for aid in range(n_agents):
+            ax_reward.plot(range(frame_idx + 1), cumulative_rewards[:frame_idx + 1, aid],
+                          color=agent_colors_reward[aid], linewidth=1.5, alpha=0.8, label=f'A{aid}')
+        ax_reward.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+        ax_reward.axvline(x=frame_idx, color='black', linestyle=':', alpha=0.3)
+        ax_reward.set_xlim(0, len(recording) - 1)
+        ax_reward.set_xlabel('Step', fontsize=8)
+        ax_reward.set_ylabel('Cumulative Reward', fontsize=8)
+        ax_reward.set_title('Rewards Over Time', fontsize=10, fontweight='bold')
+        ax_reward.legend(fontsize=6, loc='upper left', ncol=min(n_agents, 4))
+        ax_reward.grid(True, alpha=0.2)
+
+        # Draw hierarchy ranking bar chart
+        if has_hierarchy and ax_hierarchy is not None:
+            ax_hierarchy.clear()
+
+            eps = 1e-8
+            food_w = getattr(config, 'hierarchy_food_weight', 1.0)
+            dmg_w = getattr(config, 'hierarchy_damage_weight', 1.0)
+            hp_w = getattr(config, 'hierarchy_hp_weight', 1.0)
+
+            food = cumulative_food[frame_idx].copy()
+            alive_mask = step_data.alive.astype(float)
+            food *= alive_mask
+
+            # Damage dealt from ledger (sum over targets)
+            if has_ledger:
+                damage = ledger_snapshots[frame_idx][:, :, 0].sum(axis=1) * alive_mask
+            else:
+                damage = np.zeros(n_agents)
+
+            hp_ratio = (step_data.hp / config.max_hp) * alive_mask
+
+            # Normalize each by max
+            food_norm = food / max(food.max(), eps)
+            dmg_norm = damage / max(damage.max(), eps)
+            hp_norm = hp_ratio / max(hp_ratio.max(), eps)
+
+            score = food_w * food_norm + dmg_w * dmg_norm + hp_w * hp_norm
+            score *= alive_mask
+
+            # Rank (0 = lowest)
+            ranks = score.argsort().argsort().astype(float)
+            n_active = alive_mask.sum()
+            denom = max(n_active - 1, 1)
+            hierarchy_reward = (ranks / denom) * config.r_hierarchy * alive_mask
+
+            # Sort agents by score for display
+            sorted_ids = np.argsort(score)[::-1]
+
+            bar_colors = [agent_colors_reward[aid] for aid in sorted_ids]
+            bar_labels = []
+            bar_scores = []
+            for aid in sorted_ids:
+                rank_label = int(ranks[aid]) + 1 if alive_mask[aid] else '-'
+                status = '' if alive_mask[aid] else ' (dead)'
+                bar_labels.append(f'A{aid} #{rank_label}{status}')
+                bar_scores.append(score[aid])
+
+            y_pos = np.arange(n_agents)
+            bars = ax_hierarchy.barh(y_pos, bar_scores, color=bar_colors, edgecolor='black', linewidth=0.5)
+
+            # Annotate with component breakdown and reward
+            for idx, aid in enumerate(sorted_ids):
+                if alive_mask[aid]:
+                    txt = f'F:{food[aid]:.0f} D:{damage[aid]:.0f} HP:{hp_ratio[aid]:.1f}  +{hierarchy_reward[aid]:.2f}'
+                    ax_hierarchy.text(max(bar_scores) * 0.02 + bar_scores[idx], idx, txt,
+                                     va='center', fontsize=7, color='black')
+
+            ax_hierarchy.set_yticks(y_pos)
+            ax_hierarchy.set_yticklabels(bar_labels, fontsize=8)
+            ax_hierarchy.set_xlabel('Hierarchy Score', fontsize=8)
+            ax_hierarchy.set_title('Social Hierarchy (rank + reward)', fontsize=10, fontweight='bold')
+            ax_hierarchy.set_xlim(0, max(max(bar_scores) * 1.5, 0.1))
+            ax_hierarchy.grid(True, axis='x', alpha=0.2)
 
         return []
 
@@ -1074,10 +1314,14 @@ def visualize_trained_agent(model_path: str, config: Config = None,
         print(f"Episode {ep + 1} finished after {env.step_count} steps")
 
         # Replay episode
-        replay_episode(recorder.get_recording(), config, speed=2.0)
+        pred_snaps = recorder.predator_ledger_snapshots if recorder.predator_ledger_snapshots else None
+        replay_episode(recorder.get_recording(), config, speed=2.0,
+                       ledger_snapshots=recorder.ledger_snapshots,
+                       predator_ledger_snapshots=pred_snaps)
 
         # Show final ledger
-        render_ledger_heatmaps(env.ledger.get_tensor())
+        pred_ledger = getattr(env, 'predator_ledger', None)
+        render_ledger_heatmaps(env.ledger.get_tensor(), predator_ledger=pred_ledger)
 
 
 if __name__ == "__main__":
@@ -1119,5 +1363,6 @@ if __name__ == "__main__":
         config=config,
         speed=1.0,
         ledger_snapshots=recorder.ledger_snapshots,
+        predator_ledger_snapshots=recorder.predator_ledger_snapshots,
         show_ledger=True
     )

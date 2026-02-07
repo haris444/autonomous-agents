@@ -707,3 +707,136 @@ class VecBuffer:
                 'returns_resource': flatten_and_index(self.returns_resource, mb_indices),
                 'returns_social': flatten_and_index(self.returns_social, mb_indices),
             }
+
+    def get_agent_batches(self, agent_idx: int) -> Generator[Dict[str, torch.Tensor], None, None]:
+        """
+        Yield minibatches for a specific agent only.
+
+        Uses direct slicing [:, :, agent_idx] instead of mask+nonzero for speed.
+
+        Args:
+            agent_idx: Which agent's data to return (0-indexed)
+        """
+        # Direct slice for this agent: [num_steps, n_envs, ...] -> flatten to [num_steps*n_envs, ...]
+        agent_batch_size = self.num_steps * self.n_envs
+        minibatch_size = max(1, agent_batch_size // self.config.num_minibatches)
+
+        # Shuffle indices
+        perm = torch.randperm(agent_batch_size, device=self.device)
+
+        # Pre-slice and flatten all tensors for this agent
+        def agent_flat(tensor):
+            """Slice agent dim and flatten [num_steps, n_envs, ...] -> [num_steps*n_envs, ...]."""
+            sliced = tensor[:, :, agent_idx]  # [num_steps, n_envs, ...]
+            return sliced.reshape(agent_batch_size, *sliced.shape[2:])
+
+        et = agent_flat(self.entity_tokens_obs)
+        em = agent_flat(self.entity_mask_obs)
+        sig = agent_flat(self.signal_obs)
+        shp = agent_flat(self.self_hp_obs)
+        sinv = agent_flat(self.self_inventory_obs)
+        aid = agent_flat(self.agent_ids)
+        dirs = agent_flat(self.directions)
+        acts = agent_flat(self.action_types)
+        lps = agent_flat(self.log_probs)
+        advs = agent_flat(self.advantages)
+        rets = agent_flat(self.returns)
+        dm = agent_flat(self.direction_masks)
+        am = agent_flat(self.action_type_masks)
+        rs = agent_flat(self.returns_survival)
+        rr = agent_flat(self.returns_resource)
+        rso = agent_flat(self.returns_social)
+
+        for start in range(0, agent_batch_size, minibatch_size):
+            idx = perm[start:start + minibatch_size]
+
+            yield {
+                'obs': {
+                    'entity_tokens': et[idx],
+                    'entity_mask': em[idx],
+                    'signals': sig[idx],
+                    'self_hp': shp[idx],
+                    'self_inventory': sinv[idx],
+                    'agent_id': aid[idx],
+                },
+                'directions': dirs[idx],
+                'action_types': acts[idx],
+                'log_probs': lps[idx],
+                'advantages': advs[idx],
+                'returns': rets[idx],
+                'direction_mask': dm[idx],
+                'action_type_mask': am[idx],
+                'returns_survival': rs[idx],
+                'returns_resource': rr[idx],
+                'returns_social': rso[idx],
+            }
+
+    def get_aligned_batches(self, n_active: int = None) -> Generator[Dict[str, torch.Tensor], None, None]:
+        """
+        Yield minibatches with all agents stacked in dim 0, using the SAME
+        shuffled permutation across agents. Shape: [n_active, minibatch_size, ...].
+
+        This enables vmapped PPO updates where all agents are processed in parallel.
+
+        Args:
+            n_active: Number of active agents (defaults to self.n_agents)
+        """
+        if n_active is None:
+            n_active = self.n_agents
+
+        # Per-agent batch size
+        agent_batch_size = self.num_steps * self.n_envs
+        minibatch_size = max(1, agent_batch_size // self.config.num_minibatches)
+
+        # Shared permutation across all agents
+        perm = torch.randperm(agent_batch_size, device=self.device)
+
+        # Pre-slice all agents and flatten: [n_active, num_steps*n_envs, ...]
+        def agents_flat(tensor):
+            """Slice first n_active agents, reshape to [n_active, num_steps*n_envs, ...]."""
+            sliced = tensor[:, :, :n_active]  # [num_steps, n_envs, n_active, ...]
+            # Permute agent dim to front: [n_active, num_steps, n_envs, ...]
+            perm_dims = [2, 0, 1] + list(range(3, sliced.dim()))
+            permuted = sliced.permute(*perm_dims)
+            return permuted.reshape(n_active, agent_batch_size, *permuted.shape[3:])
+
+        et = agents_flat(self.entity_tokens_obs)
+        em = agents_flat(self.entity_mask_obs)
+        sig = agents_flat(self.signal_obs)
+        shp = agents_flat(self.self_hp_obs)
+        sinv = agents_flat(self.self_inventory_obs)
+        aid = agents_flat(self.agent_ids)
+        dirs = agents_flat(self.directions)
+        acts = agents_flat(self.action_types)
+        lps = agents_flat(self.log_probs)
+        advs = agents_flat(self.advantages)
+        rets = agents_flat(self.returns)
+        dm = agents_flat(self.direction_masks)
+        am = agents_flat(self.action_type_masks)
+        rs = agents_flat(self.returns_survival)
+        rr = agents_flat(self.returns_resource)
+        rso = agents_flat(self.returns_social)
+
+        for start in range(0, agent_batch_size, minibatch_size):
+            idx = perm[start:start + minibatch_size]
+
+            yield {
+                'obs': {
+                    'entity_tokens': et[:, idx],  # [n_active, mb, ...]
+                    'entity_mask': em[:, idx],
+                    'signals': sig[:, idx],
+                    'self_hp': shp[:, idx],
+                    'self_inventory': sinv[:, idx],
+                    'agent_id': aid[:, idx],
+                },
+                'directions': dirs[:, idx],
+                'action_types': acts[:, idx],
+                'log_probs': lps[:, idx],
+                'advantages': advs[:, idx],
+                'returns': rets[:, idx],
+                'direction_mask': dm[:, idx],
+                'action_type_mask': am[:, idx],
+                'returns_survival': rs[:, idx],
+                'returns_resource': rr[:, idx],
+                'returns_social': rso[:, idx],
+            }

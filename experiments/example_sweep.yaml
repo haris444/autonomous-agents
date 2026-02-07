@@ -1,0 +1,26 @@
+experiment:
+  name: "seed_sweep"
+  description: "Multi-seed sweep for statistical significance"
+
+r_coop_attempt: 5.0
+
+# Social hierarchy
+r_hierarchy: 1
+hierarchy_food_weight: 1.0
+hierarchy_damage_weight: 1.0
+hierarchy_hp_weight: 1.0
+
+total_timesteps: 1_000_000
+
+# Predator
+n_predators: 1
+predator_hp_mult: 0.5
+predator_damage: 10.0
+predator_kill_reward: 5.0
+predator_respawn_steps: 20
+
+training:
+  pretrain: true
+
+sweep:
+  seeds: [42, 123, 456, 789]

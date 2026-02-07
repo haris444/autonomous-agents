@@ -1,0 +1,42 @@
+experiment:
+  name: "reward_grid"
+  description: "Grid search over reward presets and learning rates"
+
+reward_presets:
+  cooperative:
+    r_coop_attempt: 5.0
+    r_food_share: 1.0
+    r_attack_mult: 0.0
+    r_reciprocity: 0.5
+  competitive:
+    r_attack_mult: 0.5
+    r_revenge: 2.0
+    r_coop_attempt: 0.0
+  balanced:
+    r_coop_attempt: 2.0
+    r_attack_mult: 0.1
+    r_revenge: 0.5
+
+# Social hierarchy
+r_hierarchy: 1
+hierarchy_food_weight: 1.0
+hierarchy_damage_weight: 1.0
+hierarchy_hp_weight: 1.0
+
+total_timesteps: 500_000
+
+# Predator
+n_predators: 1
+predator_hp_mult: 0.5
+predator_damage: 10.0
+predator_kill_reward: 5.0
+predator_respawn_steps: 20
+
+training:
+  pretrain: true
+
+sweep:
+  seeds: [42, 123]
+  grid:
+    reward_preset: [cooperative, competitive, balanced]
+    learning_rate: [1.0e-4, 2.5e-4]

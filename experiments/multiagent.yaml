@@ -1,0 +1,92 @@
+experiment:
+  name: "run3_resume"
+  description: "Resume from phase11 checkpoint, 8 agents on 8x8 grid"
+
+# Environment
+grid_size: 6
+n_agents: 4
+max_hp: 100.0
+hp_decay_rate: 0.01
+attack_damage_fraction: 0.5
+max_steps_per_episode: 256
+
+# Action space
+n_directions: 5
+n_action_types: 5
+
+# Entity tokens
+max_food_tokens: 16
+fourier_bands: 4
+
+# Attention
+attention_embed_dim: 64
+attention_num_heads: 4
+group_embed_dim: 16
+
+# Food
+poor_food_value: 10.0
+rich_food_value: 30.0
+poor_food_spawn_rate: 0.0025
+rich_food_spawn_rate: 0.05
+food_coverage_cap: 0.1
+
+# Rewards
+r_small: 2.0
+r_large: 10.0
+r_attack_mult: 0.5
+r_damage_taken: -1.0
+r_low_hp: -1
+r_food_share: 0.0
+r_betrayal: 0.0
+r_reciprocity: 0.0
+r_defense: 0.0
+r_revenge: 0
+r_survival: 0.0
+r_death: -1000
+r_coop_attempt: 0
+r_approach_food: 0
+r_ally_proximity: 0.0
+
+# Social hierarchy
+r_hierarchy: 1
+hierarchy_food_weight: 1.0
+hierarchy_damage_weight: 1.0
+hierarchy_hp_weight: 1.0
+
+# PPO
+learning_rate: 2.5e-4
+gamma: 0.7
+gae_lambda: 0.95
+clip_coef: 0.2
+ent_coef: 0.001
+ent_coef_coop: 0.05
+vf_coef: 1.0
+aux_vf_coef: 0.5
+max_grad_norm: 0.5
+
+# Training
+total_timesteps: 20_000_000
+num_steps: 256
+num_minibatches: 16
+update_epochs: 4
+seed: 42
+n_envs: 32
+
+# Pretraining
+pretrain_mode: false
+pretrain_spawn_agents: 1
+
+# Curriculum
+curriculum_enabled: true
+curriculum_thresholds: [50, 40, 30]
+
+# Predator (environmental enemy to force attack learning)
+n_predators: 1
+predator_hp_mult: 0.5
+predator_damage: 10.0
+predator_kill_reward: 5.0
+predator_respawn_steps: 20
+
+training:
+  checkpoint: phase11/checkpoint_ep7930.pt
+  output_dir: multi_agent

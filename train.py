@@ -19,7 +19,7 @@ from config import Config
 from environment import GridWorld
 from network import ActorCritic
 from buffer import RolloutBuffer, SingleAgentBuffer
-from ppo import PPO, IndependentPPO, VmapPPO
+from ppo import PPO, IndependentPPO, VmapPPO, load_state_dict_flexible
 from utils import set_seed, get_device
 from scenarios import CURRICULUM, THRESHOLDS
 from ledger import Ledger
@@ -51,6 +51,7 @@ def apply_scripted_partner(
     """
     # Direction constants
     DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
+    DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]  # UP, DOWN, LEFT, RIGHT, STAY
     # Action type constants
     ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
 
@@ -59,18 +60,18 @@ def apply_scripted_partner(
     action_types = action_types.clone()
 
     # Determine which agents are allies vs enemies
-    n_active = env.agent_alive.sum().item()
+    n_agents = len(env.agent_alive)
 
     if relationship == 'ally':
-        ally_agents = list(range(1, int(n_active)))
+        ally_agents = list(range(1, n_agents))
         enemy_agents = []
     elif relationship == 'enemy':
         ally_agents = []
-        enemy_agents = list(range(1, int(n_active)))
+        enemy_agents = list(range(1, n_agents))
     elif relationship == 'mixed':
         # Agent 1 is always ally, agent 2+ are enemies
-        ally_agents = [1] if n_active > 1 else []
-        enemy_agents = list(range(2, int(n_active)))
+        ally_agents = [1] if n_agents > 1 else []
+        enemy_agents = list(range(2, n_agents))
     elif relationship == 'neutral':
         # Neutral: responds to agent 0's behavior with reciprocity
         # - Positive: If agent 0 gives food or cooperates, neutral becomes friendly
@@ -80,7 +81,7 @@ def apply_scripted_partner(
         # Get rich food locations for positive reciprocity behavior
         rich_coords = torch.nonzero(env.rich_food, as_tuple=False)
 
-        for agent_id in range(1, int(n_active)):
+        for agent_id in range(1, n_agents):
             if not env.agent_alive[agent_id]:
                 continue
 
@@ -125,19 +126,28 @@ def apply_scripted_partner(
                             best_food = food_pos_f
 
                     if best_food is not None:
-                        dist0 = (pos0 - best_food).abs().sum().item()
-
-                        if dist0 <= 1 and best_dist <= 1:
-                            # Both near food - cooperate
+                        if best_dist <= 1:
+                            # Adjacent to food - cooperate and wait for agent 0
                             action_types[agent_id] = ACT_COOPERATE
                             directions[agent_id] = DIR_STAY
                         elif best_dist > 0:
-                            # Move toward food
+                            # Move toward food with blocker avoidance
                             diff = best_food - pos_n
                             if abs(diff[0]) >= abs(diff[1]):
-                                directions[agent_id] = DIR_UP if diff[0] < 0 else DIR_DOWN
+                                primary_dir = DIR_UP if diff[0] < 0 else DIR_DOWN
+                                fallback_dir = (DIR_LEFT if diff[1] < 0 else DIR_RIGHT) if diff[1] != 0 else None
                             else:
-                                directions[agent_id] = DIR_LEFT if diff[1] < 0 else DIR_RIGHT
+                                primary_dir = DIR_LEFT if diff[1] < 0 else DIR_RIGHT
+                                fallback_dir = (DIR_UP if diff[0] < 0 else DIR_DOWN) if diff[0] != 0 else None
+
+                            delta = torch.tensor(DELTAS[primary_dir], device=pos_n.device, dtype=pos_n.dtype)
+                            intended_pos = pos_n + delta
+                            blocked = (intended_pos == pos0).all()
+
+                            if blocked and fallback_dir is not None:
+                                directions[agent_id] = fallback_dir
+                            else:
+                                directions[agent_id] = primary_dir
             else:
                 # PASSIVE: No interaction yet - block attacks only
                 if action_types[agent_id] == ACT_ATTACK:
@@ -150,8 +160,6 @@ def apply_scripted_partner(
 
     # Apply ally behavior: move towards rich food, coop when both agents adjacent
     rich_coords = torch.nonzero(env.rich_food, as_tuple=False)
-    food_count = env.rich_food.sum().item()
-    expected_foods = getattr(env, '_coop_n_foods', 1)  # Get from scenario or default
 
     for agent_id in ally_agents:
         if not env.agent_alive[agent_id]:
@@ -162,34 +170,7 @@ def apply_scripted_partner(
         action_types[agent_id] = ACT_MOVE
         directions[agent_id] = DIR_STAY
 
-        # Check if we should flee (food was recently eaten)
-        # "Flee mode": partner moves away from food nearest to agent 0
-        flee_mode = False
-        if food_count < expected_foods and rich_coords.numel() > 0:
-            # Food was eaten - find food closest to agent 0
-            best_food_for_agent0 = None
-            best_dist_to_0 = float('inf')
-            for food_pos in rich_coords:
-                food_pos_f = food_pos.float()
-                dist_to_0 = (pos0 - food_pos_f).abs().sum().item()
-                if dist_to_0 < best_dist_to_0:
-                    best_dist_to_0 = dist_to_0
-                    best_food_for_agent0 = food_pos_f
-
-            if best_food_for_agent0 is not None:
-                dist_partner_to_that_food = (pos_a - best_food_for_agent0).abs().sum().item()
-                # If partner is near that food, move AWAY from it
-                if dist_partner_to_that_food <= 3:
-                    flee_mode = True
-                    # Move away = opposite direction from food
-                    diff = pos_a - best_food_for_agent0  # Direction AWAY from food
-                    action_types[agent_id] = ACT_MOVE
-                    if abs(diff[0]) >= abs(diff[1]):
-                        directions[agent_id] = DIR_DOWN if diff[0] > 0 else DIR_UP
-                    else:
-                        directions[agent_id] = DIR_RIGHT if diff[1] > 0 else DIR_LEFT
-
-        if not flee_mode and rich_coords.numel() > 0:
+        if rich_coords.numel() > 0:
             # Normal behavior: Find closest rich food and move toward it
             best_food = None
             best_dist = float('inf')
@@ -201,28 +182,34 @@ def apply_scripted_partner(
                     best_food = food_pos_f
 
             if best_food is not None:
-                dist0 = (pos0 - best_food).abs().sum().item()
                 dist_a = best_dist
 
-                if dist0 <= 1 and dist_a <= 1:
-                    # Both near food - ally coops
+                if dist_a <= 1:
+                    # Adjacent to food - cooperate and wait for agent 0
                     action_types[agent_id] = ACT_COOPERATE
-                    directions[agent_id] = DIR_STAY  # Direction ignored for COOP
+                    directions[agent_id] = DIR_STAY
                 elif dist_a > 0:
-                    # Not on top of food yet - move towards it
+                    # Not on top of food yet - move towards it (with blocker avoidance)
                     action_types[agent_id] = ACT_MOVE
                     diff = best_food - pos_a  # Direction to food
-                    # Prioritize larger distance axis
+
+                    # Determine primary and fallback directions
                     if abs(diff[0]) >= abs(diff[1]):
-                        if diff[0] < 0:
-                            directions[agent_id] = DIR_UP
-                        elif diff[0] > 0:
-                            directions[agent_id] = DIR_DOWN
+                        primary_dir = DIR_UP if diff[0] < 0 else DIR_DOWN
+                        fallback_dir = (DIR_LEFT if diff[1] < 0 else DIR_RIGHT) if diff[1] != 0 else None
                     else:
-                        if diff[1] < 0:
-                            directions[agent_id] = DIR_LEFT
-                        elif diff[1] > 0:
-                            directions[agent_id] = DIR_RIGHT
+                        primary_dir = DIR_LEFT if diff[1] < 0 else DIR_RIGHT
+                        fallback_dir = (DIR_UP if diff[0] < 0 else DIR_DOWN) if diff[0] != 0 else None
+
+                    # Check if primary direction is blocked by agent 0
+                    delta = torch.tensor(DELTAS[primary_dir], device=pos_a.device, dtype=pos_a.dtype)
+                    intended_pos = pos_a + delta
+                    blocked = (intended_pos == pos0).all()
+
+                    if blocked and fallback_dir is not None:
+                        directions[agent_id] = fallback_dir
+                    else:
+                        directions[agent_id] = primary_dir
                 # else: adjacent to food but agent 0 not there yet - STAY
 
     # Apply enemy behavior: attack agent 0 when adjacent
@@ -244,9 +231,22 @@ def apply_scripted_partner(
             elif diff[1] == 1:  # Agent 0 is right
                 directions[agent_id] = DIR_RIGHT
         else:
-            # Not adjacent - stay in place
+            # Not adjacent - chase agent 0, avoid occupied cells
             action_types[agent_id] = ACT_MOVE
-            directions[agent_id] = DIR_STAY
+            # Determine primary and fallback directions
+            if abs(diff[0]) >= abs(diff[1]):
+                primary = DIR_DOWN if diff[0] > 0 else DIR_UP
+                fallback = (DIR_RIGHT if diff[1] > 0 else DIR_LEFT) if diff[1] != 0 else primary
+            else:
+                primary = DIR_RIGHT if diff[1] > 0 else DIR_LEFT
+                fallback = (DIR_DOWN if diff[0] > 0 else DIR_UP) if diff[0] != 0 else primary
+            # Check if primary direction cell is occupied
+            dr = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]  # UP, DOWN, LEFT, RIGHT, STAY
+            pr, pc = int(pos_e[0]) + dr[primary][0], int(pos_e[1]) + dr[primary][1]
+            if 0 <= pr < env.grid_size and 0 <= pc < env.grid_size and env.occupancy[pr, pc] == -1:
+                directions[agent_id] = primary
+            else:
+                directions[agent_id] = fallback
 
     return directions, action_types
 
@@ -285,26 +285,7 @@ def load_pretrained(networks, path: str, env=None):
         state_dict = checkpoint
 
     for i, net in enumerate(networks):
-        # Try strict loading first, fall back to partial loading on mismatch
-        try:
-            net.load_state_dict(state_dict, strict=True)
-        except RuntimeError as e:
-            if "size mismatch" in str(e):
-                print(f"  [Warning] Architecture mismatch, loading compatible layers only...")
-                # Load only layers with matching shapes
-                model_dict = net.state_dict()
-                compatible = {}
-                skipped = []
-                for k, v in state_dict.items():
-                    if k in model_dict and model_dict[k].shape == v.shape:
-                        compatible[k] = v
-                    else:
-                        skipped.append(k)
-                model_dict.update(compatible)
-                net.load_state_dict(model_dict)
-                print(f"  Loaded {len(compatible)}/{len(state_dict)} layers, skipped: {skipped}")
-            else:
-                raise e
+        load_state_dict_flexible(net, state_dict)
 
     print(f"Loaded pretrained weights from {path} into {len(networks)} networks")
 

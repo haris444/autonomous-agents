@@ -19,22 +19,14 @@ class ObservationEncoder(nn.Module):
     Encodes observations using a unified Transformer over all entities.
 
     Architecture:
-        - Entity Tokens: Single Transformer over agents + food (Fourier positional encoding)
+        - Entity Tokens: Per-group projection (fourier, velocity, type, value, social
+          each → group_embed_dim) then concat → Transformer
         - Signals: MLP
         - Self HP: MLP
 
-    Inputs:
-        - entity_tokens: [batch, max_entities, 25]
-            - fourier[16]: 4 freq bands × (sin_dx, cos_dx, sin_dy, cos_dy)
-            - velocity[2]: (dv_x, dv_y)
-            - type_onehot[2]: [is_food, is_agent]
-            - value[1]: HP or quality
-            - social[4]: [dmg_dealt, food_given, coop_count, defense]
-        - entity_mask: [batch, max_entities] - which tokens are valid
-        - signals: [batch, n_agents] - who is signaling
-        - self_hp: [batch, 1] - agent's own HP (normalized)
-        - self_inventory: [batch, 1] - agent's food inventory (normalized)
-        - agent_id: [batch] - which agent this observation belongs to
+    Each feature group is projected to the same dimensionality before concatenation,
+    so the number of Fourier bands doesn't affect the relative influence of position
+    vs social/type features.
 
     Output:
         - features: [batch, output_dim]
@@ -43,10 +35,17 @@ class ObservationEncoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        self.fourier_dim = config.fourier_bands * 4
 
-        # 1. ENTITY TOKENS: Unified Transformer over agents + food
-        # Each token has 25 features: fourier[16] + velocity[2] + type[2] + value[1] + social[4]
-        self.entity_embed = nn.Linear(config.entity_token_dim, config.attention_embed_dim)
+        # 1. ENTITY TOKENS: Per-group projections to standardize influence
+        # Each group gets projected to group_embed_dim, then concatenated and projected to attention_embed_dim
+        g = config.group_embed_dim
+        self.fourier_embed = nn.Linear(self.fourier_dim, g)
+        self.velocity_embed = nn.Linear(2, g)
+        self.type_embed = nn.Linear(2, g)
+        self.value_embed = nn.Linear(1, g)
+        self.social_embed = nn.Linear(4, g)
+        self.entity_embed = nn.Linear(5 * g, config.attention_embed_dim)
         self.entity_attention = nn.MultiheadAttention(
             embed_dim=config.attention_embed_dim,
             num_heads=config.attention_num_heads,
@@ -90,8 +89,15 @@ class ObservationEncoder(nn.Module):
             my_tokens = entity_tokens
             my_mask = entity_mask
 
-        # Embed entity tokens
-        tokens = self.entity_embed(my_tokens)  # [B, max_entities, embed_dim]
+        # Split token into feature groups and project each to equal size
+        f = self.fourier_dim
+        fourier_proj = self.fourier_embed(my_tokens[..., :f])
+        velocity_proj = self.velocity_embed(my_tokens[..., f:f+2])
+        type_proj = self.type_embed(my_tokens[..., f+2:f+4])
+        value_proj = self.value_embed(my_tokens[..., f+4:f+5])
+        social_proj = self.social_embed(my_tokens[..., f+5:f+9])
+        grouped = torch.cat([fourier_proj, velocity_proj, type_proj, value_proj, social_proj], dim=-1)
+        tokens = self.entity_embed(grouped)  # [B, max_entities, embed_dim]
 
         # Create attention mask (True = ignore)
         attn_mask = ~my_mask  # [B, max_entities]
@@ -203,19 +209,31 @@ class ActorCritic(nn.Module):
         )
         return self.shared(features)
 
-    def forward(self, obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, obs: Dict[str, torch.Tensor], return_aux: bool = False):
         """
         Forward pass returning raw logits and value.
+
+        Args:
+            obs: Observation dictionary
+            return_aux: If True, also return auxiliary value head outputs
 
         Returns:
             direction_logits: [batch, n_directions] (5 directions)
             action_type_logits: [batch, n_action_types] (5 action types)
             value: [batch, 1]
+            (if return_aux) value_survival: [batch, 1]
+            (if return_aux) value_resource: [batch, 1]
+            (if return_aux) value_social: [batch, 1]
         """
         hidden = self._encode(obs)
         direction_logits = self.direction_head(hidden)
         action_type_logits = self.action_type_head(hidden)
         value = self.value_head(hidden)
+        if return_aux:
+            return (direction_logits, action_type_logits, value,
+                    self.value_head_survival(hidden),
+                    self.value_head_resource(hidden),
+                    self.value_head_social(hidden))
         return direction_logits, action_type_logits, value
 
     def get_value(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:

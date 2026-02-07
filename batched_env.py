@@ -4,6 +4,7 @@ Batched GridWorld Environment — processes N environments simultaneously.
 Drop-in replacement for VecEnv. All state tensors have leading [n_envs, ...] dimension.
 Uses batched tensor operations instead of looping over independent GridWorld instances.
 """
+import time
 import torch
 import torch.nn.functional as F
 from typing import Dict, Tuple
@@ -48,6 +49,14 @@ class BatchedGridWorld:
         cols_grid = torch.arange(gs, device=device).unsqueeze(0).expand(gs, gs)
         self.coord_grid = torch.stack([rows_grid, cols_grid], dim=-1).float()
 
+        # Precomputed edge cells [num_edge, 2] for predator respawn
+        edge_list = []
+        for c in range(gs):
+            edge_list.extend([(0, c), (gs - 1, c)])
+        for r in range(1, gs - 1):
+            edge_list.extend([(r, 0), (r, gs - 1)])
+        self._edge_cells = torch.tensor(edge_list, device=device, dtype=torch.long)
+
         # Ledger normalization scale [4]
         self._ledger_norm_scale = torch.tensor(
             [1.0 / 100.0, 1.0 / 100.0, 1.0 / 10.0, 1.0 / 100.0],
@@ -64,6 +73,7 @@ class BatchedGridWorld:
 
         # Shadow env for scenario handling and get_first_env()
         self._shadow_env = GridWorld(config, device)
+        self.partner_relationships = [None] * n_envs  # Per-slot relationship tracking
 
         # Per-env scalars
         self.step_count = torch.zeros(n_envs, device=device, dtype=torch.long)
@@ -77,6 +87,7 @@ class BatchedGridWorld:
         self.agent_hp = torch.zeros((n_envs, n), device=device)
         self.agent_alive = torch.zeros((n_envs, n), device=device, dtype=torch.bool)
         self.agent_inventory = torch.zeros((n_envs, n), device=device)
+        self.food_eaten_total = torch.zeros((n_envs, n), device=device)
         self.occupancy = torch.full((n_envs, gs, gs), -1, device=device, dtype=torch.long)
         self.poor_food = torch.zeros((n_envs, gs, gs), device=device, dtype=torch.bool)
         self.rich_food = torch.zeros((n_envs, gs, gs), device=device, dtype=torch.bool)
@@ -84,12 +95,49 @@ class BatchedGridWorld:
         self.ledger_tensor = torch.zeros((n_envs, n, n, 4), device=device)
         self.recent_attacks = torch.zeros((n_envs, 3, n, n), device=device)
 
+        # Predator state (environmental enemy)
+        self.n_predators = config.n_predators
+        n_pred = config.n_predators
+        if n_pred > 0:
+            self.predator_positions = torch.zeros((n_envs, n_pred, 2), device=device, dtype=torch.long)
+            self.predator_prev_positions = torch.zeros((n_envs, n_pred, 2), device=device, dtype=torch.long)
+            self.predator_hp = torch.zeros((n_envs, n_pred), device=device)
+            self.predator_alive = torch.zeros((n_envs, n_pred), device=device, dtype=torch.bool)
+            self.predator_respawn_timer = torch.zeros((n_envs, n_pred), device=device, dtype=torch.long)
+            self.predator_ledger = torch.zeros((n_envs, n, n_pred, 2), device=device)
+
         # Cooperation tracking
         self.last_coop_success_count = 0
+
+        # Step sub-timers (cumulative)
+        self.step_timers = {
+            'interactions': 0.0, 'movement': 0.0, 'predator': 0.0,
+            'hp_decay': 0.0, 'food': 0.0, 'hierarchy': 0.0,
+            'spawn_food': 0.0, 'deaths': 0.0, 'rewards': 0.0,
+            'observations': 0.0, 'reset': 0.0, 'nearest_food': 0.0,
+        }
+        self.step_timer_calls = 0
 
     # =====================================================================
     # PUBLIC API (matches VecEnv)
     # =====================================================================
+
+    def get_step_timing_str(self) -> str:
+        """Return a formatted string of step sub-timers and reset them."""
+        T = self.step_timers
+        total = sum(T.values())
+        if total <= 0:
+            return ""
+        parts = []
+        for k, v in sorted(T.items(), key=lambda x: -x[1]):
+            pct = 100 * v / total
+            if pct >= 1.0:
+                parts.append(f"{k}: {v:.2f}s ({pct:.0f}%)")
+        # Reset
+        for k in T:
+            T[k] = 0.0
+        self.step_timer_calls = 0
+        return " | ".join(parts)
 
     @property
     def grid_size_prop(self) -> int:
@@ -110,7 +158,7 @@ class BatchedGridWorld:
 
     @property
     def partner_relationship(self):
-        return getattr(self._shadow_env, 'partner_relationship', None)
+        return self.partner_relationships[0]
 
     def get_first_env(self) -> GridWorld:
         """Sync shadow env from batch slot 0 and return it."""
@@ -126,6 +174,14 @@ class BatchedGridWorld:
         s.signals = self.signals[0].clone()
         s.ledger.tensor = self.ledger_tensor[0].clone()
         s.step_count = self.step_count[0].item()
+        if self.n_predators > 0:
+            s.predator_positions = self.predator_positions[0].clone()
+            s.predator_prev_positions = self.predator_prev_positions[0].clone()
+            s.predator_hp = self.predator_hp[0].clone()
+            s.predator_alive = self.predator_alive[0].clone()
+            s.predator_respawn_timer = self.predator_respawn_timer[0].clone()
+            if hasattr(self, 'predator_ledger'):
+                s.predator_ledger = self.predator_ledger[0].clone()
         return s
 
     def reset(self) -> Dict[str, torch.Tensor]:
@@ -161,7 +217,9 @@ class BatchedGridWorld:
             obs, rewards, dones, infos — all batched [n_envs, ...]
         """
         self.step_count += 1
+        self.step_timer_calls += 1
         ne, n = self.n_envs, self.n_agents
+        T = self.step_timers
 
         self.prev_agent_positions = self.agent_positions.clone()
 
@@ -172,45 +230,74 @@ class BatchedGridWorld:
         is_signal = (action_types == ACT_SIGNAL)
 
         hp_before = self.agent_hp.clone()
+        _t = time.time()
         dist_before, _ = self._compute_nearest_food_info()
+        T['nearest_food'] += time.time() - _t
 
         # Clear signals
         self.signals.zero_()
 
-        # 1. Interactions (from current position)
-        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards = (
+        # 1. Interactions (from current position, includes agent-vs-predator)
+        _t = time.time()
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, give_rewards, predator_kill_rewards = (
             self._resolve_interactions(directions, action_types, is_attack, is_give, is_signal)
         )
+        T['interactions'] += time.time() - _t
 
-        # 2. Movement
+        # 2. Movement (predators block cells)
+        _t = time.time()
         self._resolve_movement(directions, is_move)
         self._update_occupancy()
+        T['movement'] += time.time() - _t
 
-        # 3. HP decay
+        # 3. Predator movement + attack
+        _t = time.time()
+        predator_damage = self._predator_step()
+        T['predator'] += time.time() - _t
+
+        # 4. HP decay (agents only)
+        _t = time.time()
         self._apply_hp_decay()
+        T['hp_decay'] += time.time() - _t
 
-        # 4. Food eating
+        # 5. Food eating
+        _t = time.time()
         food_rewards = self._process_food_eating(action_types)
         intrinsic_coop_rewards = self._compute_intrinsic_coop_rewards(action_types)
         self._consume_inventory()
+        T['food'] += time.time() - _t
 
-        # 5. Spawn food
+        # 5c. Hierarchy rewards (competitive ranking bonus)
+        _t = time.time()
+        hierarchy_rewards = self._compute_hierarchy_rewards()
+        T['hierarchy'] += time.time() - _t
+
+        # 6. Spawn food
+        _t = time.time()
         self._spawn_food()
+        T['spawn_food'] += time.time() - _t
 
-        # 6. Deaths
+        # 7. Deaths (agents + predators)
+        _t = time.time()
         death_rewards = self._check_deaths()
         self._update_occupancy()
+        T['deaths'] += time.time() - _t
 
         # Reward computation
+        _t = time.time()
+        total_damage_taken = damage_taken + predator_damage
         hp_after = self.agent_hp.clone()
         hp_ratio = hp_before / self.config.max_hp
         pain_multiplier = 1.0 / (hp_ratio + 0.1)
-        damage_pain = damage_taken * pain_multiplier * self.config.r_damage_taken
+        damage_pain = total_damage_taken * pain_multiplier * self.config.r_damage_taken
 
         hp_ratio_after = hp_after / self.config.max_hp
         low_hp_penalty = (1.0 - hp_ratio_after) * self.config.r_low_hp * self.agent_alive.float()
 
+        _t2 = time.time()
         dist_after, _ = self._compute_nearest_food_info()
+        T['nearest_food'] += time.time() - _t2
+
         approach_delta = dist_before - dist_after
         approach_delta = torch.where(
             torch.isinf(dist_before) | torch.isinf(dist_after),
@@ -225,16 +312,25 @@ class BatchedGridWorld:
         rewards = (
             death_rewards + food_rewards + intrinsic_coop_rewards
             + attack_rewards + defense_rewards + revenge_rewards + betrayal_rewards
+            + give_rewards + predator_kill_rewards + hierarchy_rewards
             + damage_pain + low_hp_penalty + approach_reward + survival_bonus
         )
+        T['rewards'] += time.time() - _t
 
+        _t = time.time()
         observations = self._get_all_observations()
+        T['observations'] += time.time() - _t
+
         dones = ~self.agent_alive  # [n_envs, n_agents]
 
         # Episode termination
         all_dead = ~self.agent_alive.any(dim=1)  # [n_envs]
         max_steps = self.step_count >= self.config.max_steps_per_episode
         episode_done = all_dead | max_steps  # [n_envs]
+        # In pretrain, end episode when agent 0 dies (scripted partners can outlive it)
+        if self.config.pretrain_mode:
+            agent0_dead = ~self.agent_alive[:, 0]  # [n_envs]
+            episode_done = episode_done | agent0_dead
 
         # Set all agents done for finished envs
         dones = dones | episode_done.unsqueeze(1)
@@ -247,7 +343,12 @@ class BatchedGridWorld:
                 self._check_curriculum_advance(self.current_episode_reward[0].item())
             self.current_episode_reward[done_indices] = 0.0
 
+        # Save terminal state before auto-reset wipes it
+        terminal_ledger = self.ledger_tensor.clone() if episode_done.any() else None
+        terminal_relationships = list(self.partner_relationships) if episode_done.any() else None
+
         # Auto-reset finished envs (obs already captured above)
+        _t = time.time()
         if episode_done.any():
             self._masked_reset(episode_done, is_initial=False)
             # Overwrite observations for reset envs with fresh state
@@ -260,17 +361,21 @@ class BatchedGridWorld:
                 )
                 for key in observations
             }
+        T['reset'] += time.time() - _t
 
         # Decomposed rewards
         survival_rewards = damage_pain + low_hp_penalty + death_rewards
         resource_rewards = food_rewards + approach_reward
         social_rewards = (attack_rewards + defense_rewards + revenge_rewards
-                          + betrayal_rewards + intrinsic_coop_rewards)
+                          + betrayal_rewards + intrinsic_coop_rewards + give_rewards
+                          + predator_kill_rewards + hierarchy_rewards)
 
         infos = {
             'reward_survival': survival_rewards,
             'reward_resource': resource_rewards,
             'reward_social': social_rewards,
+            'terminal_ledger': terminal_ledger,
+            'terminal_relationships': terminal_relationships,
         }
 
         return observations, rewards, dones, infos
@@ -305,11 +410,26 @@ class BatchedGridWorld:
         self.agent_hp[mask] = self.config.max_hp
         self.agent_alive[mask] = True
         self.agent_inventory[mask] = 0
+        self.food_eaten_total[mask] = 0
 
         self.poor_food[mask] = False
         self.rich_food[mask] = False
 
         self.prev_agent_positions[mask] = self.agent_positions[mask].clone()
+
+        # Reset predator state for reset envs
+        if self.n_predators > 0:
+            self.predator_hp[mask] = self.config.max_hp * self.config.predator_hp_mult
+            self.predator_alive[mask] = True
+            self.predator_respawn_timer[mask] = 0
+            # Spawn predators at random edge cells
+            reset_indices = torch.where(mask)[0]
+            for idx in reset_indices:
+                i = idx.item()
+                for p in range(self.n_predators):
+                    self._respawn_predator_in_slot(i, p)
+            self.predator_prev_positions[mask] = self.predator_positions[mask].clone()
+            self.predator_ledger[mask] = 0
 
         # Update occupancy for all envs (cheap)
         self._update_occupancy()
@@ -335,11 +455,21 @@ class BatchedGridWorld:
         self.agent_hp[slot] = s.agent_hp
         self.agent_alive[slot] = s.agent_alive
         self.agent_inventory[slot] = s.agent_inventory
+        self.food_eaten_total[slot] = getattr(s, 'food_eaten_total', torch.zeros(self.n_agents, device=self.device))
         self.poor_food[slot] = s.poor_food
         self.rich_food[slot] = s.rich_food
         self.ledger_tensor[slot] = s.ledger.tensor
         self.signals[slot] = s.signals
         self.prev_agent_positions[slot] = s.agent_positions.clone()
+        self.partner_relationships[slot] = getattr(s, 'partner_relationship', None)
+        if self.n_predators > 0 and s.predator_positions is not None:
+            self.predator_positions[slot] = s.predator_positions
+            self.predator_prev_positions[slot] = s.predator_prev_positions
+            self.predator_hp[slot] = s.predator_hp
+            self.predator_alive[slot] = s.predator_alive
+            self.predator_respawn_timer[slot] = s.predator_respawn_timer
+            if hasattr(s, 'predator_ledger') and s.predator_ledger is not None:
+                self.predator_ledger[slot] = s.predator_ledger
 
     def _spawn_initial_food(self, mask: torch.Tensor):
         """Spawn food at full capacity for reset envs."""
@@ -381,7 +511,7 @@ class BatchedGridWorld:
     # =====================================================================
 
     def _update_occupancy(self):
-        """Rebuild occupancy grid for all envs — fully batched."""
+        """Rebuild occupancy grid for all envs — fully batched, including predators."""
         ne, n = self.n_envs, self.n_agents
         self.occupancy.fill_(-1)
 
@@ -393,6 +523,16 @@ class BatchedGridWorld:
 
         self.occupancy[env_idx[alive], rows[alive], cols[alive]] = agent_idx[alive]
 
+        # Predators occupy cells as n_agents + pred_idx
+        if self.n_predators > 0:
+            n_pred = self.n_predators
+            env_idx_p = torch.arange(ne, device=self.device).unsqueeze(1).expand(ne, n_pred)
+            pred_idx = torch.arange(n_pred, device=self.device).unsqueeze(0).expand(ne, n_pred) + n
+            pred_rows = self.predator_positions[:, :, 0]
+            pred_cols = self.predator_positions[:, :, 1]
+            pred_alive = self.predator_alive
+            self.occupancy[env_idx_p[pred_alive], pred_rows[pred_alive], pred_cols[pred_alive]] = pred_idx[pred_alive]
+
     # =====================================================================
     # TRIVIAL METHODS
     # =====================================================================
@@ -403,7 +543,8 @@ class BatchedGridWorld:
 
     def _consume_inventory(self):
         hp_missing = self.config.max_hp - self.agent_hp
-        heal = torch.minimum(hp_missing, self.agent_inventory)
+        cap = torch.full_like(self.agent_inventory, self.config.heal_per_tick)
+        heal = torch.minimum(torch.minimum(hp_missing, self.agent_inventory), cap)
         heal = heal * self.agent_alive.float() * (hp_missing > 0).float()
         self.agent_hp = self.agent_hp + heal
         self.agent_inventory = self.agent_inventory - heal
@@ -442,11 +583,12 @@ class BatchedGridWorld:
         occupant_at_dest = self.occupancy[env_idx, dest_rows, dest_cols]  # [ne, n]
 
         has_occupant = occupant_at_dest >= 0
-        safe_occ = occupant_at_dest.clamp(min=0)
+        is_predator_occ = occupant_at_dest >= n  # Predators stored as n_agents + pred_idx
+        safe_occ = occupant_at_dest.clamp(min=0, max=n - 1)  # Clamp to agent range for gather
 
-        # Check if occupant is staying — need to gather from is_staying using [env, agent] indexing
-        # is_staying is [ne, n], safe_occ is [ne, n] (agent index of occupant)
-        occupant_is_staying = torch.gather(is_staying, 1, safe_occ) & has_occupant
+        # Check if occupant is staying — predators always block
+        agent_occupant_staying = torch.gather(is_staying, 1, safe_occ) & has_occupant & ~is_predator_occ
+        occupant_is_staying = agent_occupant_staying | (is_predator_occ & has_occupant)
 
         agent_ids = torch.arange(n, device=self.device).unsqueeze(0).expand(ne, n)
         is_self_occupant = (occupant_at_dest == agent_ids)
@@ -484,17 +626,17 @@ class BatchedGridWorld:
         self.signals = signal_mask
 
         attack_mask = is_attack & self.agent_alive
-        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards = (
+        attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, predator_kill_rewards = (
             self._resolve_attacks(directions, attack_mask)
         )
 
         give_mask = is_give & self.agent_alive
-        self._resolve_give_food(directions, give_mask)
+        give_rewards = self._resolve_give_food(directions, give_mask)
 
-        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, give_rewards, predator_kill_rewards
 
     def _resolve_attacks(self, directions, attack_mask):
-        """Fully batched attack resolution including defense/revenge/betrayal."""
+        """Fully batched attack resolution including defense/revenge/betrayal and agent-vs-predator."""
         ne, n, gs = self.n_envs, self.n_agents, self.grid_size
 
         attack_rewards = torch.zeros(ne, n, device=self.device)
@@ -502,9 +644,10 @@ class BatchedGridWorld:
         defense_rewards = torch.zeros(ne, n, device=self.device)
         revenge_rewards = torch.zeros(ne, n, device=self.device)
         betrayal_rewards = torch.zeros(ne, n, device=self.device)
+        predator_kill_rewards = torch.zeros(ne, n, device=self.device)
 
         if not attack_mask.any():
-            return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
+            return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, predator_kill_rewards
 
         # Attack cost
         attack_cost = self.config.max_hp * 0.05
@@ -529,22 +672,23 @@ class BatchedGridWorld:
         env_idx = torch.arange(ne, device=self.device).unsqueeze(1).expand(ne, n)
         target_ids = self.occupancy[env_idx, safe_rows, safe_cols]  # [ne, n]
 
+        # Separate agent targets from predator targets
         has_target = target_ids >= 0
-        safe_target_ids = target_ids.clamp(min=0)
-        # Gather target alive status
-        target_alive = torch.gather(self.agent_alive, 1, safe_target_ids) & has_target
-        valid_hit = valid_attack & has_target & target_alive
+        is_predator_target = target_ids >= n
+        is_agent_target = has_target & ~is_predator_target
 
-        damage = (self.agent_hp / 2) * valid_hit.float()  # [ne, n]
+        # === Agent-vs-Agent attacks ===
+        safe_target_ids = target_ids.clamp(min=0, max=n - 1)
+        target_alive = torch.gather(self.agent_alive, 1, safe_target_ids) & is_agent_target
+        valid_hit = valid_attack & is_agent_target & target_alive
+
+        damage = (self.agent_hp * self.config.attack_damage_fraction) * valid_hit.float()  # [ne, n]
 
         # Build damage matrix [ne, n, n]: damage_matrix[e, attacker, victim]
         damage_matrix = torch.zeros(ne, n, n, device=self.device)
-        # For each valid hit, set damage_matrix[e, attacker, target_id] = damage
         attacker_idx = torch.arange(n, device=self.device).unsqueeze(0).expand(ne, n)  # [ne, n]
-        # Use scatter to fill: for each (e, a), write damage[e, a] into damage_matrix[e, a, target_ids[e, a]]
         hit_mask = valid_hit  # [ne, n]
         if hit_mask.any():
-            # Flatten for scatter
             e_flat = env_idx[hit_mask]
             a_flat = attacker_idx[hit_mask]
             t_flat = safe_target_ids[hit_mask]
@@ -555,6 +699,31 @@ class BatchedGridWorld:
         damage_per_target = damage_matrix.sum(dim=1)  # [ne, n] sum over attackers
         self.agent_hp = self.agent_hp - damage_per_target
 
+        # === Agent-vs-Predator attacks ===
+        if self.n_predators > 0:
+            valid_pred_hit = valid_attack & is_predator_target
+            if valid_pred_hit.any():
+                pred_hit_e = env_idx[valid_pred_hit]
+                pred_hit_a = attacker_idx[valid_pred_hit]
+                pred_target_p = (target_ids[valid_pred_hit] - n)  # Predator index
+                pred_dmg = self.agent_hp[pred_hit_e, pred_hit_a] * self.config.attack_damage_fraction
+
+                # Apply damage to predators (loop over hits since scatter doesn't handle well here)
+                for i in range(pred_hit_e.numel()):
+                    e_i = pred_hit_e[i].item()
+                    a_i = pred_hit_a[i].item()
+                    p_i = pred_target_p[i].item()
+                    d_i = pred_dmg[i].item()
+                    if self.predator_alive[e_i, p_i]:
+                        self.predator_hp[e_i, p_i] -= d_i
+                        # Record in predator ledger: agent dealt damage to predator
+                        self.predator_ledger[e_i, a_i, p_i, 0] += d_i
+                        attack_rewards[e_i, a_i] += d_i * self.config.r_attack_mult
+                        if self.predator_hp[e_i, p_i] <= 0:
+                            self.predator_alive[e_i, p_i] = False
+                            self.predator_respawn_timer[e_i, p_i] = self.config.predator_respawn_steps
+                            predator_kill_rewards[e_i, a_i] += self.config.predator_kill_reward
+
         # Update ledger
         self.ledger_tensor[:, :, :, Ledger.DAMAGE_DEALT] += damage_matrix
 
@@ -563,46 +732,41 @@ class BatchedGridWorld:
         self.recent_attacks[:, 0] = damage_matrix
 
         # === VECTORIZED DEFENSE/REVENGE/BETRAYAL ===
-        # recent_victims[e, attacker, victim] = True if attacker hit victim in last 3 steps
         recent_victims = (self.recent_attacks > 0).any(dim=1)  # [ne, n, n]
         valid_hits = (damage_matrix > 0)  # [ne, n_c, n_a] — C hit A
 
-        # REVENGE: C hit A, and A attacked C recently
-        # recent_victims[e, a, c] means a attacked c recently
-        # We want: for (e, c, a) where C hit A, check recent_victims[e, a, c]
+        # REVENGE
         revenge_mask = valid_hits & recent_victims.transpose(1, 2)
         revenge_rewards = (damage_matrix * revenge_mask.float() * self.config.r_revenge).sum(dim=2)
 
-        # BETRAYAL: C hit A, and A helped C before
+        # BETRAYAL
         help_matrix = (self.ledger_tensor[:, :, :, Ledger.FOOD_GIVEN]
                        + self.ledger_tensor[:, :, :, Ledger.COOP_COUNT])
-        # help_matrix[e, a, c] = help a gave to c
-        # We want help_from[e, c, a] = help a gave to c
         help_from = help_matrix.transpose(1, 2)
         has_helped = (help_from > 0) & valid_hits
         betrayal_rewards = (help_from * has_helped.float() * self.config.r_betrayal).sum(dim=2)
 
-        # DEFENSE: C hit A, and A attacked some B recently (B != C). C defended B.
-        # defense_credit[e, c, b] = sum_a(damage[e, c, a] * recent_victims[e, a, b])
+        # DEFENSE
         defense_credit = torch.bmm(damage_matrix, recent_victims.float())  # [ne, n, n]
         defense_credit = defense_credit * (1.0 - self._eye.unsqueeze(0))  # zero diagonal
         defense_rewards = defense_credit.sum(dim=2) * self.config.r_defense
         self.ledger_tensor[:, :, :, Ledger.DEFENSE_SCORE] += defense_credit
 
-        # Attack rewards and damage taken
+        # Attack rewards for agent-vs-agent (predator rewards already added above)
         total_damage_dealt = damage_matrix.sum(dim=2)  # [ne, n]
-        attack_rewards = total_damage_dealt * self.config.r_attack_mult
+        attack_rewards += total_damage_dealt * self.config.r_attack_mult
         damage_taken = damage_per_target
 
-        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards
+        return attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, predator_kill_rewards
 
     def _resolve_give_food(self, directions, give_mask):
         """Batched food giving from inventory."""
         ne, n, gs = self.n_envs, self.n_agents, self.grid_size
         food_value = self.config.poor_food_value
+        give_rewards = torch.zeros(ne, n, device=self.device)
 
         if not give_mask.any():
-            return
+            return give_rewards
 
         give_amount = torch.minimum(
             torch.full((ne, n), food_value, device=self.device),
@@ -629,12 +793,13 @@ class BatchedGridWorld:
         target_ids = self.occupancy[env_idx, safe_rows, safe_cols]
 
         has_target = target_ids >= 0
-        safe_tid = target_ids.clamp(min=0)
-        target_alive = torch.gather(self.agent_alive, 1, safe_tid) & has_target
-        valid_transfer = valid_giver & in_bounds & has_target & target_alive
+        is_agent_target = has_target & (target_ids < n)
+        safe_tid = target_ids.clamp(min=0, max=n - 1)
+        target_alive = torch.gather(self.agent_alive, 1, safe_tid) & is_agent_target
+        valid_transfer = valid_giver & in_bounds & is_agent_target & target_alive
 
         if not valid_transfer.any():
-            return
+            return give_rewards
 
         transfer_mask = valid_transfer
         e_flat = env_idx[transfer_mask]
@@ -653,8 +818,156 @@ class BatchedGridWorld:
         inv_gain_flat.scatter_add_(0, flat_target, amount_flat)
         self.agent_inventory = self.agent_inventory + inv_gain.reshape(ne, n)
 
+        # Reward givers
+        give_rewards[e_flat, giver_flat] = amount_flat * self.config.r_food_share
+
         # Update ledger
         self.ledger_tensor[e_flat, giver_flat, target_flat, Ledger.FOOD_GIVEN] += amount_flat
+
+        return give_rewards
+
+    # =====================================================================
+    # PREDATOR METHODS
+    # =====================================================================
+
+    def _respawn_predator_in_slot(self, env_i: int, pred_i: int):
+        """Respawn a single predator in a specific env slot at a random edge cell."""
+        gs = self.grid_size
+        self.predator_hp[env_i, pred_i] = self.config.max_hp * self.config.predator_hp_mult
+        self.predator_alive[env_i, pred_i] = True
+        self.predator_respawn_timer[env_i, pred_i] = 0
+
+        # Collect edge cells
+        edge_cells = []
+        for c in range(gs):
+            edge_cells.extend([(0, c), (gs - 1, c)])
+        for r in range(1, gs - 1):
+            edge_cells.extend([(r, 0), (r, gs - 1)])
+
+        perm = torch.randperm(len(edge_cells))
+        for idx in perm:
+            r, c = edge_cells[idx.item()]
+            if self.occupancy[env_i, r, c] == -1:
+                self.predator_positions[env_i, pred_i] = torch.tensor([r, c], device=self.device)
+                return
+
+        # Fallback
+        self.predator_positions[env_i, pred_i] = torch.tensor([0, 0], device=self.device)
+
+    def _predator_step(self) -> torch.Tensor:
+        """Move predators toward closest agent, attack adjacent agents, handle respawn.
+
+        Fully vectorized over [n_envs, n_predators] — no Python loops in hot path.
+
+        Returns:
+            predator_damage_to_agents: [n_envs, n_agents] damage dealt by predators
+        """
+        ne, n = self.n_envs, self.n_agents
+        n_pred = self.n_predators
+        predator_damage = torch.zeros(ne, n, device=self.device)
+        if n_pred == 0:
+            return predator_damage
+
+        # === Phase 1: Respawn dead predators ===
+        dead_mask = ~self.predator_alive  # [ne, n_pred]
+        if dead_mask.any():
+            self.predator_respawn_timer[dead_mask] -= 1
+            respawn_mask = dead_mask & (self.predator_respawn_timer <= 0)  # [ne, n_pred]
+            if respawn_mask.any():
+                self._update_occupancy()
+                re, rp = torch.where(respawn_mask)
+                for i in range(re.numel()):
+                    self._respawn_predator_in_slot(re[i].item(), rp[i].item())
+                self._update_occupancy()
+
+        # === Phase 2: Movement (fully vectorized) ===
+        alive = self.predator_alive  # [ne, n_pred]
+        if not alive.any():
+            return predator_damage
+
+        self.predator_prev_positions = self.predator_positions.clone()
+
+        # Distances from each predator to each agent: [ne, n_pred, n_agents]
+        pred_pos_f = self.predator_positions.float()  # [ne, n_pred, 2]
+        agent_pos_f = self.agent_positions.float()     # [ne, n, 2]
+        dists = (pred_pos_f[:, :, None, :] - agent_pos_f[:, None, :, :]).abs().sum(dim=-1)
+        # Mask dead agents
+        dists = dists.masked_fill(~self.agent_alive[:, None, :], float('inf'))
+
+        # Closest agent per predator: [ne, n_pred]
+        closest_idx = dists.argmin(dim=2)
+
+        # Gather closest agent position: [ne, n_pred, 2]
+        closest_pos = torch.gather(
+            agent_pos_f,  # [ne, n, 2]
+            1,
+            closest_idx.unsqueeze(-1).expand(ne, n_pred, 2)
+        )  # [ne, n_pred, 2]
+
+        # Direction to move
+        diff = closest_pos - pred_pos_f  # [ne, n_pred, 2]
+        abs_diff = diff.abs()
+
+        # Determine step direction: move along larger axis (row-priority on tie)
+        move_row = (abs_diff[:, :, 0] >= abs_diff[:, :, 1]) & (abs_diff[:, :, 0] > 0)
+        move_col = ~move_row & (abs_diff[:, :, 1] > 0)
+
+        # Compute step: +1 or -1 in chosen axis
+        step_vec = torch.zeros(ne, n_pred, 2, device=self.device)
+        step_vec[:, :, 0] = move_row.float() * diff[:, :, 0].sign()
+        step_vec[:, :, 1] = move_col.float() * diff[:, :, 1].sign()
+
+        candidates = self.predator_positions + step_vec.long()
+        candidates = candidates.clamp(0, self.grid_size - 1)
+
+        # Check occupancy at candidate positions (batched lookup)
+        cand_r = candidates[:, :, 0]  # [ne, n_pred]
+        cand_c = candidates[:, :, 1]  # [ne, n_pred]
+        env_idx = torch.arange(ne, device=self.device).unsqueeze(1).expand(ne, n_pred)
+        occ_at_cand = self.occupancy[env_idx, cand_r, cand_c]  # [ne, n_pred]
+        can_move = (occ_at_cand == -1) & alive  # [ne, n_pred]
+
+        # Clear old occupancy for moving predators
+        old_r = self.predator_positions[:, :, 0]  # [ne, n_pred]
+        old_c = self.predator_positions[:, :, 1]
+        pred_occ_id = torch.arange(n_pred, device=self.device).unsqueeze(0).expand(ne, n_pred) + n
+        old_is_self = (self.occupancy[env_idx, old_r, old_c] == pred_occ_id)
+        clear_mask = can_move & old_is_self
+        self.occupancy[env_idx[clear_mask], old_r[clear_mask], old_c[clear_mask]] = -1
+
+        # Update positions and set new occupancy
+        self.predator_positions[can_move] = candidates[can_move]
+        new_r = self.predator_positions[:, :, 0]
+        new_c = self.predator_positions[:, :, 1]
+        self.occupancy[env_idx[alive], new_r[alive], new_c[alive]] = pred_occ_id[alive]
+
+        # === Phase 3: Attack adjacent agents (fully vectorized) ===
+        pred_pos_f = self.predator_positions.float()
+        dists_atk = (pred_pos_f[:, :, None, :] - agent_pos_f[:, None, :, :]).abs().sum(dim=-1)  # [ne, n_pred, n]
+        adjacent = (dists_atk <= 1.0) & self.agent_alive[:, None, :] & alive[:, :, None]
+
+        # Pick one target per predator (closest adjacent)
+        atk_dist = dists_atk.masked_fill(~adjacent, float('inf'))
+        target_idx = atk_dist.argmin(dim=2)  # [ne, n_pred]
+        has_target = adjacent.any(dim=2)      # [ne, n_pred]
+
+        # Apply damage via scatter_add
+        dmg = self.config.predator_damage
+        dmg_per_pred = torch.zeros(ne, n_pred, device=self.device)
+        dmg_per_pred[has_target] = dmg
+
+        # Scatter damage to agent dimension: [ne, n_pred] -> [ne, n]
+        predator_damage.scatter_add_(1, target_idx, dmg_per_pred)
+        self.agent_hp -= predator_damage
+
+        # Update predator ledger: channel 1 = damage pred dealt to agent
+        # Expand for scatter: [ne, n_pred] -> [ne, n_pred, 1]
+        hit_envs, hit_preds = torch.where(has_target)
+        if hit_envs.numel() > 0:
+            hit_agents = target_idx[hit_envs, hit_preds]
+            self.predator_ledger[hit_envs, hit_agents, hit_preds, 1] += dmg
+
+        return predator_damage
 
     # =====================================================================
     # FOOD METHODS
@@ -710,6 +1023,7 @@ class BatchedGridWorld:
         on_poor = self.poor_food[env_idx, rows, cols] & self.agent_alive
         food_rewards += on_poor.float() * self.config.r_small
         self.agent_inventory = self.agent_inventory + on_poor.float() * self.config.poor_food_value
+        self.food_eaten_total = self.food_eaten_total + on_poor.float()
 
         # Remove eaten poor food
         self.poor_food[env_idx[on_poor], rows[on_poor], cols[on_poor]] = False
@@ -780,6 +1094,7 @@ class BatchedGridWorld:
 
         # Reward
         did_participate = (foods_per_agent > 0).float()
+        self.food_eaten_total = self.food_eaten_total + did_participate
         food_reward = did_participate * self.config.r_large
         return food_reward + reciprocity_bonus
 
@@ -805,6 +1120,57 @@ class BatchedGridWorld:
         near_coop_opp = (within_range_rich & coop_opportunity.unsqueeze(1)).any(dim=(2, 3))
         reward_mask = coop_mask & near_coop_opp
         return reward_mask.float() * self.config.r_coop_attempt
+
+    def _compute_hierarchy_rewards(self) -> torch.Tensor:
+        """Compute per-step hierarchy bonus based on agent ranking (batched).
+
+        Returns [n_envs, n_agents] tensor of hierarchy rewards.
+        """
+        ne, n = self.n_envs, self.n_agents
+        cfg = self.config
+
+        if cfg.r_hierarchy == 0.0:
+            return torch.zeros(ne, n, device=self.device)
+
+        alive = self.agent_alive.float()  # [ne, n]
+        n_active = alive.sum(dim=1)  # [ne]
+        valid_env = n_active >= 2  # [ne]
+
+        if not valid_env.any():
+            return torch.zeros(ne, n, device=self.device)
+
+        eps = 1e-8
+
+        # Component scores (normalize per-env by max across agents)
+        food = self.food_eaten_total * alive  # [ne, n]
+        food_max = food.max(dim=1, keepdim=True).values.clamp(min=eps)
+        food_norm = food / food_max
+
+        # Total damage dealt (sum over all targets from ledger)
+        damage = self.ledger_tensor[:, :, :, Ledger.DAMAGE_DEALT].sum(dim=2) * alive  # [ne, n]
+        damage_max = damage.max(dim=1, keepdim=True).values.clamp(min=eps)
+        damage_norm = damage / damage_max
+
+        hp_ratio = (self.agent_hp / cfg.max_hp) * alive  # [ne, n]
+        hp_max = hp_ratio.max(dim=1, keepdim=True).values.clamp(min=eps)
+        hp_norm = hp_ratio / hp_max
+
+        # Weighted hierarchy score
+        score = (cfg.hierarchy_food_weight * food_norm
+                 + cfg.hierarchy_damage_weight * damage_norm
+                 + cfg.hierarchy_hp_weight * hp_norm) * alive
+
+        # Rank via argsort of argsort (rank 0 = lowest score)
+        ranks = score.argsort(dim=1).argsort(dim=1).float()
+
+        # Reward: linear from 0 (bottom) to r_hierarchy (top)
+        denom = (n_active - 1).clamp(min=1.0).unsqueeze(1)
+        rewards = (ranks / denom) * cfg.r_hierarchy * alive
+
+        # Zero out invalid envs (< 2 active agents)
+        rewards = rewards * valid_env.unsqueeze(1).float()
+
+        return rewards
 
     def _spawn_food(self):
         """Spawn new food — batched for normal mode, shadow env for curriculum."""
@@ -870,6 +1236,14 @@ class BatchedGridWorld:
         s.step_count = self.step_count[slot].item()
         s.curriculum_phase = self.curriculum_phase
         s._current_scenario = self._current_scenario
+        if self.n_predators > 0:
+            s.predator_positions = self.predator_positions[slot].clone()
+            s.predator_prev_positions = self.predator_prev_positions[slot].clone()
+            s.predator_hp = self.predator_hp[slot].clone()
+            s.predator_alive = self.predator_alive[slot].clone()
+            s.predator_respawn_timer = self.predator_respawn_timer[slot].clone()
+            if hasattr(self, 'predator_ledger'):
+                s.predator_ledger = self.predator_ledger[slot].clone()
 
     # =====================================================================
     # OBSERVATIONS
@@ -930,7 +1304,10 @@ class BatchedGridWorld:
         agent_hp_norm = (self.agent_hp / self.config.max_hp).view(ne, 1, n, 1).expand(ne, n, n, 1)
 
         # Social features from ledger [ne, n, n, 4]
-        social = (self.ledger_tensor * self._ledger_norm_scale).clamp(0, 1) * 5.0
+        if self.config.ablate_ledger:
+            social = torch.zeros(ne, n, n, 4, device=self.device)
+        else:
+            social = (self.ledger_tensor * self._ledger_norm_scale).clamp(0, 1) * 5.0
 
         agent_tokens = torch.cat([fourier_agents, velocity_agents, type_onehot, agent_hp_norm, social], dim=-1)
         tokens[:, :, :n, :] = agent_tokens
@@ -992,6 +1369,47 @@ class BatchedGridWorld:
         tokens[:, :, n:n + actual_k, :] = food_tokens[:, :, :actual_k, :]
         mask[:, :, n:n + actual_k] = food_valid[:, :, :actual_k]
 
+        # === PREDATOR TOKENS (after food tokens) ===
+        if self.n_predators > 0:
+            pred_start = n + max_food
+            for p in range(self.n_predators):
+                slot = pred_start + p
+                if slot >= max_ent:
+                    break
+
+                # Relative position: pred_pos - observer_pos, normalized [ne, n, 2]
+                pred_pos_f = self.predator_positions[:, p:p+1, :].float()  # [ne, 1, 2]
+                observer_pos_f = self.agent_positions.float()  # [ne, n, 2]
+                rel_pos_pred = (pred_pos_f - observer_pos_f) / gs  # [ne, n, 2]
+
+                fourier_pred = self._fourier_encode(rel_pos_pred)  # [ne, n, 16]
+
+                # Velocity
+                pred_prev_f = self.predator_prev_positions[:, p:p+1, :].float()
+                observer_prev_f = self.prev_agent_positions.float()
+                rel_prev_pred = (pred_prev_f - observer_prev_f) / gs
+                velocity_pred = (rel_pos_pred - rel_prev_pred) * 10.0  # [ne, n, 2]
+
+                # Type: agent-like [0, 1]
+                type_pred = torch.zeros(ne, n, 2, device=self.device)
+                type_pred[:, :, 1] = 1  # is_agent
+
+                # HP normalized by max_hp (>1.0 distinguishes from agents)
+                hp_val = (self.predator_hp[:, p] / self.config.max_hp).view(ne, 1, 1).expand(ne, n, 1)
+
+                # Social: from predator ledger (damage dealt/received)
+                social_pred = torch.zeros(ne, n, 4, device=self.device)
+                if hasattr(self, 'predator_ledger'):
+                    social_pred[:, :, 0] = (self.predator_ledger[:, :, p, 0] / 100.0).clamp(0, 1) * 5.0
+                    social_pred[:, :, 1] = (self.predator_ledger[:, :, p, 1] / 100.0).clamp(0, 1) * 5.0
+
+                pred_token = torch.cat([fourier_pred, velocity_pred, type_pred, hp_val, social_pred], dim=-1)  # [ne, n, 25]
+                tokens[:, :, slot, :] = pred_token
+
+                # Mask: alive predators
+                pred_alive_expanded = self.predator_alive[:, p].unsqueeze(1).expand(ne, n)  # [ne, n]
+                mask[:, :, slot] = pred_alive_expanded
+
         return tokens, mask
 
     def _get_action_masks_batched(self):
@@ -1018,20 +1436,25 @@ class BatchedGridWorld:
         occupants = self.occupancy[env_idx, safe_rows, safe_cols]  # [ne, n, 4]
 
         has_target = occupants >= 0
-        safe_occ = occupants.clamp(min=0)
-        # Gather alive status for occupants
+        is_agent_occ = has_target & (occupants < n)
+        safe_occ = occupants.clamp(min=0, max=n - 1)
+        # Gather alive status for agent occupants
         env_idx_flat = env_idx.reshape(-1)
         occ_flat = safe_occ.reshape(-1)
         target_alive_flat = self.agent_alive[env_idx_flat, occ_flat]
-        target_alive = target_alive_flat.reshape(ne, n, 4) & has_target
+        target_alive = target_alive_flat.reshape(ne, n, 4) & is_agent_occ
         direction_has_agent = target_in_bounds & target_alive
-        any_adjacent = direction_has_agent.any(dim=2)
+
+        # Check for adjacent predators too
+        direction_has_predator = target_in_bounds & has_target & (occupants >= n)
+        any_adjacent_agent = direction_has_agent.any(dim=2)
+        any_adjacent_target = (direction_has_agent | direction_has_predator).any(dim=2)
 
         # Action type mask [ne, n, 5]
         action_type_mask = torch.zeros(ne, n, 5, dtype=torch.bool, device=self.device)
         action_type_mask[:, :, ACT_MOVE] = self.agent_alive
-        action_type_mask[:, :, ACT_ATTACK] = any_adjacent & self.agent_alive
-        action_type_mask[:, :, ACT_GIVE] = any_adjacent & self.agent_alive
+        action_type_mask[:, :, ACT_ATTACK] = any_adjacent_target & self.agent_alive
+        action_type_mask[:, :, ACT_GIVE] = any_adjacent_agent & self.agent_alive
         action_type_mask[:, :, ACT_SIGNAL] = self.agent_alive
         # COOPERATE: rich food within distance 1
         if self.rich_food.any():
@@ -1054,11 +1477,7 @@ class BatchedGridWorld:
         max_phase = max(THRESHOLDS.keys())
         if self.curriculum_phase >= max_phase:
             return
-        self.episode_returns.append(episode_return)
-        if len(self.episode_returns) >= 10:
-            avg_return = sum(self.episode_returns[-10:]) / 10
-            threshold = THRESHOLDS.get(self.curriculum_phase, 999999)
-            if avg_return >= threshold and self.curriculum_phase < max_phase:
-                self.curriculum_phase += 1
-                self.episode_returns = []
-                print(f"[Curriculum] Avg return {avg_return:.1f} >= {threshold} -> Advanced to phase {self.curriculum_phase}")
+        threshold = THRESHOLDS.get(self.curriculum_phase, 999999)
+        if episode_return >= threshold and self.curriculum_phase < max_phase:
+            self.curriculum_phase += 1
+            print(f"[Curriculum] Return {episode_return:.1f} >= {threshold} -> Advanced to phase {self.curriculum_phase}")

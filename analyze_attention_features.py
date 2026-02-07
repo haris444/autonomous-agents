@@ -37,8 +37,15 @@ def load_episode(path: str):
 def load_model(checkpoint_path: str, config: Config, agent_id: int = 0):
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model = ActorCritic(config)
-    # Use strict=False to handle model architecture differences
-    model.load_state_dict(ckpt['network_state_dicts'][agent_id], strict=False)
+    
+    if 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
+    elif 'network_state_dicts' in ckpt:
+        state_dict = ckpt['network_state_dicts'][agent_id]
+    else:
+        raise KeyError(f"Checkpoint missing model state dict. Keys: {ckpt.keys()}")
+
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model
 
@@ -187,7 +194,7 @@ def get_attention_weights(model, obs):
         return attn_weights[0].numpy()
 
 
-def get_attention_ablated(model, obs, ablate_position=False, ablate_social=False, ablate_type=False):
+def get_attention_ablated(model, obs, ablate_position=False, ablate_social=False, ablate_type=False, ablate_velocity=False, ablate_value=False):
     """Get attention with certain features zeroed out.
 
     Token format (25 features):
@@ -201,10 +208,14 @@ def get_attention_ablated(model, obs, ablate_position=False, ablate_social=False
 
     if ablate_position:
         tokens_modified[:, :, 0:16] = 0  # Zero fourier features
-    if ablate_social:
-        tokens_modified[:, :, 21:25] = 0  # Zero social channels
+    if ablate_velocity:
+        tokens_modified[:, :, 16:18] = 0  # Zero velocity
     if ablate_type:
         tokens_modified[:, :, 18:20] = 0.5  # Neutral type
+    if ablate_value:
+        tokens_modified[:, :, 20] = 0.5  # Neutral value (0.5 HP/Quality)
+    if ablate_social:
+        tokens_modified[:, :, 21:25] = 0  # Zero social channels
 
     obs_modified = {**obs, 'entity_tokens': tokens_modified}
 
@@ -237,11 +248,15 @@ def analyze_attention_features(episode_path: str, checkpoint_path: str, frame_id
     attn_normal = get_attention_weights(model, obs)
     attn_no_pos = get_attention_ablated(model, obs, ablate_position=True)
     attn_no_social = get_attention_ablated(model, obs, ablate_social=True)
+    attn_no_velocity = get_attention_ablated(model, obs, ablate_velocity=True)
+    attn_no_value = get_attention_ablated(model, obs, ablate_value=True)
 
     # Extract attention from agent 0's perspective
     attn_from_a0 = attn_normal[0, :]
     attn_from_a0_no_pos = attn_no_pos[0, :]
     attn_from_a0_no_social = attn_no_social[0, :]
+    attn_from_a0_no_velocity = attn_no_velocity[0, :]
+    attn_from_a0_no_value = attn_no_value[0, :]
 
     # Filter to valid entities
     valid_mask = obs['entity_mask'][0].numpy()
@@ -249,6 +264,8 @@ def analyze_attention_features(episode_path: str, checkpoint_path: str, frame_id
     valid_attn = [attn_from_a0[e['idx']] for e in valid_info]
     valid_attn_no_pos = [attn_from_a0_no_pos[e['idx']] for e in valid_info]
     valid_attn_no_social = [attn_from_a0_no_social[e['idx']] for e in valid_info]
+    valid_attn_no_velocity = [attn_from_a0_no_velocity[e['idx']] for e in valid_info]
+    valid_attn_no_value = [attn_from_a0_no_value[e['idx']] for e in valid_info]
 
     # Create visualization
     fig = plt.figure(figsize=(20, 14))
@@ -329,19 +346,29 @@ def analyze_attention_features(episode_path: str, checkpoint_path: str, frame_id
     ax_ablation = fig.add_axes([0.02, 0.08, 0.45, 0.40])
 
     x = np.arange(len(valid_info))
-    width = 0.25
+    width = 0.15
 
-    bars1 = ax_ablation.bar(x - width, valid_attn, width, label='Normal', color='#3498db', edgecolor='black')
-    bars2 = ax_ablation.bar(x, valid_attn_no_pos, width, label='No Position (dx,dy=0)', color='#e74c3c', edgecolor='black')
-    bars3 = ax_ablation.bar(x + width, valid_attn_no_social, width, label='No Social', color='#2ecc71', edgecolor='black')
+    bars1 = ax_ablation.bar(x - 2*width, valid_attn, width, label='Normal', color='#3498db', edgecolor='black')
+    bars2 = ax_ablation.bar(x - width, valid_attn_no_pos, width, label='No Position', color='#e74c3c', edgecolor='black')
+    bars3 = ax_ablation.bar(x, valid_attn_no_social, width, label='No Social', color='#2ecc71', edgecolor='black')
+    bars4 = ax_ablation.bar(x + width, valid_attn_no_velocity, width, label='No Velocity', color='#9b59b6', edgecolor='black')
+    bars5 = ax_ablation.bar(x + 2*width, valid_attn_no_value, width, label='No Value', color='#f1c40f', edgecolor='black')
 
     ax_ablation.set_xlabel('Entity')
     ax_ablation.set_ylabel('Attention Weight')
-    ax_ablation.set_title('Ablation Study: What happens when we remove features?', fontsize=11, fontweight='bold')
+    ax_ablation.set_title('Ablation Study: Impact of removing features', fontsize=11, fontweight='bold')
     ax_ablation.set_xticks(x)
     ax_ablation.set_xticklabels([e['label'] for e in valid_info])
-    ax_ablation.legend(loc='upper right')
-    ax_ablation.set_ylim(0, max(max(valid_attn), max(valid_attn_no_pos), max(valid_attn_no_social)) * 1.2)
+    ax_ablation.legend(loc='upper right', ncol=2, fontsize=9)
+    # Calculate max height properly dealing with empty lists
+    max_height = 0
+    if valid_attn:
+         max_height = max(max(valid_attn), 
+                          max(valid_attn_no_pos), 
+                          max(valid_attn_no_social),
+                          max(valid_attn_no_velocity),
+                          max(valid_attn_no_value))
+    ax_ablation.set_ylim(0, max_height * 1.3)
 
     # === BOTTOM RIGHT: Feature importance summary ===
     ax_summary = fig.add_axes([0.55, 0.08, 0.40, 0.40])
@@ -351,48 +378,48 @@ def analyze_attention_features(episode_path: str, checkpoint_path: str, frame_id
     # Calculate feature importance
     pos_influence = np.mean(np.abs(np.array(valid_attn) - np.array(valid_attn_no_pos)))
     social_influence = np.mean(np.abs(np.array(valid_attn) - np.array(valid_attn_no_social)))
+    vel_influence = np.mean(np.abs(np.array(valid_attn) - np.array(valid_attn_no_velocity)))
+    val_influence = np.mean(np.abs(np.array(valid_attn) - np.array(valid_attn_no_value)))
 
     # Distance correlation
     dist_corr = np.corrcoef(distances, valid_attn)[0, 1] if len(distances) > 1 else 0
 
     lines = []
-    lines.append("HOW MUCH DOES EACH FEATURE MATTER?")
+    lines.append("FEATURE IMPORTANCE RANKING (Avg Attn Change):")
     lines.append("=" * 50)
-    lines.append("")
-    lines.append("POSITION (Fourier features):")
-    lines.append(f"  Avg attention change when zeroed: {pos_influence:.3f}")
-    lines.append(f"  Distance-Attention correlation: {dist_corr:.2f}")
-    if abs(dist_corr) > 0.3:
-        if dist_corr < 0:
-            lines.append("  -> CLOSER entities get MORE attention")
-        else:
-            lines.append("  -> FARTHER entities get MORE attention")
-    else:
-        lines.append("  -> Distance has WEAK effect on attention")
-    lines.append("")
-    lines.append("SOCIAL HISTORY:")
-    lines.append(f"  Avg attention change when zeroed: {social_influence:.3f}")
-    if social_influence > pos_influence:
-        lines.append("  -> Social history is MORE important than position")
-    else:
-        lines.append("  -> Position is MORE important than social history")
-    lines.append("")
-    lines.append("INTERPRETATION:")
-    lines.append("-" * 50)
+    
+    influences = [
+        ('Position', pos_influence),
+        ('Social', social_influence),
+        ('Velocity', vel_influence),
+        ('Value (HP/Qual)', val_influence)
+    ]
+    influences.sort(key=lambda x: x[1], reverse=True)
 
-    # Find what drives attention most
-    if pos_influence > social_influence and abs(dist_corr) > 0.3:
-        lines.append("Agent primarily uses SPATIAL information")
-        lines.append("(pays attention based on WHERE things are)")
-    elif social_influence > pos_influence:
-        lines.append("Agent primarily uses SOCIAL information")
-        lines.append("(pays attention based on relationship history)")
+    for name, inf in influences:
+        lines.append(f"{name:<15}: {inf:.4f}")
+
+    lines.append("")
+    lines.append("-" * 50)
+    lines.append("INSIGHTS:")
+    
+    # Generate insights based on ranking
+    top_feature = influences[0][0]
+    lines.append(f"• Primary driver: {top_feature.upper()}")
+    
+    if abs(dist_corr) > 0.4:
+        lines.append(f"• Distance dependent: {'YES' if dist_corr < 0 else 'YES (Inverse)'} (Corr: {dist_corr:.2f})")
     else:
-        lines.append("Agent uses BALANCED combination of features")
-        lines.append("(both position and social matter)")
+        lines.append(f"• Distance dependent: NO (Corr: {dist_corr:.2f})")
+
+    if social_influence > 0.01:
+        lines.append("• Agent considers relationship history")
+    
+    if vel_influence > 0.01:
+        lines.append("• Agent considers movement (velocity)")
 
     ax_summary.text(0.05, 0.95, '\n'.join(lines), transform=ax_summary.transAxes,
-                   fontfamily='monospace', fontsize=10, verticalalignment='top',
+                   fontfamily='monospace', fontsize=11, verticalalignment='top',
                    bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5))
 
     plt.savefig('attention_feature_analysis.png', dpi=150, bbox_inches='tight')

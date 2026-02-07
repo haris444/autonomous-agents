@@ -15,6 +15,31 @@ from network import ActorCritic
 from buffer import RolloutBuffer, SingleAgentBuffer
 
 
+def load_state_dict_flexible(net, state_dict):
+    """Load state dict, resizing mismatched layers (e.g. signal_encoder) via slice/pad.
+    Returns True if any layers were resized (caller should skip optimizer state)."""
+    try:
+        net.load_state_dict(state_dict, strict=True)
+        return False
+    except RuntimeError as e:
+        if "size mismatch" not in str(e):
+            raise
+        model_dict = net.state_dict()
+        resized = []
+        for k, v in list(state_dict.items()):
+            if k in model_dict and v.shape != model_dict[k].shape:
+                target_shape = model_dict[k].shape
+                new_v = torch.zeros(target_shape, dtype=v.dtype, device=v.device)
+                slices = tuple(slice(0, min(s, t)) for s, t in zip(v.shape, target_shape))
+                new_v[slices] = v[slices]
+                state_dict[k] = new_v
+                resized.append(f"{k}: {list(v.shape)} -> {list(target_shape)}")
+        net.load_state_dict(state_dict, strict=True)
+        for r in resized:
+            print(f"  [Resized] {r}")
+        return True
+
+
 class PPO:
     """
     PPO algorithm implementation.
@@ -418,15 +443,36 @@ class IndependentPPO:
         network: ActorCritic,
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute combined PPO loss for one minibatch."""
-        # Get current policy outputs
-        _, _, new_log_prob, entropy, new_value = network.get_action_and_value(
-            batch['obs'],
-            direction=batch['directions'],
-            action_type=batch['action_types'],
-            direction_mask=batch.get('direction_mask'),
-            action_type_mask=batch.get('action_type_mask')
-        )
+        """Compute combined PPO loss for one minibatch.
+
+        Uses forward(return_aux=True) to get all heads in a single encode pass.
+        """
+        obs = batch['obs']
+        has_aux = 'returns_survival' in batch and batch['returns_survival'].abs().sum() > 0
+
+        # Single forward pass for all heads
+        result = network.forward(obs, return_aux=has_aux)
+        if has_aux:
+            dir_logits, act_logits, value, v_surv, v_res, v_soc = result
+        else:
+            dir_logits, act_logits, value = result
+
+        # Apply action masks
+        LARGE_NEG = -1e8
+        direction_mask = batch.get('direction_mask')
+        action_type_mask = batch.get('action_type_mask')
+        if direction_mask is not None:
+            dir_logits = dir_logits.masked_fill(~direction_mask, LARGE_NEG)
+        if action_type_mask is not None:
+            act_logits = act_logits.masked_fill(~action_type_mask, LARGE_NEG)
+
+        # Compute log probs and entropy from logits
+        from torch.distributions import Categorical
+        dir_dist = Categorical(logits=dir_logits)
+        act_dist = Categorical(logits=act_logits)
+        new_log_prob = dir_dist.log_prob(batch['directions']) + act_dist.log_prob(batch['action_types'])
+        entropy = dir_dist.entropy() + act_dist.entropy()
+        new_value = value.squeeze(-1)
 
         # Policy ratio
         log_ratio = new_log_prob - batch['log_probs']
@@ -453,13 +499,12 @@ class IndependentPPO:
         # Value loss
         v_loss = 0.5 * ((new_value - batch['returns']) ** 2).mean()
 
-        # Auxiliary value losses for decomposed reward streams
+        # Auxiliary value losses (already computed from same forward pass)
         aux_v_loss = torch.tensor(0.0, device=self.device)
-        if 'returns_survival' in batch and batch['returns_survival'].abs().sum() > 0:
-            aux_values = network.get_auxiliary_values(batch['obs'])
-            v_loss_survival = 0.5 * ((aux_values['survival'] - batch['returns_survival']) ** 2).mean()
-            v_loss_resource = 0.5 * ((aux_values['resource'] - batch['returns_resource']) ** 2).mean()
-            v_loss_social = 0.5 * ((aux_values['social'] - batch['returns_social']) ** 2).mean()
+        if has_aux:
+            v_loss_survival = 0.5 * ((v_surv.squeeze(-1) - batch['returns_survival']) ** 2).mean()
+            v_loss_resource = 0.5 * ((v_res.squeeze(-1) - batch['returns_resource']) ** 2).mean()
+            v_loss_social = 0.5 * ((v_soc.squeeze(-1) - batch['returns_social']) ** 2).mean()
             aux_v_loss = v_loss_survival + v_loss_resource + v_loss_social
 
         # Entropy bonus
@@ -540,6 +585,24 @@ class VmapPPO:
     def _get_stacked_params(self):
         """Stack parameters from all active networks for vmap."""
         return func.stack_module_state(self.networks[:self.n_active])
+
+    def _get_vmapped_forward(self):
+        """Get cached vmapped forward function (return_aux=True), creating on first use."""
+        cached = getattr(self, '_cached_vmapped_forward', None)
+        if cached is not None:
+            return cached
+        base_network = self.base_network
+
+        def forward_batch(params, buffers, obs_batch):
+            return func.functional_call(
+                base_network,
+                (params, buffers),
+                args=(obs_batch,),
+                kwargs={'return_aux': True}
+            )
+
+        self._cached_vmapped_forward = func.vmap(forward_batch, in_dims=(0, 0, 0))
+        return self._cached_vmapped_forward
 
     def get_actions_and_values(
         self,
@@ -951,14 +1014,38 @@ class VmapPPO:
         network: ActorCritic,
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute combined PPO loss for one minibatch."""
-        _, _, new_log_prob, entropy, new_value = network.get_action_and_value(
-            batch['obs'],
-            direction=batch['directions'],
-            action_type=batch['action_types'],
-            direction_mask=batch.get('direction_mask'),
-            action_type_mask=batch.get('action_type_mask')
-        )
+        """Compute combined PPO loss for one minibatch.
+
+        Uses forward(return_aux=True) to get all heads in a single encode pass,
+        avoiding the double-encoding that previously happened when
+        get_action_and_value() and get_auxiliary_values() each called _encode().
+        """
+        obs = batch['obs']
+        has_aux = 'returns_survival' in batch and batch['returns_survival'].abs().sum() > 0
+
+        # Single forward pass for all heads
+        result = network.forward(obs, return_aux=has_aux)
+        if has_aux:
+            dir_logits, act_logits, value, v_surv, v_res, v_soc = result
+        else:
+            dir_logits, act_logits, value = result
+
+        # Apply action masks
+        LARGE_NEG = -1e8
+        direction_mask = batch.get('direction_mask')
+        action_type_mask = batch.get('action_type_mask')
+        if direction_mask is not None:
+            dir_logits = dir_logits.masked_fill(~direction_mask, LARGE_NEG)
+        if action_type_mask is not None:
+            act_logits = act_logits.masked_fill(~action_type_mask, LARGE_NEG)
+
+        # Compute log probs and entropy from logits
+        from torch.distributions import Categorical
+        dir_dist = Categorical(logits=dir_logits)
+        act_dist = Categorical(logits=act_logits)
+        new_log_prob = dir_dist.log_prob(batch['directions']) + act_dist.log_prob(batch['action_types'])
+        entropy = dir_dist.entropy() + act_dist.entropy()
+        new_value = value.squeeze(-1)
 
         log_ratio = new_log_prob - batch['log_probs']
         ratio = log_ratio.exp()
@@ -980,13 +1067,12 @@ class VmapPPO:
 
         v_loss = 0.5 * ((new_value - batch['returns']) ** 2).mean()
 
-        # Auxiliary value losses for decomposed reward streams
+        # Auxiliary value losses (already computed from same forward pass)
         aux_v_loss = torch.tensor(0.0, device=self.device)
-        if 'returns_survival' in batch and batch['returns_survival'].abs().sum() > 0:
-            aux_values = network.get_auxiliary_values(batch['obs'])
-            v_loss_survival = 0.5 * ((aux_values['survival'] - batch['returns_survival']) ** 2).mean()
-            v_loss_resource = 0.5 * ((aux_values['resource'] - batch['returns_resource']) ** 2).mean()
-            v_loss_social = 0.5 * ((aux_values['social'] - batch['returns_social']) ** 2).mean()
+        if has_aux:
+            v_loss_survival = 0.5 * ((v_surv.squeeze(-1) - batch['returns_survival']) ** 2).mean()
+            v_loss_resource = 0.5 * ((v_res.squeeze(-1) - batch['returns_resource']) ** 2).mean()
+            v_loss_social = 0.5 * ((v_soc.squeeze(-1) - batch['returns_social']) ** 2).mean()
             aux_v_loss = v_loss_survival + v_loss_resource + v_loss_social
 
         entropy_loss = entropy.mean()
@@ -1018,9 +1104,9 @@ class VmapPPO:
         direction_mask: torch.Tensor = None,
         action_type_mask: torch.Tensor = None,
         n_envs: int = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Get actions and values for vectorized environments.
+        Get actions, values, and auxiliary values in a single forward pass.
 
         Args:
             obs: Batched observations [n_envs, n_agents, ...]
@@ -1030,6 +1116,7 @@ class VmapPPO:
 
         Returns:
             directions, action_types, log_probs, entropies, values: all [n_envs, n_agents]
+            aux_values: dict with 'survival', 'resource', 'social' keys, each [n_envs, n_agents]
         """
         # Infer n_envs from observations
         if n_envs is None:
@@ -1038,68 +1125,68 @@ class VmapPPO:
 
         from torch.distributions import Categorical
 
-        # Optimize: Transpose [n_envs, n_active] -> [n_active, n_envs]
-        # This allows vmap to process batches of size n_envs per agent
-        
         # Prepare inputs: [n_active, n_envs, ...]
         obs_transposed = {
             k: v[:, :self.n_active].transpose(0, 1) for k, v in obs.items()
         }
-        
+
         dir_mask_transposed = None
         if direction_mask is not None:
-             dir_mask_transposed = direction_mask[:, :self.n_active].transpose(0, 1) # [n_active, n_envs, 5]
-             
+             dir_mask_transposed = direction_mask[:, :self.n_active].transpose(0, 1)
+
         act_mask_transposed = None
         if action_type_mask is not None:
-             act_mask_transposed = action_type_mask[:, :self.n_active].transpose(0, 1) # [n_active, n_envs, 5]
+             act_mask_transposed = action_type_mask[:, :self.n_active].transpose(0, 1)
 
-        # Use clone mode logic or vmap
         if self.clone_mode:
-            # Reshape to [n_envs * n_active, ...] for single shared network
             obs_flat = {
                 k: v.reshape(-1, *v.shape[2:]) for k, v in obs_transposed.items()
             }
             dir_mask_flat = dir_mask_transposed.reshape(-1, 5) if dir_mask_transposed is not None else None
             act_mask_flat = act_mask_transposed.reshape(-1, 5) if act_mask_transposed is not None else None
-            
-            # Forward pass using sequential helper (it handles single batch dim)
-            dirs, acts, lps, ents, vals = self._get_actions_and_values_sequential(
-                obs_flat, dir_mask_flat, act_mask_flat
+
+            # Single forward pass with aux values
+            net = self.networks[0]
+            dir_logits, act_logits, val, v_surv, v_res, v_soc = net.forward(
+                obs_flat, return_aux=True
             )
-            
-            # Reshape back: [n_active * n_envs] -> [n_active, n_envs] -> [n_envs, n_active]
-            # Note: _get_actions_and_values_sequential returns flattened results corresponding to input
-            # Input was [n_active, n_envs] flattened, so we undo that
+
+            # Apply masks and sample actions
+            LARGE_NEG = -1e8
+            if dir_mask_flat is not None:
+                dir_logits = dir_logits.masked_fill(~dir_mask_flat, LARGE_NEG)
+            if act_mask_flat is not None:
+                act_logits = act_logits.masked_fill(~act_mask_flat, LARGE_NEG)
+
+            dir_dist = Categorical(logits=dir_logits)
+            act_dist = Categorical(logits=act_logits)
+            dirs = dir_dist.sample()
+            acts = act_dist.sample()
+            lps = dir_dist.log_prob(dirs) + act_dist.log_prob(acts)
+            ents = dir_dist.entropy() + act_dist.entropy()
+
+            # Reshape: [n_active * n_envs] -> [n_active, n_envs] -> [n_envs, n_active]
             directions = dirs.view(self.n_active, n_envs).transpose(0, 1)
             action_types = acts.view(self.n_active, n_envs).transpose(0, 1)
             log_probs = lps.view(self.n_active, n_envs).transpose(0, 1)
             entropies = ents.view(self.n_active, n_envs).transpose(0, 1)
-            values = vals.view(self.n_active, n_envs).transpose(0, 1)
-            
+            values = val.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
+            s_vals = v_surv.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
+            r_vals = v_res.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
+            soc_vals = v_soc.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
+
         else:
             # Independent mode: vmap over n_active agents
             params, buffers = self._get_stacked_params()
+            batched_forward = self._get_vmapped_forward()
 
-            def forward_batch(params, buffers, obs_batch):
-                # obs_batch is [n_envs, ...]
-                # functional_call sends this batch to network
-                return func.functional_call(
-                    self.base_network,
-                    (params, buffers),
-                    args=(obs_batch,)
-                )
+            # Returns [n_active, n_envs, ...] for each of 6 outputs
+            direction_logits, action_type_logits, values_out, v_surv, v_res, v_soc = batched_forward(
+                params, buffers, obs_transposed
+            )
 
-            # vmap over agents (dim 0 of params/buffers/obs_transposed)
-            # Input obs_transposed is [n_active, n_envs, ...]
-            batched_forward = func.vmap(forward_batch, in_dims=(0, 0, 0))
-            
-            # Returns [n_active, n_envs, ...]
-            direction_logits, action_type_logits, values_out = batched_forward(params, buffers, obs_transposed)
-            
-            # Squeeze values: [n_active, n_envs, 1] -> [n_active, n_envs]
             values_out = values_out.squeeze(-1)
-            
+
             # Masking
             LARGE_NEG = -1e8
             if dir_mask_transposed is not None:
@@ -1110,35 +1197,45 @@ class VmapPPO:
             # Sampling
             direction_dist = Categorical(logits=direction_logits)
             action_type_dist = Categorical(logits=action_type_logits)
-            
-            directions_out = direction_dist.sample() # [n_active, n_envs]
-            action_types_out = action_type_dist.sample() # [n_active, n_envs]
-            
+
+            directions_out = direction_dist.sample()
+            action_types_out = action_type_dist.sample()
+
             log_probs_out = direction_dist.log_prob(directions_out) + action_type_dist.log_prob(action_types_out)
             entropies_out = direction_dist.entropy() + action_type_dist.entropy()
-            
+
             # Transpose results back to [n_envs, n_active]
             directions = directions_out.transpose(0, 1)
             action_types = action_types_out.transpose(0, 1)
             log_probs = log_probs_out.transpose(0, 1)
             entropies = entropies_out.transpose(0, 1)
             values = values_out.transpose(0, 1)
+            s_vals = v_surv.squeeze(-1).transpose(0, 1)
+            r_vals = v_res.squeeze(-1).transpose(0, 1)
+            soc_vals = v_soc.squeeze(-1).transpose(0, 1)
 
-        # Handle inactive agents (padding) if necessary
+        # Handle inactive agents (padding)
         if self.n_active < n_agents:
             pad_size = n_agents - self.n_active
-            # Padding for [n_envs, pad_size]
-            pad_dir = torch.full((n_envs, pad_size), 4, device=self.device, dtype=torch.long) # STAY
-            pad_act = torch.zeros((n_envs, pad_size), device=self.device, dtype=torch.long) # MOVE
+            pad_dir = torch.full((n_envs, pad_size), 4, device=self.device, dtype=torch.long)
+            pad_act = torch.zeros((n_envs, pad_size), device=self.device, dtype=torch.long)
             pad_float = torch.zeros((n_envs, pad_size), device=self.device)
-            
+
             directions = torch.cat([directions, pad_dir], dim=1)
             action_types = torch.cat([action_types, pad_act], dim=1)
             log_probs = torch.cat([log_probs, pad_float], dim=1)
             entropies = torch.cat([entropies, pad_float], dim=1)
             values = torch.cat([values, pad_float], dim=1)
+            s_vals = torch.cat([s_vals, pad_float], dim=1)
+            r_vals = torch.cat([r_vals, pad_float], dim=1)
+            soc_vals = torch.cat([soc_vals, pad_float], dim=1)
 
-        return directions, action_types, log_probs, entropies, values
+        aux_values = {
+            'survival': s_vals,
+            'resource': r_vals,
+            'social': soc_vals
+        }
+        return directions, action_types, log_probs, entropies, values, aux_values
 
     def vec_get_values(
         self,
@@ -1163,33 +1260,23 @@ class VmapPPO:
         obs_transposed = {k: v[:, :self.n_active].transpose(0, 1) for k, v in obs.items()}
 
         if self.clone_mode:
-            # Flatten [n_active, n_envs] -> [batch]
+            # Flatten [n_active, n_envs] -> [n_active * n_envs, ...]
             obs_flat = {k: v.reshape(-1, *v.shape[2:]) for k, v in obs_transposed.items()}
-            
-            # Use sequential helper (returns [batch])
-            vals = self._get_values_sequential(obs_flat)
-            
-            # Reshape [batch] -> [n_active, n_envs] -> [n_envs, n_active]
+
+            # Batch all active agents*envs through shared network
+            net = self.networks[0]
+            vals = net.get_value(obs_flat).squeeze(-1)
+
+            # Reshape [n_active * n_envs] -> [n_active, n_envs] -> [n_envs, n_active]
             values = vals.view(self.n_active, n_envs).transpose(0, 1)
         
         else:
             params, buffers = self._get_stacked_params()
-            
-            def get_value_batch(params, buffers, obs_batch):
-                # obs_batch is [n_envs, ...]
-                _, _, val = func.functional_call(
-                    self.base_network, 
-                    (params, buffers), 
-                    args=(obs_batch,)
-                )
-                return val
+            batched_forward = self._get_vmapped_forward()
 
-            # vmap over agents
-            batched_value = func.vmap(get_value_batch, in_dims=(0, 0, 0))
-            
-            # [n_active, n_envs, 1]
-            values_out = batched_value(params, buffers, obs_transposed)
-            
+            # Reuse cached forward (returns 6 outputs, we only need value)
+            _, _, values_out, _, _, _ = batched_forward(params, buffers, obs_transposed)
+
             # [n_active, n_envs] -> [n_envs, n_active]
             values = values_out.squeeze(-1).transpose(0, 1)
 
@@ -1207,7 +1294,7 @@ class VmapPPO:
         n_envs: int = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Get auxiliary values for vectorized environments.
+        Get auxiliary values for vectorized environments using vmap.
 
         Args:
             obs: Batched observations [n_envs, n_agents, ...]
@@ -1220,38 +1307,32 @@ class VmapPPO:
             n_envs = obs['entity_tokens'].shape[0]
         n_agents = self.n_agents
 
-        survival_list = []
-        resource_list = []
-        social_list = []
-        
         # Prepare inputs: [n_active, n_envs, ...]
         obs_transposed = {k: v[:, :self.n_active].transpose(0, 1) for k, v in obs.items()}
-        
-        for i in range(self.n_active):
-            net_idx = 0 if self.clone_mode else i
-            net = self.networks[net_idx]
-            
-            # Extract batch for agent i: [n_envs, ...]
-            # obs_transposed[k][i] is [n_envs, ...]
-            obs_i = {k: v[i] for k, v in obs_transposed.items()}
-            
-            # Forward pass [n_envs]
-            aux = net.get_auxiliary_values(obs_i)
-            
-            survival_list.append(aux['survival'])
-            resource_list.append(aux['resource'])
-            social_list.append(aux['social'])
-            
-        # Stack results: [n_active, n_envs] -> transpose -> [n_envs, n_active]
-        if survival_list:
-            s_vals = torch.stack(survival_list).transpose(0, 1)
-            r_vals = torch.stack(resource_list).transpose(0, 1)
-            soc_vals = torch.stack(social_list).transpose(0, 1)
+
+        if self.clone_mode:
+            # Flatten [n_active, n_envs] -> [n_active * n_envs, ...]
+            obs_flat = {k: v.reshape(-1, *v.shape[2:]) for k, v in obs_transposed.items()}
+            net = self.networks[0]
+            # forward with return_aux=True: single encode for all heads
+            _, _, _, v_surv, v_res, v_soc = net.forward(obs_flat, return_aux=True)
+            # Reshape [n_active*n_envs, 1] -> [n_active, n_envs] -> [n_envs, n_active]
+            s_vals = v_surv.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
+            r_vals = v_res.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
+            soc_vals = v_soc.squeeze(-1).view(self.n_active, n_envs).transpose(0, 1)
         else:
-            s_vals = torch.zeros(n_envs, 0, device=self.device)
-            r_vals = torch.zeros(n_envs, 0, device=self.device)
-            soc_vals = torch.zeros(n_envs, 0, device=self.device)
-            
+            # Independent mode: vmap over agents
+            params, buffers = self._get_stacked_params()
+            batched_forward = self._get_vmapped_forward()
+
+            # Returns [n_active, n_envs, ...] for each output
+            _, _, _, v_surv, v_res, v_soc = batched_forward(params, buffers, obs_transposed)
+
+            # [n_active, n_envs, 1] -> [n_active, n_envs] -> [n_envs, n_active]
+            s_vals = v_surv.squeeze(-1).transpose(0, 1)
+            r_vals = v_res.squeeze(-1).transpose(0, 1)
+            soc_vals = v_soc.squeeze(-1).transpose(0, 1)
+
         # Pad for inactive agents
         if self.n_active < n_agents:
             pad_size = n_agents - self.n_active
@@ -1271,35 +1352,167 @@ class VmapPPO:
         Update networks from VecBuffer (vectorized environment buffer).
 
         In clone mode, all agents share weights so we update once with all data.
-        In independent mode, we update each agent with its own data.
+        In independent mode, uses vmapped parallel update across all agents.
         """
-        from buffer import VecBuffer  # Avoid circular import
+        if self.clone_mode:
+            # Clone mode: all data → network[0]
+            epoch_metrics = defaultdict(list)
+            for epoch in range(self.config.update_epochs):
+                for batch in buffer.get_batches(n_active=self.n_active):
+                    loss, metrics = self._compute_loss(self.networks[0], batch)
+                    self.optimizers[0].zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.networks[0].parameters(), self.config.max_grad_norm)
+                    self.optimizers[0].step()
 
-        # Aggregate metrics across epochs
-        epoch_metrics = defaultdict(list)
+                    for k, v in metrics.items():
+                        epoch_metrics[k].append(v)
+            return {k: torch.stack(v).mean().item() for k, v in epoch_metrics.items()}
+        else:
+            # Independent mode: vmapped parallel update
+            return self._vmapped_update_from_vec_buffer(buffer)
+
+    def _make_loss_fn(self, has_aux: bool):
+        """Create a pure-functional PPO loss function (closed over config + has_aux)."""
+        clip_coef = self.config.clip_coef
+        vf_coef = self.config.vf_coef
+        aux_vf_coef = self.config.aux_vf_coef
+        ent_coef = self.config.ent_coef
+        base_network = self.base_network
+        device = self.device
+
+        def loss_fn(params, buffs, obs, directions, action_types,
+                   old_log_probs, advantages, returns,
+                   direction_mask, action_type_mask,
+                   returns_survival, returns_resource, returns_social):
+            """Pure-functional PPO loss. All args are tensors for vmap."""
+            if has_aux:
+                dir_logits, act_logits, value, v_surv, v_res, v_soc = func.functional_call(
+                    base_network, (params, buffs),
+                    args=(obs,), kwargs={'return_aux': True}
+                )
+            else:
+                dir_logits, act_logits, value = func.functional_call(
+                    base_network, (params, buffs), args=(obs,)
+                )
+
+            LARGE_NEG = -1e8
+            dir_logits = dir_logits.masked_fill(~direction_mask, LARGE_NEG)
+            act_logits = act_logits.masked_fill(~action_type_mask, LARGE_NEG)
+
+            dir_log_sm = torch.nn.functional.log_softmax(dir_logits, dim=-1)
+            act_log_sm = torch.nn.functional.log_softmax(act_logits, dim=-1)
+            dir_log_prob = dir_log_sm.gather(1, directions.unsqueeze(-1)).squeeze(-1)
+            act_log_prob = act_log_sm.gather(1, action_types.unsqueeze(-1)).squeeze(-1)
+            new_log_prob = dir_log_prob + act_log_prob
+
+            dir_probs = torch.nn.functional.softmax(dir_logits, dim=-1)
+            act_probs = torch.nn.functional.softmax(act_logits, dim=-1)
+            entropy = -(dir_probs * dir_log_sm).sum(-1) - (act_probs * act_log_sm).sum(-1)
+
+            new_value = value.squeeze(-1)
+
+            log_ratio = new_log_prob - old_log_probs
+            ratio = log_ratio.exp()
+
+            adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            pg_loss1 = -adv * ratio
+            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            v_loss = 0.5 * ((new_value - returns) ** 2).mean()
+
+            aux_v_loss = torch.tensor(0.0, device=device)
+            if has_aux:
+                aux_v_loss = (
+                    0.5 * ((v_surv.squeeze(-1) - returns_survival) ** 2).mean() +
+                    0.5 * ((v_res.squeeze(-1) - returns_resource) ** 2).mean() +
+                    0.5 * ((v_soc.squeeze(-1) - returns_social) ** 2).mean()
+                )
+
+            entropy_loss = entropy.mean()
+            loss = pg_loss + vf_coef * v_loss + aux_vf_coef * aux_v_loss - ent_coef * entropy_loss
+
+            approx_kl = ((ratio - 1) - log_ratio).mean().detach()
+            clip_frac = ((ratio - 1.0).abs() > clip_coef).float().mean().detach()
+
+            metrics = torch.stack([
+                pg_loss.detach(), v_loss.detach(), aux_v_loss.detach(),
+                entropy_loss.detach(), loss.detach(), approx_kl, clip_frac
+            ])
+            return loss, metrics
+
+        return loss_fn
+
+    def _get_vmapped_grad_fn(self, has_aux: bool):
+        """Get cached vmapped grad function, creating on first use."""
+        attr = '_vmapped_grad_fn_aux' if has_aux else '_vmapped_grad_fn_noaux'
+        cached = getattr(self, attr, None)
+        if cached is not None:
+            return cached
+        loss_fn = self._make_loss_fn(has_aux)
+        vmapped_grad_fn = func.vmap(
+            func.grad(loss_fn, has_aux=True),
+            in_dims=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        )
+        setattr(self, attr, vmapped_grad_fn)
+        return vmapped_grad_fn
+
+    def _vmapped_update_from_vec_buffer(self, buffer: 'VecBuffer') -> Dict[str, float]:
+        """
+        Vmapped parallel PPO update for independent agents.
+
+        Uses func.vmap(func.grad(...)) to compute gradients for all agents
+        in parallel, then applies them to individual networks sequentially
+        (optimizer step is cheap relative to forward+backward).
+        """
+        metric_keys = ['policy_loss', 'value_loss', 'aux_value_loss',
+                        'entropy', 'total_loss', 'approx_kl', 'clip_fraction']
+        all_metrics = torch.zeros(len(metric_keys), device=self.device)
+        n_batches = 0
+
+        # Determine has_aux once upfront (consistent for entire update)
+        has_aux = buffer.returns_survival.abs().sum() > 0
+
+        # Get cached vmapped grad function (no retracing per minibatch)
+        vmapped_grad_fn = self._get_vmapped_grad_fn(has_aux)
 
         for epoch in range(self.config.update_epochs):
-            # Get minibatches from the buffer
-            for batch in buffer.get_batches(n_active=self.n_active):
-                # Use single shared network in clone mode, otherwise each agent
-                if self.clone_mode:
-                    # All data goes to network[0]
-                    loss, metrics = self._compute_loss(self.networks[0], batch)
-                    self.optimizers[0].zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.networks[0].parameters(), self.config.max_grad_norm)
-                    self.optimizers[0].step()
-                else:
-                    # In independent mode, all agents should see all data
-                    # (since buffer contains data from all envs/agents)
-                    loss, metrics = self._compute_loss(self.networks[0], batch)
-                    self.optimizers[0].zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.networks[0].parameters(), self.config.max_grad_norm)
-                    self.optimizers[0].step()
+            for batch in buffer.get_aligned_batches(n_active=self.n_active):
+                # Stack current params from all active networks
+                params, buffs = self._get_stacked_params()
 
-                for k, v in metrics.items():
-                    epoch_metrics[k].append(v)
+                # Execute: get gradients and metrics for all agents in parallel
+                grads, metrics_stacked = vmapped_grad_fn(
+                    params, buffs,
+                    batch['obs'], batch['directions'], batch['action_types'],
+                    batch['log_probs'], batch['advantages'], batch['returns'],
+                    batch['direction_mask'], batch['action_type_mask'],
+                    batch['returns_survival'], batch['returns_resource'], batch['returns_social']
+                )
+
+                # Accumulate metrics (mean across agents)
+                all_metrics += metrics_stacked.mean(dim=0)
+                n_batches += 1
+
+                # Apply gradients to individual networks
+                for agent_idx in range(self.n_active):
+                    net = self.networks[agent_idx]
+                    opt = self.optimizers[agent_idx]
+
+                    opt.zero_grad()
+
+                    # Copy vmapped grads into network .grad fields
+                    for name, param in net.named_parameters():
+                        if param.requires_grad:
+                            param.grad = grads[name][agent_idx]
+
+                    nn.utils.clip_grad_norm_(net.parameters(), self.config.max_grad_norm)
+                    opt.step()
 
         # Average metrics
-        return {k: torch.stack(v).mean().item() for k, v in epoch_metrics.items()}
+        if n_batches > 0:
+            all_metrics /= n_batches
+
+        return {k: all_metrics[i].item() for i, k in enumerate(metric_keys)}
