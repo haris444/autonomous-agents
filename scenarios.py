@@ -943,29 +943,31 @@ def get_curriculum() -> dict:
 
 
 def get_thresholds() -> dict:
-    """Return advancement thresholds for each phase."""
+    """Return advancement thresholds for each phase.
+
+    Thresholds are set at ~35% of theoretical max (lowered from 70%)
+    to allow faster curriculum progression with reward shaping.
+    """
     return {
-        # Solo phases: 70% of theoretical max
-        # floor(128/distance) * 5 food reward
-        1: 448,   # dist 1: 128 foods * 5 = 640, 70% = 448
-        2: 224,   # dist 2: 64 foods * 5 = 320, 70% = 224
-        3: 147,   # dist 3: 42 foods * 5 = 210, 70% = 147
-        4: 63,    # dist 7: 18 foods * 5 = 90, 70% = 63
-        5: 32,    # dist 14: 9 foods * 5 = 45, 70% = 32
+        # Solo phases: 35% of theoretical max (halved from original 70%)
+        1: 200,   # dist 1: was 448, now faster with approach reward
+        2: 100,   # dist 2: was 224
+        3: 70,    # dist 3: was 147
+        4: 30,    # dist 7: was 63
+        5: 15,    # dist 14: was 32
 
-        # Coop phases: per-agent average
-        6: 896,   # 2 agents, rich food (20 reward each)
-        7: 448,
-        8: 294,
+        # Coop phases: halved thresholds
+        6: 400,   # was 896
+        7: 200,   # was 448
+        8: 150,   # was 294
 
-        # Low-HP coop phase: same mission as phase 8 but at 50% HP
-        # Slightly lower threshold since survival is harder
-        9: 250,   # 2 agents at 50% HP, must cooperate without attacking ally
+        # Low-HP coop phase: slightly lowered
+        9: 120,   # was 250
 
-        # Social phases
-        10: 800,  # 3-agent with scripted ally - must learn reliable cooperation
-        11: 500,  # 4-agent with cloned weights, coherent friend/foe histories
-        12: 60,   # Full population emergent learning
+        # Social phases: more aggressive lowering
+        10: 400,  # was 800
+        11: 250,  # was 500
+        12: 30,   # was 60
     }
 
 

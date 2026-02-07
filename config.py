@@ -20,7 +20,7 @@ class Config:
 
     # Entity tokens (unified agents + food representation)
     max_food_tokens: int = 16    # Limit food tokens to K nearest
-    entity_token_dim: int = 25   # fourier[16] + velocity[2] + type_onehot[2] + value[1] + social[4]
+    entity_token_dim: int = field(init=False)  # Derived: fourier_bands*4 + velocity[2] + type[2] + value[1] + social[4]
     fourier_bands: int = 4       # Number of frequency octaves (1, 2, 4, 8)
 
     # Attention/Transformer parameters
@@ -35,19 +35,24 @@ class Config:
     food_coverage_cap: float = 0.40  # Max fraction of grid each food type can cover
 
     # Rewards (eating >> approaching to incentivize actually eating)
-    r_small: float = 5.0        # Eat poor food (5x approach reward for 10 steps)
-    r_large: float = 20.0       # Eat rich food (coop)
-    r_attack_mult: float = 0.1  # Attack reward = 10% of ALL damage dealt (5x reduced)
+    # Rewards (eating >> approaching to incentivize actually eating)
+    r_small: float = 20.0       # (Was 5.0) Make eating distinctly positive
+    r_large: float = 50.0       # (Was 20.0) Super reward for coop
+    r_attack_mult: float = 0.1  # Attack reward = 10% of ALL damage dealt
     r_damage_taken: float = -1.0  # Penalty per HP lost (scaled by HP ratio)
-    r_low_hp: float = -3.125    # Per-tick penalty when HP is low (50x original)
-    r_food_share: float = 0.0   # No bonus - giving food already transfers HP naturally
+    r_low_hp: float = -0.5      # (Was -3.125) Reduced existence penalty
+    r_food_share: float = 0.0   # No bonus
     r_betrayal: float = -0.5    # Penalty for attacking agents who helped you
     r_reciprocity: float = 0.2  # Bonus for cooperating with agents who helped you
-    r_defense: float = 0.2      # Bonus for defending allies (attacking their attackers)
-    r_revenge: float = 0.5      # Bonus for retaliating against attackers (50% of damage dealt)
-    r_survival: float = 0.0     # No survival bonus
-    r_death: float = 0.0        # No death penalty (survival incentive from HP decay)
-    r_coop_attempt: float = 2.0 # Intrinsic reward for choosing COOP when near rich food + ally
+    r_defense: float = 0.2      # Bonus for defending allies
+    r_revenge: float = 0.5      # Bonus for retaliating
+    r_survival: float = 0.1     # Bonus for staying alive (counteracts hp_decay)
+    r_death: float = -50.0      # Massive penalty for dying
+    r_coop_attempt: float = 2.0 # Intrinsic reward for choosing COOP
+
+    # Reward shaping (for faster learning)
+    r_approach_food: float = 0.5  # (Was 0.1) Stronger scent towards food
+    r_ally_proximity: float = 0.3 # Reward for moving toward ally who is near rich food
 
     # PPO Hyperparameters
     learning_rate: float = 2.5e-4
@@ -66,6 +71,7 @@ class Config:
     num_minibatches: int = 1
     update_epochs: int = 4
     seed: int = 42
+    n_envs: int = 8             # Number of parallel environments for vectorized training
 
     # Pretraining (curriculum learning)
     pretrain_mode: bool = False          # Single-agent pretraining mode
@@ -89,6 +95,7 @@ class Config:
     ledger_channels: int = field(init=False)
 
     def __post_init__(self):
+        self.entity_token_dim = self.fourier_bands * 4 + 9  # fourier + velocity[2] + type[2] + value[1] + social[4]
         self.batch_size = self.n_agents * self.num_steps
         self.minibatch_size = self.batch_size // self.num_minibatches
         self.max_entities = self.n_agents + self.max_food_tokens  # Total tokens in sequence

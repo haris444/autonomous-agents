@@ -252,6 +252,9 @@ class GridWorld:
         # === Track HP at start ===
         hp_before = self.agent_hp.clone()
 
+        # === Track distance to food BEFORE movement (for approach reward) ===
+        dist_to_food_before, _ = self._compute_nearest_food_info(self.agent_positions)
+
         # Clear signals from last step
         self.signals.zero_()
 
@@ -300,6 +303,22 @@ class GridWorld:
         hp_ratio_after = hp_after / self.config.max_hp
         low_hp_penalty = (1.0 - hp_ratio_after) * self.config.r_low_hp * self.agent_alive.float()
 
+        # === APPROACH REWARD (reward shaping for faster learning) ===
+        # Compute distance to food AFTER movement
+        dist_to_food_after, _ = self._compute_nearest_food_info(self.agent_positions)
+        # Reward for getting closer (positive when dist decreases)
+        # Handle inf values (no food) by setting approach_delta to 0
+        approach_delta = dist_to_food_before - dist_to_food_after
+        approach_delta = torch.where(
+            torch.isinf(dist_to_food_before) | torch.isinf(dist_to_food_after),
+            torch.zeros_like(approach_delta),
+            approach_delta
+        )
+        approach_reward = approach_delta * self.config.r_approach_food * self.agent_alive.float()
+
+        # Survival bonus (constant positive reward for staying alive)
+        survival_bonus = self.config.r_survival * self.agent_alive.float()
+
         # Combine all rewards
         rewards = (
             death_rewards           # Death penalty (-50.0)
@@ -311,6 +330,8 @@ class GridWorld:
             + betrayal_rewards      # Betrayal penalty (for attacking benefactors)
             + damage_pain           # Damage pain (non-linear)
             + low_hp_penalty        # Low HP penalty (constant per tick)
+            + approach_reward       # Reward for moving closer to food
+            + survival_bonus        # Bonus for staying alive
         )
 
         # Build outputs
@@ -334,7 +355,7 @@ class GridWorld:
 
         # Group reward components for auxiliary value heads
         survival_rewards = damage_pain + low_hp_penalty + death_rewards
-        resource_rewards = food_rewards
+        resource_rewards = food_rewards + approach_reward
         social_rewards = attack_rewards + defense_rewards + revenge_rewards + betrayal_rewards + intrinsic_coop_rewards
 
         infos = {
@@ -372,10 +393,10 @@ class GridWorld:
             rel_pos: [..., 2] tensor of (dx, dy) normalized to [-1, 1]
 
         Returns:
-            [..., 16] tensor of Fourier features (4 bands × 4 features per band)
+            [..., fourier_bands*4] tensor of Fourier features
         """
-        # Frequency bands: 1, 2, 4, 8 (coarse to fine)
-        bands = [1.0, 2.0, 4.0, 8.0]
+        # Frequency bands: powers of 2 (coarse to fine)
+        bands = [2.0 ** i for i in range(self.config.fourier_bands)]
 
         dx = rel_pos[..., 0:1]  # [..., 1]
         dy = rel_pos[..., 1:2]  # [..., 1]
@@ -388,7 +409,7 @@ class GridWorld:
             features.append(torch.sin(freq * torch.pi * dy))
             features.append(torch.cos(freq * torch.pi * dy))
 
-        return torch.cat(features, dim=-1)  # [..., 16]
+        return torch.cat(features, dim=-1)  # [..., fourier_bands*4]
 
     def _compute_nearest_food_info(self, positions: torch.Tensor, poor_only: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1141,9 +1162,9 @@ class GridWorld:
 
         self.episode_returns.append(episode_return)
 
-        # Check advancement every 20 episodes
-        if len(self.episode_returns) >= 20:
-            avg_return = sum(self.episode_returns[-20:]) / 20
+        # Check advancement every 10 episodes (was 20, reduced for faster progression)
+        if len(self.episode_returns) >= 10:
+            avg_return = sum(self.episode_returns[-10:]) / 10
 
             threshold = THRESHOLDS.get(self.curriculum_phase, 999999)
 

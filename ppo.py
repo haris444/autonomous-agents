@@ -3,6 +3,7 @@ Proximal Policy Optimization (PPO) algorithm.
 
 Handles dual-action policy with shared value function.
 """
+from collections import defaultdict
 from typing import Dict, List, Tuple
 
 import torch
@@ -1005,3 +1006,300 @@ class VmapPPO:
         }
 
         return loss, batch_metrics
+
+    # =========================================================================
+    # VECTORIZED ENVIRONMENT METHODS
+    # Process [n_envs, n_agents, ...] shaped inputs for parallel training
+    # =========================================================================
+
+    def vec_get_actions_and_values(
+        self,
+        obs: Dict[str, torch.Tensor],
+        direction_mask: torch.Tensor = None,
+        action_type_mask: torch.Tensor = None,
+        n_envs: int = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get actions and values for vectorized environments.
+
+        Args:
+            obs: Batched observations [n_envs, n_agents, ...]
+            direction_mask: [n_envs, n_agents, 5]
+            action_type_mask: [n_envs, n_agents, 5]
+            n_envs: Number of environments (inferred from obs if not provided)
+
+        Returns:
+            directions, action_types, log_probs, entropies, values: all [n_envs, n_agents]
+        """
+        # Infer n_envs from observations
+        if n_envs is None:
+            n_envs = obs['entity_tokens'].shape[0]
+        n_agents = self.n_agents
+
+        from torch.distributions import Categorical
+
+        # Optimize: Transpose [n_envs, n_active] -> [n_active, n_envs]
+        # This allows vmap to process batches of size n_envs per agent
+        
+        # Prepare inputs: [n_active, n_envs, ...]
+        obs_transposed = {
+            k: v[:, :self.n_active].transpose(0, 1) for k, v in obs.items()
+        }
+        
+        dir_mask_transposed = None
+        if direction_mask is not None:
+             dir_mask_transposed = direction_mask[:, :self.n_active].transpose(0, 1) # [n_active, n_envs, 5]
+             
+        act_mask_transposed = None
+        if action_type_mask is not None:
+             act_mask_transposed = action_type_mask[:, :self.n_active].transpose(0, 1) # [n_active, n_envs, 5]
+
+        # Use clone mode logic or vmap
+        if self.clone_mode:
+            # Reshape to [n_envs * n_active, ...] for single shared network
+            obs_flat = {
+                k: v.reshape(-1, *v.shape[2:]) for k, v in obs_transposed.items()
+            }
+            dir_mask_flat = dir_mask_transposed.reshape(-1, 5) if dir_mask_transposed is not None else None
+            act_mask_flat = act_mask_transposed.reshape(-1, 5) if act_mask_transposed is not None else None
+            
+            # Forward pass using sequential helper (it handles single batch dim)
+            dirs, acts, lps, ents, vals = self._get_actions_and_values_sequential(
+                obs_flat, dir_mask_flat, act_mask_flat
+            )
+            
+            # Reshape back: [n_active * n_envs] -> [n_active, n_envs] -> [n_envs, n_active]
+            # Note: _get_actions_and_values_sequential returns flattened results corresponding to input
+            # Input was [n_active, n_envs] flattened, so we undo that
+            directions = dirs.view(self.n_active, n_envs).transpose(0, 1)
+            action_types = acts.view(self.n_active, n_envs).transpose(0, 1)
+            log_probs = lps.view(self.n_active, n_envs).transpose(0, 1)
+            entropies = ents.view(self.n_active, n_envs).transpose(0, 1)
+            values = vals.view(self.n_active, n_envs).transpose(0, 1)
+            
+        else:
+            # Independent mode: vmap over n_active agents
+            params, buffers = self._get_stacked_params()
+
+            def forward_batch(params, buffers, obs_batch):
+                # obs_batch is [n_envs, ...]
+                # functional_call sends this batch to network
+                return func.functional_call(
+                    self.base_network,
+                    (params, buffers),
+                    args=(obs_batch,)
+                )
+
+            # vmap over agents (dim 0 of params/buffers/obs_transposed)
+            # Input obs_transposed is [n_active, n_envs, ...]
+            batched_forward = func.vmap(forward_batch, in_dims=(0, 0, 0))
+            
+            # Returns [n_active, n_envs, ...]
+            direction_logits, action_type_logits, values_out = batched_forward(params, buffers, obs_transposed)
+            
+            # Squeeze values: [n_active, n_envs, 1] -> [n_active, n_envs]
+            values_out = values_out.squeeze(-1)
+            
+            # Masking
+            LARGE_NEG = -1e8
+            if dir_mask_transposed is not None:
+                direction_logits = direction_logits.masked_fill(~dir_mask_transposed, LARGE_NEG)
+            if act_mask_transposed is not None:
+                action_type_logits = action_type_logits.masked_fill(~act_mask_transposed, LARGE_NEG)
+
+            # Sampling
+            direction_dist = Categorical(logits=direction_logits)
+            action_type_dist = Categorical(logits=action_type_logits)
+            
+            directions_out = direction_dist.sample() # [n_active, n_envs]
+            action_types_out = action_type_dist.sample() # [n_active, n_envs]
+            
+            log_probs_out = direction_dist.log_prob(directions_out) + action_type_dist.log_prob(action_types_out)
+            entropies_out = direction_dist.entropy() + action_type_dist.entropy()
+            
+            # Transpose results back to [n_envs, n_active]
+            directions = directions_out.transpose(0, 1)
+            action_types = action_types_out.transpose(0, 1)
+            log_probs = log_probs_out.transpose(0, 1)
+            entropies = entropies_out.transpose(0, 1)
+            values = values_out.transpose(0, 1)
+
+        # Handle inactive agents (padding) if necessary
+        if self.n_active < n_agents:
+            pad_size = n_agents - self.n_active
+            # Padding for [n_envs, pad_size]
+            pad_dir = torch.full((n_envs, pad_size), 4, device=self.device, dtype=torch.long) # STAY
+            pad_act = torch.zeros((n_envs, pad_size), device=self.device, dtype=torch.long) # MOVE
+            pad_float = torch.zeros((n_envs, pad_size), device=self.device)
+            
+            directions = torch.cat([directions, pad_dir], dim=1)
+            action_types = torch.cat([action_types, pad_act], dim=1)
+            log_probs = torch.cat([log_probs, pad_float], dim=1)
+            entropies = torch.cat([entropies, pad_float], dim=1)
+            values = torch.cat([values, pad_float], dim=1)
+
+        return directions, action_types, log_probs, entropies, values
+
+    def vec_get_values(
+        self,
+        obs: Dict[str, torch.Tensor],
+        n_envs: int = None
+    ) -> torch.Tensor:
+        """
+        Get values for vectorized environments.
+
+        Args:
+            obs: Batched observations [n_envs, n_agents, ...]
+            n_envs: Number of environments (inferred from obs if not provided)
+
+        Returns:
+            values: [n_envs, n_agents]
+        """
+        if n_envs is None:
+            n_envs = obs['entity_tokens'].shape[0]
+        n_agents = self.n_agents
+
+        # Prepare inputs: [n_active, n_envs, ...]
+        obs_transposed = {k: v[:, :self.n_active].transpose(0, 1) for k, v in obs.items()}
+
+        if self.clone_mode:
+            # Flatten [n_active, n_envs] -> [batch]
+            obs_flat = {k: v.reshape(-1, *v.shape[2:]) for k, v in obs_transposed.items()}
+            
+            # Use sequential helper (returns [batch])
+            vals = self._get_values_sequential(obs_flat)
+            
+            # Reshape [batch] -> [n_active, n_envs] -> [n_envs, n_active]
+            values = vals.view(self.n_active, n_envs).transpose(0, 1)
+        
+        else:
+            params, buffers = self._get_stacked_params()
+            
+            def get_value_batch(params, buffers, obs_batch):
+                # obs_batch is [n_envs, ...]
+                _, _, val = func.functional_call(
+                    self.base_network, 
+                    (params, buffers), 
+                    args=(obs_batch,)
+                )
+                return val
+
+            # vmap over agents
+            batched_value = func.vmap(get_value_batch, in_dims=(0, 0, 0))
+            
+            # [n_active, n_envs, 1]
+            values_out = batched_value(params, buffers, obs_transposed)
+            
+            # [n_active, n_envs] -> [n_envs, n_active]
+            values = values_out.squeeze(-1).transpose(0, 1)
+
+        # Pad for inactive agents
+        if self.n_active < n_agents:
+            pad_size = n_agents - self.n_active
+            pad_val = torch.zeros((n_envs, pad_size), device=self.device)
+            values = torch.cat([values, pad_val], dim=1)
+
+        return values
+
+    def vec_get_auxiliary_values(
+        self,
+        obs: Dict[str, torch.Tensor],
+        n_envs: int = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Get auxiliary values for vectorized environments.
+
+        Args:
+            obs: Batched observations [n_envs, n_agents, ...]
+            n_envs: Number of environments (inferred from obs if not provided)
+
+        Returns:
+            Dict with 'survival', 'resource', 'social' keys, each [n_envs, n_agents]
+        """
+        if n_envs is None:
+            n_envs = obs['entity_tokens'].shape[0]
+        n_agents = self.n_agents
+
+        survival_list = []
+        resource_list = []
+        social_list = []
+        
+        # Prepare inputs: [n_active, n_envs, ...]
+        obs_transposed = {k: v[:, :self.n_active].transpose(0, 1) for k, v in obs.items()}
+        
+        for i in range(self.n_active):
+            net_idx = 0 if self.clone_mode else i
+            net = self.networks[net_idx]
+            
+            # Extract batch for agent i: [n_envs, ...]
+            # obs_transposed[k][i] is [n_envs, ...]
+            obs_i = {k: v[i] for k, v in obs_transposed.items()}
+            
+            # Forward pass [n_envs]
+            aux = net.get_auxiliary_values(obs_i)
+            
+            survival_list.append(aux['survival'])
+            resource_list.append(aux['resource'])
+            social_list.append(aux['social'])
+            
+        # Stack results: [n_active, n_envs] -> transpose -> [n_envs, n_active]
+        if survival_list:
+            s_vals = torch.stack(survival_list).transpose(0, 1)
+            r_vals = torch.stack(resource_list).transpose(0, 1)
+            soc_vals = torch.stack(social_list).transpose(0, 1)
+        else:
+            s_vals = torch.zeros(n_envs, 0, device=self.device)
+            r_vals = torch.zeros(n_envs, 0, device=self.device)
+            soc_vals = torch.zeros(n_envs, 0, device=self.device)
+            
+        # Pad for inactive agents
+        if self.n_active < n_agents:
+            pad_size = n_agents - self.n_active
+            pad = torch.zeros((n_envs, pad_size), device=self.device)
+            s_vals = torch.cat([s_vals, pad], dim=1)
+            r_vals = torch.cat([r_vals, pad], dim=1)
+            soc_vals = torch.cat([soc_vals, pad], dim=1)
+
+        return {
+            'survival': s_vals,
+            'resource': r_vals,
+            'social': soc_vals
+        }
+
+    def update_from_vec_buffer(self, buffer: 'VecBuffer') -> Dict[str, float]:
+        """
+        Update networks from VecBuffer (vectorized environment buffer).
+
+        In clone mode, all agents share weights so we update once with all data.
+        In independent mode, we update each agent with its own data.
+        """
+        from buffer import VecBuffer  # Avoid circular import
+
+        # Aggregate metrics across epochs
+        epoch_metrics = defaultdict(list)
+
+        for epoch in range(self.config.update_epochs):
+            # Get minibatches from the buffer
+            for batch in buffer.get_batches(n_active=self.n_active):
+                # Use single shared network in clone mode, otherwise each agent
+                if self.clone_mode:
+                    # All data goes to network[0]
+                    loss, metrics = self._compute_loss(self.networks[0], batch)
+                    self.optimizers[0].zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.networks[0].parameters(), self.config.max_grad_norm)
+                    self.optimizers[0].step()
+                else:
+                    # In independent mode, all agents should see all data
+                    # (since buffer contains data from all envs/agents)
+                    loss, metrics = self._compute_loss(self.networks[0], batch)
+                    self.optimizers[0].zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.networks[0].parameters(), self.config.max_grad_norm)
+                    self.optimizers[0].step()
+
+                for k, v in metrics.items():
+                    epoch_metrics[k].append(v)
+
+        # Average metrics
+        return {k: torch.stack(v).mean().item() for k, v in epoch_metrics.items()}
