@@ -95,10 +95,18 @@ def build_config(yaml_dict: dict, cli_overrides: dict = None) -> Config:
             if v is not None and k in valid_names:
                 config_values[k] = v
 
-    # Convert lists to tuples for tuple-typed fields
+    # Convert lists to tuples for tuple-typed fields, coerce types
+    field_types = {f.name: f.type for f in fields(Config) if f.name in valid_names}
     for k, v in config_values.items():
         if isinstance(v, list):
             config_values[k] = tuple(v)
+        # Coerce string values to the correct type (e.g., YAML parses "3e-4" as str)
+        elif isinstance(v, str) and k in field_types:
+            ft = field_types[k]
+            if ft == 'float' or ft is float:
+                config_values[k] = float(v)
+            elif ft == 'int' or ft is int:
+                config_values[k] = int(v)
 
     return Config(**config_values) if config_values else Config()
 

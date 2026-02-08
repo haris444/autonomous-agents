@@ -1209,9 +1209,10 @@ class GridWorld:
         # Rank via argsort of argsort (rank 0 = lowest score)
         ranks = score.argsort().argsort().float()
 
-        # Reward: linear from 0 (bottom) to r_hierarchy (top)
+        # Reward: linear from -r_hierarchy (bottom) to +r_hierarchy (top)
+        # Bottom 50% get negative rewards, top 50% get positive
         denom = (n_active - 1).clamp(min=1.0)
-        rewards = (ranks / denom) * cfg.r_hierarchy * alive
+        rewards = (2.0 * ranks / denom - 1.0) * cfg.r_hierarchy * alive
 
         return rewards
 

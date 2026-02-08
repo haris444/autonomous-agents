@@ -74,6 +74,19 @@ class Config:
     aux_vf_coef: float = 0.5    # Weight for auxiliary value losses (survival, resource, social)
     max_grad_norm: float = 0.5
 
+    # SAC Hyperparameters (Discrete Soft Actor-Critic)
+    sac_learning_rate: float = 3e-4       # LR for actor, critic, and alpha
+    sac_tau: float = 0.005                # Polyak averaging for target networks
+    sac_alpha_init: float = 0.2           # Initial entropy coefficient
+    sac_auto_alpha: bool = True           # Learn alpha automatically
+    sac_target_entropy_scale: float = 0.5 # target_entropy = -scale * log(1/|A|) per head
+    sac_gamma: float = 0.99              # Discount (SAC typically uses higher gamma)
+    sac_buffer_size: int = 500_000        # Replay buffer capacity
+    sac_batch_size: int = 256             # Minibatch size for SAC updates
+    sac_learning_starts: int = 5000       # Random actions before training starts
+    sac_update_frequency: int = 1         # Gradient steps per env step
+    sac_target_update_interval: int = 1   # Steps between target network Polyak updates
+
     # Training
     total_timesteps: int = 2_000_000
     num_steps: int = 128        # Steps per rollout before update (batch_size = 8 * 128 = 1024)

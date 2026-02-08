@@ -4,7 +4,6 @@ Batched GridWorld Environment — processes N environments simultaneously.
 Drop-in replacement for VecEnv. All state tensors have leading [n_envs, ...] dimension.
 Uses batched tensor operations instead of looping over independent GridWorld instances.
 """
-import time
 import torch
 import torch.nn.functional as F
 from typing import Dict, Tuple
@@ -109,35 +108,10 @@ class BatchedGridWorld:
         # Cooperation tracking
         self.last_coop_success_count = 0
 
-        # Step sub-timers (cumulative)
-        self.step_timers = {
-            'interactions': 0.0, 'movement': 0.0, 'predator': 0.0,
-            'hp_decay': 0.0, 'food': 0.0, 'hierarchy': 0.0,
-            'spawn_food': 0.0, 'deaths': 0.0, 'rewards': 0.0,
-            'observations': 0.0, 'reset': 0.0, 'nearest_food': 0.0,
-        }
-        self.step_timer_calls = 0
 
     # =====================================================================
     # PUBLIC API (matches VecEnv)
     # =====================================================================
-
-    def get_step_timing_str(self) -> str:
-        """Return a formatted string of step sub-timers and reset them."""
-        T = self.step_timers
-        total = sum(T.values())
-        if total <= 0:
-            return ""
-        parts = []
-        for k, v in sorted(T.items(), key=lambda x: -x[1]):
-            pct = 100 * v / total
-            if pct >= 1.0:
-                parts.append(f"{k}: {v:.2f}s ({pct:.0f}%)")
-        # Reset
-        for k in T:
-            T[k] = 0.0
-        self.step_timer_calls = 0
-        return " | ".join(parts)
 
     @property
     def grid_size_prop(self) -> int:
@@ -217,9 +191,7 @@ class BatchedGridWorld:
             obs, rewards, dones, infos — all batched [n_envs, ...]
         """
         self.step_count += 1
-        self.step_timer_calls += 1
         ne, n = self.n_envs, self.n_agents
-        T = self.step_timers
 
         self.prev_agent_positions = self.agent_positions.clone()
 
@@ -230,61 +202,42 @@ class BatchedGridWorld:
         is_signal = (action_types == ACT_SIGNAL)
 
         hp_before = self.agent_hp.clone()
-        _t = time.time()
         dist_before, _ = self._compute_nearest_food_info()
-        T['nearest_food'] += time.time() - _t
 
         # Clear signals
         self.signals.zero_()
 
         # 1. Interactions (from current position, includes agent-vs-predator)
-        _t = time.time()
         attack_rewards, damage_taken, defense_rewards, revenge_rewards, betrayal_rewards, give_rewards, predator_kill_rewards = (
             self._resolve_interactions(directions, action_types, is_attack, is_give, is_signal)
         )
-        T['interactions'] += time.time() - _t
 
         # 2. Movement (predators block cells)
-        _t = time.time()
         self._resolve_movement(directions, is_move)
         self._update_occupancy()
-        T['movement'] += time.time() - _t
 
         # 3. Predator movement + attack
-        _t = time.time()
         predator_damage = self._predator_step()
-        T['predator'] += time.time() - _t
 
         # 4. HP decay (agents only)
-        _t = time.time()
         self._apply_hp_decay()
-        T['hp_decay'] += time.time() - _t
 
         # 5. Food eating
-        _t = time.time()
         food_rewards = self._process_food_eating(action_types)
         intrinsic_coop_rewards = self._compute_intrinsic_coop_rewards(action_types)
         self._consume_inventory()
-        T['food'] += time.time() - _t
 
         # 5c. Hierarchy rewards (competitive ranking bonus)
-        _t = time.time()
         hierarchy_rewards = self._compute_hierarchy_rewards()
-        T['hierarchy'] += time.time() - _t
 
         # 6. Spawn food
-        _t = time.time()
         self._spawn_food()
-        T['spawn_food'] += time.time() - _t
 
         # 7. Deaths (agents + predators)
-        _t = time.time()
         death_rewards = self._check_deaths()
         self._update_occupancy()
-        T['deaths'] += time.time() - _t
 
         # Reward computation
-        _t = time.time()
         total_damage_taken = damage_taken + predator_damage
         hp_after = self.agent_hp.clone()
         hp_ratio = hp_before / self.config.max_hp
@@ -294,10 +247,7 @@ class BatchedGridWorld:
         hp_ratio_after = hp_after / self.config.max_hp
         low_hp_penalty = (1.0 - hp_ratio_after) * self.config.r_low_hp * self.agent_alive.float()
 
-        _t2 = time.time()
         dist_after, _ = self._compute_nearest_food_info()
-        T['nearest_food'] += time.time() - _t2
-
         approach_delta = dist_before - dist_after
         approach_delta = torch.where(
             torch.isinf(dist_before) | torch.isinf(dist_after),
@@ -315,12 +265,8 @@ class BatchedGridWorld:
             + give_rewards + predator_kill_rewards + hierarchy_rewards
             + damage_pain + low_hp_penalty + approach_reward + survival_bonus
         )
-        T['rewards'] += time.time() - _t
 
-        _t = time.time()
         observations = self._get_all_observations()
-        T['observations'] += time.time() - _t
-
         dones = ~self.agent_alive  # [n_envs, n_agents]
 
         # Episode termination
@@ -348,7 +294,6 @@ class BatchedGridWorld:
         terminal_relationships = list(self.partner_relationships) if episode_done.any() else None
 
         # Auto-reset finished envs (obs already captured above)
-        _t = time.time()
         if episode_done.any():
             self._masked_reset(episode_done, is_initial=False)
             # Overwrite observations for reset envs with fresh state
@@ -361,7 +306,6 @@ class BatchedGridWorld:
                 )
                 for key in observations
             }
-        T['reset'] += time.time() - _t
 
         # Decomposed rewards
         survival_rewards = damage_pain + low_hp_penalty + death_rewards
@@ -1163,9 +1107,10 @@ class BatchedGridWorld:
         # Rank via argsort of argsort (rank 0 = lowest score)
         ranks = score.argsort(dim=1).argsort(dim=1).float()
 
-        # Reward: linear from 0 (bottom) to r_hierarchy (top)
+        # Reward: linear from -r_hierarchy (bottom) to +r_hierarchy (top)
+        # Bottom 50% get negative rewards, top 50% get positive
         denom = (n_active - 1).clamp(min=1.0).unsqueeze(1)
-        rewards = (ranks / denom) * cfg.r_hierarchy * alive
+        rewards = (2.0 * ranks / denom - 1.0) * cfg.r_hierarchy * alive
 
         # Zero out invalid envs (< 2 active agents)
         rewards = rewards * valid_env.unsqueeze(1).float()

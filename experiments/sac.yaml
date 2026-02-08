@@ -1,0 +1,86 @@
+experiment:
+  name: "sac"
+  description: "Discrete SAC training: off-policy with automatic entropy tuning"
+
+# Environment
+grid_size: 6
+n_agents: 4
+max_hp: 100.0
+hp_decay_rate: 0.01
+attack_damage_fraction: 0.5
+max_steps_per_episode: 64
+
+# Action space
+n_directions: 5
+n_action_types: 5
+
+# Entity tokens
+max_food_tokens: 16
+fourier_bands: 4
+
+# Attention
+attention_embed_dim: 64
+attention_num_heads: 4
+group_embed_dim: 16
+
+# Food
+poor_food_value: 10.0
+rich_food_value: 30.0
+poor_food_spawn_rate: 0.0025
+rich_food_spawn_rate: 0.05
+food_coverage_cap: 0.1
+
+# Rewards
+r_small: 2.0
+r_large: 10.0
+r_attack_mult: 0.5
+r_damage_taken: -1.0
+r_low_hp: -1
+r_food_share: 0.0
+r_betrayal: 0.0
+r_reciprocity: 0.0
+r_defense: 0.0
+r_revenge: 0
+r_survival: 0.0
+r_death: -1000
+r_coop_attempt: 0
+r_approach_food: 0
+r_ally_proximity: 0.0
+
+# Social hierarchy
+r_hierarchy: 1
+hierarchy_food_weight: 1.0
+hierarchy_damage_weight: 1.0
+hierarchy_hp_weight: 1.0
+
+# SAC Hyperparameters
+sac_learning_rate: 0.0003
+sac_tau: 0.005
+sac_alpha_init: 0.2
+sac_auto_alpha: true
+sac_target_entropy_scale: 0.5
+sac_gamma: 0.99
+sac_buffer_size: 500000
+sac_batch_size: 256
+sac_learning_starts: 5000
+sac_update_frequency: 1
+sac_target_update_interval: 1
+
+# Training
+total_timesteps: 5_000_000
+seed: 42
+n_envs: 8
+
+# Pretraining
+pretrain_mode: false
+curriculum_enabled: false
+
+# Predator
+n_predators: 1
+predator_hp_mult: 0.5
+predator_damage: 10.0
+predator_kill_reward: 5.0
+predator_respawn_steps: 20
+
+training:
+  output_dir: sac_output

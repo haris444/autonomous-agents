@@ -210,20 +210,7 @@ def train_vec(
     last_partner_info = None
     from ledger import Ledger
 
-    # Timing accumulators for profiling
-    t_rollout_total = 0.0
-    t_update_total = 0.0
-    t_gae_total = 0.0
-    t_other_total = 0.0
-    # Sub-rollout timing accumulators
-    t_masks_total = 0.0
-    t_forward_total = 0.0
-    t_env_step_total = 0.0
-    t_buffer_total = 0.0
-    timing_interval = 5  # Print timing breakdown every N updates
-
     for update in range(num_updates):
-        t_iter_start = time.time()
 
         # Get current phase and scenario
         phase = vec_env.get_curriculum_phase()
@@ -237,7 +224,6 @@ def train_vec(
             scenario_config = None
 
         # === ROLLOUT PHASE ===
-        t_rollout_start = time.time()
         buffer.reset()  # Reset buffer, but NOT the environments!
 
         # Apply scenario on first update or whenever phase changes
@@ -251,16 +237,12 @@ def train_vec(
 
             with torch.no_grad():
                 # Get action masks [n_envs, n_agents, 5]
-                _t0 = time.time()
                 direction_mask, action_type_mask = vec_env.get_action_masks()
-                t_masks_total += time.time() - _t0
 
                 # Get actions, values, and aux values in single forward pass
-                _t0 = time.time()
                 directions, action_types, log_probs, _, values, aux_values = multi_agent.vec_get_actions_and_values(
                     obs, direction_mask=direction_mask, action_type_mask=action_type_mask
                 )
-                t_forward_total += time.time() - _t0
 
             # Apply scripted partner behavior (phase 10+: per-env relationship)
             if scenario_config is not None and scenario_config.partner_mode == "scripted":
@@ -295,9 +277,7 @@ def train_vec(
                                 aux_values=aux_np)
 
             # Environment step
-            _t0 = time.time()
             next_obs, rewards, dones, infos = vec_env.step(directions, action_types)
-            t_env_step_total += time.time() - _t0
 
             # Update recorded step with rewards
             if recording_active and recorder.steps:
@@ -309,8 +289,7 @@ def train_vec(
             episode_rewards += rewards
             episode_steps += 1
 
-            # Store in buffer (timed together with episode tracking)
-            _t0 = time.time()
+            # Store in buffer
             buffer.store(
                 obs, directions, action_types, log_probs,
                 rewards, dones, values,
@@ -383,13 +362,9 @@ def train_vec(
                         episode_rewards[e] = 0
                         episode_steps[e] = 0
 
-            t_buffer_total += time.time() - _t0
-
             obs = next_obs
 
         # === COMPUTE GAE ===
-        t_rollout_end = time.time()
-        t_rollout_total += t_rollout_end - t_rollout_start
         with torch.no_grad():
             _, _, _, _, next_values, next_aux = multi_agent.vec_get_actions_and_values(obs)
             next_dones = torch.zeros(n_envs, config.n_agents, device=device)  # Not terminal yet
@@ -402,13 +377,7 @@ def train_vec(
         )
 
         # === PPO UPDATE ===
-        t_gae_end = time.time()
-        t_gae_total += t_gae_end - t_rollout_end
-        t_update_start = time.time()
         metrics = multi_agent.update_from_vec_buffer(buffer)
-
-        t_update_end = time.time()
-        t_update_total += t_update_end - t_update_start
 
         # === LOGGING ===
         elapsed = time.time() - start_time
@@ -435,9 +404,6 @@ def train_vec(
             rel = p['rel'].upper()[:3]
             partner_str = f" | Partner[{rel}]: food={p['food']:.0f} coop={p['coop']:.0f} def={p['def']:.0f} dmg={p['dmg']:.0f}"
 
-        # Track "other" time (logging, viz, checkpointing)
-        t_other_start = time.time()
-
         print(f"Update {update}/{num_updates} | "
               f"{phase_str} | "
               f"Ep: {completed_episodes} | "
@@ -445,27 +411,6 @@ def train_vec(
               f"SPS: {sps:.0f} | "
               f"Loss: {metrics.get('total_loss', 0):.3f}"
               f"{partner_str}")
-
-        # Print timing breakdown every update (all per-update, reset after print)
-        t_total = t_rollout_total + t_gae_total + t_update_total + t_other_total
-        if t_total > 0:
-            print(f"  [Timing] Rollout: {t_rollout_total:.2f}s ({100*t_rollout_total/t_total:.0f}%) | "
-                  f"GAE: {t_gae_total:.2f}s ({100*t_gae_total/t_total:.0f}%) | "
-                  f"Update: {t_update_total:.2f}s ({100*t_update_total/t_total:.0f}%) | "
-                  f"Other: {t_other_total:.2f}s ({100*t_other_total/t_total:.0f}%)")
-            t_rollout_sub = t_masks_total + t_forward_total + t_env_step_total + t_buffer_total
-            if t_rollout_sub > 0:
-                print(f"  [Rollout breakdown] Masks: {t_masks_total:.2f}s ({100*t_masks_total/t_rollout_sub:.0f}%) | "
-                      f"Forward: {t_forward_total:.2f}s ({100*t_forward_total/t_rollout_sub:.0f}%) | "
-                      f"EnvStep: {t_env_step_total:.2f}s ({100*t_env_step_total/t_rollout_sub:.0f}%) | "
-                      f"Buffer+Other: {t_buffer_total:.2f}s ({100*t_buffer_total/t_rollout_sub:.0f}%)")
-            env_timing = vec_env.get_step_timing_str()
-            if env_timing:
-                print(f"  [EnvStep breakdown] {env_timing}")
-
-        # Reset all timers so next update shows per-update numbers
-        t_rollout_total = t_gae_total = t_update_total = t_other_total = 0.0
-        t_masks_total = t_forward_total = t_env_step_total = t_buffer_total = 0.0
 
         if csv_writer:
             loss_val = metrics.get('total_loss', 0)
@@ -507,10 +452,6 @@ def train_vec(
                 curves_path = f"{output_dir}/training_curves.png"
                 fig_curves.savefig(curves_path, dpi=100, bbox_inches='tight')
                 plt.close(fig_curves)
-
-        t_other_total += time.time() - t_other_start
-
-    # Final timing summary (last update only, since timers reset each update)
 
     # Final summary
     elapsed = time.time() - start_time
