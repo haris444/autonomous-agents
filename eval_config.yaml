@@ -1,0 +1,60 @@
+checkpoint: "run3/checkpoint_ep1330.pt"
+
+profiling:
+  episodes: 1          # Episodes to build agent profiles (averaged)
+
+evaluation:
+  episodes_per_scenario: 1
+  greedy: false         # false = sample from policy, true = argmax
+
+scenarios:
+  - name: "Free-for-all"
+    type: "social"
+    params:
+      n_agents: 8
+      inject_histories: false
+      n_rich_food: 5
+
+  - name: "Social (coherent histories)"
+    type: "social"
+    params:
+      n_agents: 8
+      inject_histories: true
+      coherent_histories: true
+      n_rich_food: 5
+
+  - name: "2-Team Battle"
+    type: "team"
+    params:
+      n_agents: 8
+      num_teams: 2
+
+  - name: "4-Team Battle"
+    type: "team"
+    params:
+      n_agents: 8
+      num_teams: 4
+
+  - name: "Cooperation Pairs"
+    type: "coop"
+    params:
+      distance: 3
+      n_rich_food: 5
+
+  - name: "Scarce Resources"
+    type: "social"
+    params:
+      n_agents: 8
+      inject_histories: false
+      n_rich_food: 0
+
+output:
+  directory: "./eval_results"
+
+device: "auto"   # "auto", "cuda", or "cpu"
+
+personality:
+  aggressive_threshold: 0.15
+  cooperative_threshold: 0.20
+  forager_threshold: 0.60
+  passive_stay_threshold: 0.40

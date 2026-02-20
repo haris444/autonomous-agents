@@ -6,25 +6,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Multi-agent reinforcement learning system investigating whether complex social behaviors (cooperation, altruism, tribalism, policing) can emerge from simple survival instincts. Agents live in a GridWorld, compete for food, and maintain a shared **Ledger** of objective interaction history. Built from scratch in PyTorch (CleanRL-style PPO), no RL framework dependencies.
 
+## Project Structure
+
+```
+core/           Foundation modules (Config, Ledger, utils)
+env/            Environment implementations (GridWorld, BatchedGridWorld, VecEnv)
+agents/         Networks + RL algorithms (ActorCritic, PPO, SAC, buffers)
+training/       Training entry-point scripts (train.py, train_vec.py, train_sac.py, scenarios)
+analysis/       Diagnostics, evaluation, visualization
+experiments/    YAML configs (configs/) + experiment runners
+tests/          Correctness tests + benchmarks
+docs/           PROJECT_SPEC.md, ARCHITECTURE.md
+results/        All outputs (runs/, ablation/, replays/, plots/, journal/)
+```
+
 ## Commands
 
 ```bash
 # Single-environment training
-python train.py
-python train.py --visualize                    # with live rendering
-python train.py --visualize --render-every 50  # render every N updates
+python -m training.train
+python -m training.train --visualize                    # with live rendering
+python -m training.train --visualize --render-every 50  # render every N updates
 
 # Vectorized multi-environment training (faster)
-python train_vec.py --n_envs 8 --pretrain
-python train_vec.py --n_envs 16 --batch_size 1024
+python -m training.train_vec --n_envs 8 --pretrain
+python -m training.train_vec --n_envs 16 --batch_size 1024
+
+# SAC training
+python -m training.train_sac --experiment experiments/configs/sac.yaml --visualize
 
 # Visualize a saved checkpoint
-python visualize_checkpoint.py --checkpoint path/to/checkpoint.pt
+python -m analysis.visualize_checkpoint --checkpoint path/to/checkpoint.pt
 
 # Diagnostics
-python diagnose_social.py
-python diagnose_spatial.py
-python diagnose_friend_foe.py
+python -m analysis.diagnose_social
+python -m analysis.diagnose_spatial
+python -m analysis.diagnose_friend_foe
+
+# Run experiments
+python -m experiments.run_experiment experiments/configs/my_experiment.yaml
 ```
 
 Dependencies: `pip install -r requirements.txt` (torch>=2.0.0, numpy, matplotlib)
@@ -41,21 +61,30 @@ Config → Environment(GridWorld) → Observations → Network(ActorCritic) → 
 
 ### Key Modules
 
-- **`environment.py`** — Fully vectorized GridWorld with PyTorch tensors (no Python loops). Single-occupancy grid, HP decay, poor food (solo) vs rich food (requires 2+ agents). Movement uses "Heavyweight Rule" (highest HP wins contested cells).
+- **`env/environment.py`** — Fully vectorized GridWorld with PyTorch tensors (no Python loops). Single-occupancy grid, HP decay, poor food (solo) vs rich food (requires 2+ agents). Movement uses "Heavyweight Rule" (highest HP wins contested cells).
 
-- **`ledger.py`** — `[n_agents × n_agents × 4]` tensor storing objective facts: damage dealt, food given, coop count, defense score. Core design principle: store actions, not relationships — agents derive feelings from facts.
+- **`core/ledger.py`** — `[n_agents × n_agents × 4]` tensor storing objective facts: damage dealt, food given, coop count, defense score. Core design principle: store actions, not relationships — agents derive feelings from facts.
 
-- **`network.py`** — Two main classes:
+- **`agents/network.py`** — Two main classes:
   - `ObservationEncoder`: Fourier-encoded entity tokens (agents + food) processed through multi-head attention (4 heads, 64 dim), plus signal encoder and self-state encoder. Outputs 144-dim feature vector.
   - `ActorCritic`: Shared trunk → factored dual-action heads (direction: 5, action type: 5) + value head + auxiliary value heads for decomposed rewards (survival/resource/social).
 
-- **`ppo.py`** — Three variants: `PPO` (single agent), `IndependentPPO` (N independent networks, supports clone mode for curriculum), `VmapPPO` (vectorized across parallel envs).
+- **`agents/ppo.py`** — Three variants: `PPO` (single agent), `IndependentPPO` (N independent networks, supports clone mode for curriculum), `VmapPPO` (vectorized across parallel envs).
 
-- **`buffer.py`** — `RolloutBuffer` / `VecBuffer` for trajectory storage and GAE advantage computation.
+- **`agents/buffer.py`** — `RolloutBuffer` / `VecBuffer` for trajectory storage and GAE advantage computation.
 
-- **`scenarios.py`** — Curriculum system with progressive phases: solo food-finding (phases 1-5), then cooperative rich-food scenarios (phases 6+). Auto-advances based on return thresholds.
+- **`training/scenarios.py`** — Curriculum system with progressive phases: solo food-finding (phases 1-5), then cooperative rich-food scenarios (phases 6+). Auto-advances based on return thresholds.
 
-- **`config.py`** — Centralized `Config` dataclass with all hyperparameters.
+- **`core/config.py`** — Centralized `Config` dataclass with all hyperparameters.
+
+### Import Convention
+
+All packages have `__init__.py` re-exports. Use either style:
+```python
+from core.config import Config          # explicit
+from core import Config                 # via __init__.py
+from agents import ActorCritic, PPO     # via __init__.py
+```
 
 ### Factored Action Space
 
