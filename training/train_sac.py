@@ -308,7 +308,7 @@ def train_sac(
 
             if csv_writer:
                 csv_writer.writerow([
-                    env_step, global_step, f'{avg_return:.2f}', completed_episodes,
+                    env_step, global_step, f'{last_return:.2f}', completed_episodes,
                     phase, f'{sps:.0f}', f'{elapsed:.1f}',
                     f"{last_metrics.get('critic_loss', 0):.4f}",
                     f"{last_metrics.get('actor_loss', 0):.4f}",
