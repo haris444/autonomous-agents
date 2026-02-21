@@ -285,20 +285,20 @@ def train_sac(
         if env_step % 10 == 0 and env_step > 0:
             elapsed = time.time() - start_time
             sps = global_step / max(1, elapsed)
-            avg_return = sum(total_returns[-100:]) / max(1, len(total_returns[-100:]))
+            last_return = total_returns[-1] if total_returns else 0.0
             buf_size = len(replay_buffer)
 
             # Phase info
             if config.pretrain_mode:
                 thresh = THRESHOLDS.get(phase, 0)
-                phase_str = f"Phase {phase} ({avg_return:.0f}/{thresh})"
+                phase_str = f"Phase {phase} ({last_return:.0f}/{thresh})"
             else:
                 phase_str = f"Phase {phase}"
 
             print(f"Step {global_step:,} | "
                   f"{phase_str} | "
                   f"Ep: {completed_episodes} | "
-                  f"Avg Return: {avg_return:.1f} | "
+                  f"Return: {last_return:.1f} | "
                   f"SPS: {sps:.0f} | "
                   f"Buffer: {buf_size:,} | "
                   f"Updates: {update_count} | "
