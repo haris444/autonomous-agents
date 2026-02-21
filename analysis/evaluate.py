@@ -6,8 +6,8 @@ personality based on behavioral tendencies, then evaluates them across varied
 scenarios to see which personality types perform best.
 
 Supports:
-- PPO checkpoints (IndependentPPO / VmapPPO / shared-weight)
-- SAC checkpoints (IndependentSAC)
+- PPO checkpoints (SharedTrunkActorCritic via PPO)
+- SAC checkpoints (SharedTrunkActorCritic via SAC)
 - Predator behavior metrics (kills, damage dealt/taken)
 - Social hierarchy ranking
 
@@ -26,8 +26,8 @@ import yaml
 from core.config import Config
 from env.environment import GridWorld
 from core.ledger import Ledger
-from agents.ppo import IndependentPPO, VmapPPO, load_state_dict_flexible
-from agents.sac import IndependentSAC
+from agents.ppo import PPO
+from agents.sac import SAC
 from training.scenarios import SocialScenario, MultiTeamScenario, CoopFoodScenario
 
 # Action / direction names matching the factored action space
@@ -76,11 +76,10 @@ class EvaluationRunner:
         self.profiling_episodes = self.yaml_cfg['profiling']['episodes']
         self.thresholds = self.yaml_cfg.get('personality', {})
 
-        self.multi_agent = None  # IndependentPPO, VmapPPO, or None (SAC)
-        self.sac = None          # IndependentSAC or None
-        self.algo = 'ppo'        # 'ppo' or 'sac'
+        self.ppo = None   # PPO or None
+        self.sac = None   # SAC or None
+        self.algo = 'ppo'  # 'ppo' or 'sac'
         self.config: Optional[Config] = None
-        self.shared_weights = False  # True when all agents share one network
 
     # ------------------------------------------------------------------
     # Checkpoint loading
@@ -98,35 +97,22 @@ class EvaluationRunner:
             self.config = raw_cfg
 
         # --- SAC checkpoint detection ---
-        if 'sac_state' in ckpt or ('actor_state_dicts' in ckpt and 'network_state_dicts' not in ckpt):
+        if 'sac_state' in ckpt:
             self.algo = 'sac'
-            self.sac = IndependentSAC(self.config, self.device)
-            sac_state = ckpt.get('sac_state', ckpt)
-            self.sac.load_state_dict(sac_state)
-            for actor in self.sac.actors:
-                actor.eval()
-            mode = "SAC (independent actors)"
+            self.sac = SAC(self.config, self.device)
+            self.sac.load_state_dict(ckpt['sac_state'])
+            self.sac.actor.eval()
+            mode = "SAC (shared trunk)"
         # --- PPO checkpoint detection ---
-        elif 'network_state_dicts' in ckpt:
-            # Independent networks -> use VmapPPO for parallel inference
-            self.multi_agent = VmapPPO(self.config, self.device)
-            for i, sd in enumerate(ckpt['network_state_dicts']):
-                load_state_dict_flexible(self.multi_agent.networks[i], sd)
-            for net in self.multi_agent.networks:
-                net.eval()
-            self.multi_agent.base_network.eval()
-            mode = "PPO independent (vmap)"
-        elif 'model_state_dict' in ckpt:
-            # train_vec.py format: single network -> use batched path
-            self.multi_agent = IndependentPPO(self.config, self.device)
-            load_state_dict_flexible(self.multi_agent.networks[0], ckpt['model_state_dict'])
-            self.multi_agent.networks[0].eval()
-            self.shared_weights = True
-            mode = "PPO shared (batched)"
+        elif 'network_state_dict' in ckpt:
+            self.algo = 'ppo'
+            self.ppo = PPO(self.config, self.device)
+            self.ppo.network.load_state_dict(ckpt['network_state_dict'])
+            self.ppo.network.eval()
+            mode = "PPO (shared trunk)"
         else:
             raise ValueError("Checkpoint has no recognized format "
-                             "(expected 'sac_state', 'actor_state_dicts', "
-                             "'network_state_dicts', or 'model_state_dict')")
+                             "(expected 'sac_state' or 'network_state_dict')")
 
         print(f"Loaded {self.config.n_agents} agent networks [{mode}] "
               f"(grid {self.config.grid_size}x{self.config.grid_size})")
@@ -195,15 +181,10 @@ class EvaluationRunner:
         n_active = sc.n_active_agents
         n = self.config.n_agents
 
-        # Choose inference path
-        if self.algo == 'sac':
-            get_actions = self._sac_actions
-        elif self.shared_weights:
-            get_actions = self._batched_actions
-        else:
-            self.multi_agent.set_n_active(n_active)
-            self.multi_agent.set_clone_mode(sc.clone_mode)
-            get_actions = self._vmap_actions
+        # Configure PPO for this scenario's n_active and clone_mode
+        if self.algo == 'ppo':
+            self.ppo.set_n_active(n_active)
+            self.ppo.set_clone_mode(sc.clone_mode)
 
         trackers = [{
             'steps_alive': 0,
@@ -219,7 +200,18 @@ class EvaluationRunner:
             dir_mask, act_mask = env.get_action_masks()
 
             with torch.no_grad():
-                dirs, acts = get_actions(obs, dir_mask, act_mask, n_active)
+                if self.algo == 'ppo':
+                    dirs, acts, _, _, _ = self.ppo.get_actions_and_values(
+                        obs, dir_mask, act_mask
+                    )
+                else:
+                    # SAC path: add env batch dim [1, n_agents, ...]
+                    obs_batched = {k: v.unsqueeze(0) for k, v in obs.items()}
+                    dirs, acts = self.sac.get_actions(
+                        obs_batched, deterministic=self.greedy
+                    )
+                    dirs = dirs.squeeze(0)
+                    acts = acts.squeeze(0)
 
             obs, rewards, dones, infos = env.step(dirs, acts)
 
@@ -264,116 +256,6 @@ class EvaluationRunner:
             trackers[i]['hierarchy_rank'] = int(ranks[i].item())
 
         return trackers[:n_active]
-
-    # ------------------------------------------------------------------
-    # Action selection paths
-    # ------------------------------------------------------------------
-    def _sac_actions(self, obs, dir_mask, act_mask, n_active):
-        """SAC path: sequential per-actor forward pass."""
-        from torch.distributions import Categorical
-        LARGE_NEG = -1e8
-        n = self.config.n_agents
-
-        dirs = torch.full((n,), 4, device=self.device, dtype=torch.long)
-        acts = torch.zeros(n, device=self.device, dtype=torch.long)
-
-        for i in range(n_active):
-            obs_i = {k: v[i:i+1] for k, v in obs.items()}
-            dir_logits, act_logits, _ = self.sac.actors[i](obs_i)
-
-            if dir_mask is not None:
-                dir_logits = dir_logits.masked_fill(~dir_mask[i:i+1], LARGE_NEG)
-            if act_mask is not None:
-                act_logits = act_logits.masked_fill(~act_mask[i:i+1], LARGE_NEG)
-
-            if self.greedy:
-                dirs[i] = dir_logits.argmax(dim=-1).squeeze()
-                acts[i] = act_logits.argmax(dim=-1).squeeze()
-            else:
-                dirs[i] = Categorical(logits=dir_logits.squeeze(0)).sample()
-                acts[i] = Categorical(logits=act_logits.squeeze(0)).sample()
-
-        return dirs, acts
-
-    def _batched_actions(self, obs, dir_mask, act_mask, n_active):
-        """Fast path: one forward pass for all agents through shared network."""
-        from torch.distributions import Categorical
-        LARGE_NEG = -1e8
-        net = self.multi_agent.networks[0]
-
-        # obs is already [n_agents, ...] -- just slice to n_active and forward
-        obs_batch = {k: v[:n_active] for k, v in obs.items()}
-
-        if self.greedy:
-            dir_logits, act_logits, _ = net.forward(obs_batch)
-            if dir_mask is not None:
-                dir_logits = dir_logits.masked_fill(~dir_mask[:n_active], LARGE_NEG)
-            if act_mask is not None:
-                act_logits = act_logits.masked_fill(~act_mask[:n_active], LARGE_NEG)
-            dirs = dir_logits.argmax(dim=-1)
-            acts = act_logits.argmax(dim=-1)
-        else:
-            dirs, acts, _, _, _ = net.get_action_and_value(
-                obs_batch,
-                direction_mask=dir_mask[:n_active] if dir_mask is not None else None,
-                action_type_mask=act_mask[:n_active] if act_mask is not None else None,
-            )
-
-        # Pad inactive agents
-        if n_active < self.config.n_agents:
-            pad = self.config.n_agents - n_active
-            dirs = torch.cat([dirs, torch.full((pad,), 4, device=self.device, dtype=dirs.dtype)])
-            acts = torch.cat([acts, torch.zeros(pad, device=self.device, dtype=acts.dtype)])
-
-        return dirs, acts
-
-    def _vmap_actions(self, obs, dir_mask, act_mask, n_active):
-        """Fast path: vmap-parallel forward pass for independent networks."""
-        if self.greedy:
-            return self._vmap_greedy_actions(obs, dir_mask, act_mask, n_active)
-        dirs, acts, _, _, _ = self.multi_agent.get_actions_and_values(obs, dir_mask, act_mask)
-        return dirs, acts
-
-    def _vmap_greedy_actions(self, obs, dir_mask, act_mask, n_active):
-        """Deterministic action selection via vmap forward + masked argmax."""
-        import torch.func as func
-
-        LARGE_NEG = -1e8
-        ma = self.multi_agent  # VmapPPO instance
-
-        # In clone mode, fall back to single-network batched forward
-        if ma.clone_mode:
-            net = ma.networks[0]
-            obs_batch = {k: v[:n_active] for k, v in obs.items()}
-            dir_logits, act_logits, _ = net.forward(obs_batch)
-        else:
-            # Stack params and vmap forward
-            params, buffers = ma._get_stacked_params()
-            stacked_obs = {k: v[:n_active].unsqueeze(1) for k, v in obs.items()}
-
-            def forward_single(params, buffers, obs_i):
-                return func.functional_call(ma.base_network, (params, buffers), args=(obs_i,))
-
-            batched_forward = func.vmap(forward_single, in_dims=(0, 0, 0))
-            dir_logits, act_logits, _ = batched_forward(params, buffers, stacked_obs)
-            dir_logits = dir_logits.squeeze(1)
-            act_logits = act_logits.squeeze(1)
-
-        if dir_mask is not None:
-            dir_logits = dir_logits.masked_fill(~dir_mask[:n_active], LARGE_NEG)
-        if act_mask is not None:
-            act_logits = act_logits.masked_fill(~act_mask[:n_active], LARGE_NEG)
-
-        dirs = dir_logits.argmax(dim=-1)
-        acts = act_logits.argmax(dim=-1)
-
-        # Pad inactive agents
-        if n_active < self.config.n_agents:
-            pad = self.config.n_agents - n_active
-            dirs = torch.cat([dirs, torch.full((pad,), 4, device=self.device, dtype=dirs.dtype)])
-            acts = torch.cat([acts, torch.zeros(pad, device=self.device, dtype=acts.dtype)])
-
-        return dirs, acts
 
     # ------------------------------------------------------------------
     # Personality classification

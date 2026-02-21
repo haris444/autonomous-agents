@@ -7,7 +7,7 @@ if the network responds differently (moves toward food).
 import torch
 import torch.nn.functional as F
 from core.config import Config
-from agents.network import ActorCritic
+from agents.network import SharedTrunkActorCritic
 
 def fourier_encode(dx, dy, device):
     """Encode position using Fourier features (matching environment)."""
@@ -82,7 +82,7 @@ def main():
     config = Config()
 
     # Load trained model
-    model = ActorCritic(config).to(device)
+    model = SharedTrunkActorCritic(config).to(device)
 
     # Try to load checkpoint - use the test model we just trained
     import os
@@ -95,8 +95,8 @@ def main():
     for path in checkpoint_paths:
         if os.path.exists(path):
             checkpoint = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dicts' in checkpoint:
-                state_dict = checkpoint['network_state_dicts'][0]
+            if 'network_state_dict' in checkpoint:
+                state_dict = checkpoint['network_state_dict']
             elif 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']
             else:
@@ -139,29 +139,22 @@ def main():
         for pos in test_positions:
             obs = create_synthetic_obs(config, pos, device)
 
-            # Get raw features from encoder
-            features = model.encoder(
-                obs['entity_tokens'],
-                obs['entity_mask'],
-                obs['signals'],
-                obs['self_hp'],
-                obs['agent_id']
-            )
+            # Get hidden features (encoder + trunk)
+            hidden = model.encode(obs)
 
-            # Get action logits
-            hidden = model.shared(features)
-            move_logits = model.move_head(hidden)
+            # Get action logits via per-agent heads (agent 0)
+            dir_logits, act_logits, value = model.apply_heads(hidden, 0)
 
             # Get move probabilities
-            move_probs = F.softmax(move_logits, dim=-1).squeeze()
+            move_probs = F.softmax(dir_logits, dim=-1).squeeze()
 
             results.append({
                 'pos': pos,
-                'feat_mean': features.mean().item(),
-                'feat_std': features.std().item(),
-                'feat_norm': features.norm().item(),
+                'feat_mean': hidden.mean().item(),
+                'feat_std': hidden.std().item(),
+                'feat_norm': hidden.norm().item(),
                 'move_probs': move_probs.cpu().numpy(),
-                'features': features.squeeze().cpu()
+                'features': hidden.squeeze().cpu()
             })
 
     # Print results

@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from core.config import Config
 from env.batched_env import BatchedGridWorld as VecEnv
-from agents.ppo import VmapPPO, load_state_dict_flexible
+from agents.ppo import PPO
 from agents.buffer import VecBuffer
 from training.scenarios import CURRICULUM, THRESHOLDS
 from training.train import apply_scripted_partner
@@ -107,38 +107,20 @@ def train_vec(
     vec_env = VecEnv(config, device, n_envs=n_envs)
 
     # Initialize PPO
-    multi_agent = VmapPPO(config, device)
+    multi_agent = PPO(config, device)
 
     # Load checkpoint if provided
     if checkpoint_path is not None:
         print(f"Loading checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-        if 'network_state_dicts' in ckpt:
-            # New format: per-agent state dicts
-            weights_resized = False
-            for i, net in enumerate(multi_agent.networks):
-                if i < len(ckpt['network_state_dicts']):
-                    weights_resized |= load_state_dict_flexible(net, ckpt['network_state_dicts'][i])
-                else:
-                    weights_resized |= load_state_dict_flexible(net, ckpt['network_state_dicts'][0])
-            if weights_resized:
-                print("  Skipping optimizer state (weight shapes changed)")
-            elif 'optimizer_state_dicts' in ckpt:
-                for i, opt in enumerate(multi_agent.optimizers):
-                    if i < len(ckpt['optimizer_state_dicts']):
-                        opt.load_state_dict(ckpt['optimizer_state_dicts'][i])
+        if 'network_state_dict' in ckpt:
+            multi_agent.network.load_state_dict(ckpt['network_state_dict'])
+            if 'optimizer_state_dict' in ckpt:
+                multi_agent.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         else:
-            # Legacy format: single state dict → replicate to all networks
-            state_dict = ckpt['model_state_dict']
-            weights_resized = False
-            for net in multi_agent.networks:
-                weights_resized |= load_state_dict_flexible(net, state_dict)
-            if not weights_resized:
-                multi_agent.optimizers[0].load_state_dict(ckpt['optimizer_state_dict'])
-            else:
-                print("  Skipping optimizer state (weight shapes changed)")
-        # Restore curriculum phase if saved
+            print("  Warning: unrecognized checkpoint format")
+
         if 'curriculum_phase' in ckpt:
             vec_env.set_curriculum_phase(ckpt['curriculum_phase'])
             print(f"  Resumed from episode {ckpt['episode']}, phase {ckpt['curriculum_phase']}, "
@@ -146,7 +128,6 @@ def train_vec(
         else:
             print(f"  Resumed from episode {ckpt['episode']}, global_step {ckpt['global_step']}, "
                   f"avg_return {ckpt['avg_return']:.1f}")
-            print(f"  Warning: checkpoint has no curriculum_phase, starting at phase {vec_env.get_curriculum_phase()}")
 
     # Override curriculum phase if specified
     if start_phase is not None:
@@ -347,10 +328,8 @@ def train_vec(
                             checkpoint_path = f"{output_dir}/checkpoint_ep{completed_episodes}.pt"
                             torch.save({
                                 'episode': completed_episodes,
-                                'model_state_dict': multi_agent.networks[0].state_dict(),
-                                'network_state_dicts': [net.state_dict() for net in multi_agent.networks],
-                                'optimizer_state_dict': multi_agent.optimizers[0].state_dict(),
-                                'optimizer_state_dicts': [opt.state_dict() for opt in multi_agent.optimizers],
+                                'network_state_dict': multi_agent.network.state_dict(),
+                                'optimizer_state_dict': multi_agent.optimizer.state_dict(),
                                 'avg_return': sum(total_returns[-10:]) / len(total_returns[-10:]),
                                 'global_step': global_step,
                                 'curriculum_phase': vec_env.get_curriculum_phase(),

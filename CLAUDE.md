@@ -11,7 +11,7 @@ Multi-agent reinforcement learning system investigating whether complex social b
 ```
 core/           Foundation modules (Config, Ledger, utils)
 env/            Environment implementations (GridWorld, BatchedGridWorld, VecEnv)
-agents/         Networks + RL algorithms (ActorCritic, PPO, SAC, buffers)
+agents/         Networks + RL algorithms (SharedTrunkActorCritic, PPO, SAC, buffers)
 training/       Training entry-point scripts (train.py, train_vec.py, train_sac.py, scenarios)
 analysis/       Diagnostics, evaluation, visualization
 experiments/    YAML configs (configs/) + experiment runners
@@ -54,7 +54,7 @@ Dependencies: `pip install -r requirements.txt` (torch>=2.0.0, numpy, matplotlib
 ### Core Pipeline
 
 ```
-Config → Environment(GridWorld) → Observations → Network(ActorCritic) → Actions → PPO Update
+Config → Environment(GridWorld) → Observations → SharedTrunkActorCritic → Actions → PPO/SAC Update
               ↕                                        ↑
            Ledger ──────── social history ──────────────┘
 ```
@@ -65,13 +65,15 @@ Config → Environment(GridWorld) → Observations → Network(ActorCritic) → 
 
 - **`core/ledger.py`** — `[n_agents × n_agents × 4]` tensor storing objective facts: damage dealt, food given, coop count, defense score. Core design principle: store actions, not relationships — agents derive feelings from facts.
 
-- **`agents/network.py`** — Two main classes:
-  - `ObservationEncoder`: Fourier-encoded entity tokens (agents + food) processed through multi-head attention (4 heads, 64 dim), plus signal encoder and self-state encoder. Outputs 144-dim feature vector.
-  - `ActorCritic`: Shared trunk → factored dual-action heads (direction: 5, action type: 5) + value head + auxiliary value heads for decomposed rewards (survival/resource/social).
+- **`agents/network.py`** — Shared trunk + per-agent heads architecture:
+  - `ObservationEncoder`: Fourier-encoded entity tokens processed through grouped projections → multi-head attention (4 heads, 64 dim), plus signal encoder and self-state encoder. Outputs 144-dim feature vector.
+  - `SharedTrunkActorCritic`: Shared encoder+trunk (144→256→128) with per-agent head parameters stored as stacked `nn.Parameter` tensors `[N, out_dim, 128]`. Supports three head application paths: `F.linear` (single agent), `bmm` (mixed agent batch), `einsum` (parallel all agents). Factored dual-action heads (direction: 5, action type: 5) + value head + auxiliary value heads (survival/resource/social).
 
-- **`agents/ppo.py`** — Three variants: `PPO` (single agent), `IndependentPPO` (N independent networks, supports clone mode for curriculum), `VmapPPO` (vectorized across parallel envs).
+- **`agents/ppo.py`** — Single unified `PPO` class wrapping `SharedTrunkActorCritic`. Supports both single-env and vec-env inference, with batched PPO update across all agents via `einsum`.
 
-- **`agents/buffer.py`** — `RolloutBuffer` / `VecBuffer` for trajectory storage and GAE advantage computation.
+- **`agents/sac.py`** — `SAC` with `SharedTrunkActorCritic` actor + `SharedTrunkCritic` (twin Q-heads). Per-agent entropy temperatures via stacked `log_alpha` parameters.
+
+- **`agents/buffer.py`** — `SingleAgentBuffer` / `VecBuffer` for trajectory storage and GAE advantage computation.
 
 - **`training/scenarios.py`** — Curriculum system with progressive phases: solo food-finding (phases 1-5), then cooperative rich-food scenarios (phases 6+). Auto-advances based on return thresholds.
 
@@ -83,7 +85,7 @@ All packages have `__init__.py` re-exports. Use either style:
 ```python
 from core.config import Config          # explicit
 from core import Config                 # via __init__.py
-from agents import ActorCritic, PPO     # via __init__.py
+from agents import SharedTrunkActorCritic, PPO, SAC  # via __init__.py
 ```
 
 ### Factored Action Space

@@ -20,7 +20,7 @@ from matplotlib.colors import LinearSegmentedColormap
 import argparse
 
 from core.config import Config
-from agents.network import ActorCritic
+from agents.network import SharedTrunkActorCritic
 from analysis.visualize import (
     classify_relationship, _get_target_from_direction,
     DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY,
@@ -36,16 +36,14 @@ def load_episode(path: str):
 
 def load_model(checkpoint_path: str, config: Config, agent_id: int = 0):
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    model = ActorCritic(config)
-    
-    if 'model_state_dict' in ckpt:
-        state_dict = ckpt['model_state_dict']
-    elif 'network_state_dicts' in ckpt:
-        state_dict = ckpt['network_state_dicts'][agent_id]
+    model = SharedTrunkActorCritic(config)
+
+    if 'network_state_dict' in ckpt:
+        state_dict = ckpt['network_state_dict']
     else:
         raise KeyError(f"Checkpoint missing model state dict. Keys: {ckpt.keys()}")
 
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
@@ -181,10 +179,22 @@ def reconstruct_observation(step, ledger, config, agent_id: int = 0):
     return obs, entity_info
 
 
+def _encode_tokens(encoder, raw_tokens):
+    """Run raw tokens through grouped projections and entity_embed."""
+    f = encoder.fourier_dim
+    fourier_proj = encoder.fourier_embed(raw_tokens[..., :f])
+    velocity_proj = encoder.velocity_embed(raw_tokens[..., f:f+2])
+    type_proj = encoder.type_embed(raw_tokens[..., f+2:f+4])
+    value_proj = encoder.value_embed(raw_tokens[..., f+4:f+5])
+    social_proj = encoder.social_embed(raw_tokens[..., f+5:f+9])
+    grouped = torch.cat([fourier_proj, velocity_proj, type_proj, value_proj, social_proj], dim=-1)
+    return encoder.entity_embed(grouped)
+
+
 def get_attention_weights(model, obs):
     """Get attention weights from the model."""
     with torch.no_grad():
-        tokens = model.encoder.entity_embed(obs['entity_tokens'])
+        tokens = _encode_tokens(model.encoder, obs['entity_tokens'])
         attn_mask = ~obs['entity_mask']
         _, attn_weights = model.encoder.entity_attention(
             tokens, tokens, tokens,
@@ -220,7 +230,7 @@ def get_attention_ablated(model, obs, ablate_position=False, ablate_social=False
     obs_modified = {**obs, 'entity_tokens': tokens_modified}
 
     with torch.no_grad():
-        tokens = model.encoder.entity_embed(obs_modified['entity_tokens'])
+        tokens = _encode_tokens(model.encoder, obs_modified['entity_tokens'])
         attn_mask = ~obs_modified['entity_mask']
         _, attn_weights = model.encoder.entity_attention(
             tokens, tokens, tokens,

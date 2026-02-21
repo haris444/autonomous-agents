@@ -16,7 +16,7 @@ import torch
 
 from core.config import Config
 from env.batched_env import BatchedGridWorld as VecEnv
-from agents.sac import IndependentSAC
+from agents.sac import SAC
 from agents.replay_buffer import ReplayBuffer
 from training.scenarios import CURRICULUM, THRESHOLDS
 
@@ -81,7 +81,7 @@ def train_sac(
     vec_env = VecEnv(config, device, n_envs=n_envs)
 
     # Initialize SAC
-    sac = IndependentSAC(config, device)
+    sac = SAC(config, device)
 
     # Training tracking (defaults, overridden by checkpoint below)
     start_env_step = 0
@@ -96,10 +96,7 @@ def train_sac(
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if 'sac_state' in ckpt:
             sac.load_state_dict(ckpt['sac_state'])
-            print("  Loaded SAC state (actors, critics, targets, alphas)")
-        elif 'actor_state_dicts' in ckpt:
-            sac.load_state_dict(ckpt)
-            print("  Loaded SAC state from flat checkpoint")
+            print("  Loaded SAC state (actor, critic, target, alphas)")
         if 'curriculum_phase' in ckpt:
             vec_env.set_curriculum_phase(ckpt['curriculum_phase'])
         # Restore counters

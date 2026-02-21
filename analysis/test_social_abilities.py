@@ -23,8 +23,8 @@ import torch.nn.functional as F
 from core.config import Config
 from env.environment import GridWorld
 from env.batched_env import BatchedGridWorld
-from agents.network import ActorCritic
-from agents.ppo import VmapPPO
+from agents.network import SharedTrunkActorCritic
+from agents.ppo import PPO
 from core.utils import get_device
 
 
@@ -240,35 +240,17 @@ class SocialTestRunner:
         # Detect checkpoint n_agents on first load
         self._checkpoint_n_agents: Optional[int] = None
         self._checkpoint_config: Optional[Config] = None
-        self._n_independent_agents: int = 1  # How many distinct networks in checkpoint
+        self._n_independent_agents: int = 1  # Single shared-trunk network
         self._detect_checkpoint_config()
 
         # Will be initialized per scenario
         self.env: Optional[GridWorld] = None
-        self.multi_agent: Optional[VmapPPO] = None
-
-    def _fix_state_dict_compatibility(self, state_dict: dict) -> dict:
-        """Fix architecture mismatches between checkpoint and current model."""
-        fixed = state_dict.copy()
-
-        # Fix self_encoder: older checkpoints have [64, 1] but current is [64, 2]
-        key = 'encoder.self_encoder.0.weight'
-        if key in fixed and fixed[key].shape[1] == 1:
-            old_weight = fixed[key]  # [64, 1]
-            # Expand to [64, 2] by repeating the HP weight for inventory
-            new_weight = torch.cat([old_weight, old_weight], dim=1)  # [64, 2]
-            fixed[key] = new_weight
-
-        return fixed
+        self.multi_agent: Optional[PPO] = None
 
     def _detect_checkpoint_config(self):
         """Detect the config used to train the checkpoint and cache it."""
         checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
         self._checkpoint_data = checkpoint  # Cache to avoid re-loading
-
-        # Detect number of independent networks
-        if 'network_state_dicts' in checkpoint:
-            self._n_independent_agents = len(checkpoint['network_state_dicts'])
 
         # Check if config is saved in checkpoint
         if 'config' in checkpoint:
@@ -281,8 +263,8 @@ class SocialTestRunner:
             return
 
         # Otherwise detect from state dict shapes
-        if 'network_state_dicts' in checkpoint:
-            state_dict = checkpoint['network_state_dicts'][0]
+        if 'network_state_dict' in checkpoint:
+            state_dict = checkpoint['network_state_dict']
         else:
             state_dict = checkpoint
 
@@ -311,22 +293,17 @@ class SocialTestRunner:
 
         # Create environment and policy
         self.env = GridWorld(self._test_config, self.device)
-        self.multi_agent = VmapPPO(self._test_config, self.device)
+        self.multi_agent = PPO(self._test_config, self.device)
 
         # Use cached checkpoint data
         checkpoint = self._checkpoint_data
-        if 'network_state_dicts' in checkpoint:
-            state_dict = checkpoint['network_state_dicts'][self.agent_idx]
-        elif 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
+        if 'network_state_dict' in checkpoint:
+            state_dict = checkpoint['network_state_dict']
         else:
             state_dict = checkpoint
 
-        state_dict = self._fix_state_dict_compatibility(state_dict)
-
-        for net in self.multi_agent.networks:
-            net.load_state_dict(state_dict, strict=False)
-            net.eval()
+        self.multi_agent.network.load_state_dict(state_dict, strict=False)
+        self.multi_agent.network.eval()
 
     def _ensure_model_loaded(self, n_agents_for_test: int):
         """Load model only if not already loaded with correct settings."""
@@ -501,7 +478,10 @@ class SocialTestRunner:
         attacks_at_provocation = torch.zeros(num_episodes, dtype=torch.long, device=self.device)
         provoked = False
 
-        net = self.multi_agent.networks[0]
+        net = self.multi_agent.network
+
+        # Agent indices for batched forward: [n_envs, n_agents] flattened to [n_envs*n_agents]
+        agent_ids = torch.arange(n_agents, device=self.device).unsqueeze(0).expand(num_episodes, -1).reshape(-1)
 
         # Precompute scripted actions (same for all envs since positions are identical)
         # We'll recompute per-step since positions may change
@@ -517,7 +497,7 @@ class SocialTestRunner:
             # Forward pass: flatten [n_envs, n_agents, ...] → [n_envs*n_agents, ...]
             with torch.no_grad():
                 flat_obs = {k: v.reshape(-1, *v.shape[2:]) for k, v in obs.items()}
-                dir_logits, act_logits, _ = net.forward(flat_obs)
+                dir_logits, act_logits, _ = net.forward(flat_obs, agent_indices=agent_ids)
 
                 # Reshape back: [n_envs*n_agents, 5] → [n_envs, n_agents, 5]
                 dir_logits = dir_logits.reshape(num_episodes, n_agents, -1)
@@ -1050,18 +1030,11 @@ class FeatureDistinctnessAnalyzer:
             'agent_id': agent_id,
         }
 
-    def extract_features(self, obs: Dict[str, torch.Tensor], network: ActorCritic) -> torch.Tensor:
-        """Extract encoder features from observation."""
+    def extract_features(self, obs: Dict[str, torch.Tensor], network: SharedTrunkActorCritic) -> torch.Tensor:
+        """Extract encoder+trunk features from observation."""
         with torch.no_grad():
-            features = network.encoder(
-                obs['entity_tokens'],
-                obs['entity_mask'],
-                obs['signals'],
-                obs['self_hp'],
-                obs['self_inventory'],
-                obs['agent_id']
-            )
-        return features  # [1, 144]
+            features = network.encode(obs)
+        return features  # [1, 128]
 
     def analyze(self) -> FeatureAnalysisResult:
         """Run feature distinctness analysis."""
@@ -1069,7 +1042,7 @@ class FeatureDistinctnessAnalyzer:
         if self.runner.multi_agent is None:
             self.runner.load_model(n_agents_for_test=2)
 
-        network = self.runner.multi_agent.networks[0]
+        network = self.runner.multi_agent.network
         network.eval()
 
         # Collect features for each scenario
@@ -1082,7 +1055,7 @@ class FeatureDistinctnessAnalyzer:
             features = self.extract_features(obs, network)
             all_features.append(features)
 
-        # Stack features [n_scenarios, 144]
+        # Stack features [n_scenarios, 128]
         all_features = torch.cat(all_features, dim=0)
 
         # Normalize to unit length for cosine similarity

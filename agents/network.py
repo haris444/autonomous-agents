@@ -2,8 +2,9 @@
 Neural Network architecture for Multi-Agent RL.
 
 ObservationEncoder: Unified Transformer over all entities (agents + food)
-ActorCritic: Factorized action heads (move, interact_type, direction) with value function
+SharedTrunkActorCritic: Shared encoder+trunk with per-agent heads
 """
+import math
 from typing import Dict, Tuple, Optional
 
 import torch
@@ -136,183 +137,182 @@ class ObservationEncoder(nn.Module):
         return combined
 
 
-class ActorCritic(nn.Module):
+class SharedTrunkActorCritic(nn.Module):
     """
-    Actor-Critic network with factored action space.
+    Shared encoder+trunk with per-agent action/value heads.
 
-    Direction head (5 outputs): UP=0, DOWN=1, LEFT=2, RIGHT=3, STAY=4
-    Action type head (5 outputs): MOVE=0, ATTACK=1, GIVE=2, SIGNAL=3, COOPERATE=4
+    Architecture:
+        ObservationEncoder (144-dim) -> Shared Trunk (144->256->128)
+        -> Per-Agent Heads (N sets of 6 linear layers, stored as stacked parameters)
 
-    Direction is ignored for SIGNAL and COOPERATE (non-directional actions).
+    Per-agent heads stored as stacked nn.Parameter tensors enabling
+    batched matmul (einsum/bmm) for parallel forward across all agents.
     """
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.encoder = ObservationEncoder(config)
+        self.n_agents = config.n_agents
 
-        # Shared trunk (ReLU to avoid Tanh saturation)
-        self.shared = nn.Sequential(
+        # Shared encoder + trunk
+        self.encoder = ObservationEncoder(config)
+        self.trunk = nn.Sequential(
             nn.Linear(self.encoder.output_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU()
         )
+        self.trunk_dim = 128
 
-        # Factored actor heads
-        self.direction_head = nn.Linear(128, config.n_directions)
-        self.action_type_head = nn.Linear(128, config.n_action_types)
+        N = config.n_agents
+        D = self.trunk_dim
+        n_dir = config.n_directions    # 5
+        n_act = config.n_action_types  # 5
 
-        # Critic head
-        self.value_head = nn.Linear(128, 1)
+        # Per-agent head parameters: [N, out_dim, D] weights + [N, out_dim] biases
+        # Policy heads (small init for exploration)
+        self.head_dir_w = nn.Parameter(torch.empty(N, n_dir, D))
+        self.head_dir_b = nn.Parameter(torch.empty(N, n_dir))
+        self.head_act_w = nn.Parameter(torch.empty(N, n_act, D))
+        self.head_act_b = nn.Parameter(torch.empty(N, n_act))
+        # Value head
+        self.head_val_w = nn.Parameter(torch.empty(N, 1, D))
+        self.head_val_b = nn.Parameter(torch.empty(N, 1))
+        # Auxiliary value heads
+        self.head_val_surv_w = nn.Parameter(torch.empty(N, 1, D))
+        self.head_val_surv_b = nn.Parameter(torch.empty(N, 1))
+        self.head_val_res_w = nn.Parameter(torch.empty(N, 1, D))
+        self.head_val_res_b = nn.Parameter(torch.empty(N, 1))
+        self.head_val_soc_w = nn.Parameter(torch.empty(N, 1, D))
+        self.head_val_soc_b = nn.Parameter(torch.empty(N, 1))
 
-        # Auxiliary value heads for decomposed reward streams
-        self.value_head_survival = nn.Linear(128, 1)
-        self.value_head_resource = nn.Linear(128, 1)
-        self.value_head_social = nn.Linear(128, 1)
-
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize network weights using orthogonal initialization."""
-        import math
-        for module in self.modules():
+        """Initialize all weights using orthogonal initialization."""
+        # Shared encoder + trunk: sqrt(2) gain for ReLU
+        for module in self.encoder.modules():
             if isinstance(module, nn.Linear):
-                # Use sqrt(2) gain for ReLU layers (He initialization equivalent)
+                nn.init.orthogonal_(module.weight, gain=math.sqrt(2))
+                nn.init.constant_(module.bias, 0.0)
+        for module in self.trunk.modules():
+            if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=math.sqrt(2))
                 nn.init.constant_(module.bias, 0.0)
 
-        # Smaller initialization for policy heads (helps with exploration)
-        nn.init.orthogonal_(self.direction_head.weight, gain=0.01)
-        nn.init.orthogonal_(self.action_type_head.weight, gain=0.01)
-        # Value head uses gain=1.0 (outputs should be in reasonable range initially)
-        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        # Per-agent heads: init template, clone to all N agents
+        self._init_head(self.head_dir_w, self.head_dir_b, gain=0.01)
+        self._init_head(self.head_act_w, self.head_act_b, gain=0.01)
+        self._init_head(self.head_val_w, self.head_val_b, gain=1.0)
+        self._init_head(self.head_val_surv_w, self.head_val_surv_b, gain=1.0)
+        self._init_head(self.head_val_res_w, self.head_val_res_b, gain=1.0)
+        self._init_head(self.head_val_soc_w, self.head_val_soc_b, gain=1.0)
 
-        # Auxiliary value heads also use gain=1.0
-        nn.init.orthogonal_(self.value_head_survival.weight, gain=1.0)
-        nn.init.orthogonal_(self.value_head_resource.weight, gain=1.0)
-        nn.init.orthogonal_(self.value_head_social.weight, gain=1.0)
-        nn.init.zeros_(self.value_head_survival.bias)
-        nn.init.zeros_(self.value_head_resource.bias)
-        nn.init.zeros_(self.value_head_social.bias)
+    def _init_head(self, weight, bias, gain):
+        """Init one template with orthogonal init, clone to all N agents."""
+        template_w = torch.empty(weight.shape[1], weight.shape[2])
+        nn.init.orthogonal_(template_w, gain=gain)
+        template_b = torch.zeros(bias.shape[1])
+        with torch.no_grad():
+            for i in range(self.n_agents):
+                weight[i].copy_(template_w)
+                bias[i].copy_(template_b)
 
-    def _encode(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Encode observations through encoder and shared trunk."""
+    def encode(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Shared encoder+trunk. Returns [B, 128]."""
         features = self.encoder(
-            obs['entity_tokens'],
-            obs['entity_mask'],
-            obs['signals'],
-            obs['self_hp'],
-            obs['self_inventory'],
-            obs['agent_id']
+            obs['entity_tokens'], obs['entity_mask'],
+            obs['signals'], obs['self_hp'],
+            obs['self_inventory'], obs['agent_id']
         )
-        return self.shared(features)
+        return self.trunk(features)
 
-    def forward(self, obs: Dict[str, torch.Tensor], return_aux: bool = False):
+    def apply_heads(self, hidden, agent_indices, return_aux=False):
         """
-        Forward pass returning raw logits and value.
+        Apply per-agent heads to trunk output.
 
         Args:
-            obs: Observation dictionary
-            return_aux: If True, also return auxiliary value head outputs
+            hidden: [B, 128] trunk output
+            agent_indices: int (single agent) or [B] long tensor (mixed agents)
+            return_aux: whether to return auxiliary value heads
 
         Returns:
-            direction_logits: [batch, n_directions] (5 directions)
-            action_type_logits: [batch, n_action_types] (5 action types)
-            value: [batch, 1]
-            (if return_aux) value_survival: [batch, 1]
-            (if return_aux) value_resource: [batch, 1]
-            (if return_aux) value_social: [batch, 1]
+            dir_logits [B, 5], act_logits [B, 5], value [B, 1]
+            (+ v_surv, v_res, v_soc each [B, 1] if return_aux)
         """
-        hidden = self._encode(obs)
-        direction_logits = self.direction_head(hidden)
-        action_type_logits = self.action_type_head(hidden)
-        value = self.value_head(hidden)
+        if isinstance(agent_indices, int):
+            # Single agent index — F.linear (efficient for per-agent training)
+            i = agent_indices
+            dir_logits = F.linear(hidden, self.head_dir_w[i], self.head_dir_b[i])
+            act_logits = F.linear(hidden, self.head_act_w[i], self.head_act_b[i])
+            value = F.linear(hidden, self.head_val_w[i], self.head_val_b[i])
+            if return_aux:
+                v_surv = F.linear(hidden, self.head_val_surv_w[i], self.head_val_surv_b[i])
+                v_res = F.linear(hidden, self.head_val_res_w[i], self.head_val_res_b[i])
+                v_soc = F.linear(hidden, self.head_val_soc_w[i], self.head_val_soc_b[i])
+                return dir_logits, act_logits, value, v_surv, v_res, v_soc
+            return dir_logits, act_logits, value
+        else:
+            # Mixed agent indices — gather + bmm
+            h = hidden.unsqueeze(-1)  # [B, 128, 1]
+            dir_logits = torch.bmm(self.head_dir_w[agent_indices], h).squeeze(-1) + self.head_dir_b[agent_indices]
+            act_logits = torch.bmm(self.head_act_w[agent_indices], h).squeeze(-1) + self.head_act_b[agent_indices]
+            value = torch.bmm(self.head_val_w[agent_indices], h).squeeze(-1) + self.head_val_b[agent_indices]
+            if return_aux:
+                v_surv = torch.bmm(self.head_val_surv_w[agent_indices], h).squeeze(-1) + self.head_val_surv_b[agent_indices]
+                v_res = torch.bmm(self.head_val_res_w[agent_indices], h).squeeze(-1) + self.head_val_res_b[agent_indices]
+                v_soc = torch.bmm(self.head_val_soc_w[agent_indices], h).squeeze(-1) + self.head_val_soc_b[agent_indices]
+                return dir_logits, act_logits, value, v_surv, v_res, v_soc
+            return dir_logits, act_logits, value
+
+    def apply_heads_parallel(self, hidden, n_active, return_aux=False):
+        """
+        Apply all agent heads in parallel via einsum.
+
+        Args:
+            hidden: [N, B, 128] per-agent hidden states
+            n_active: number of active agents to process
+
+        Returns shapes: [N, B, out_dim]
+        """
+        dir_logits = torch.einsum('noh,nbh->nbo', self.head_dir_w[:n_active], hidden) + self.head_dir_b[:n_active].unsqueeze(1)
+        act_logits = torch.einsum('noh,nbh->nbo', self.head_act_w[:n_active], hidden) + self.head_act_b[:n_active].unsqueeze(1)
+        value = torch.einsum('noh,nbh->nbo', self.head_val_w[:n_active], hidden) + self.head_val_b[:n_active].unsqueeze(1)
+
         if return_aux:
-            return (direction_logits, action_type_logits, value,
-                    self.value_head_survival(hidden),
-                    self.value_head_resource(hidden),
-                    self.value_head_social(hidden))
-        return direction_logits, action_type_logits, value
+            v_surv = torch.einsum('noh,nbh->nbo', self.head_val_surv_w[:n_active], hidden) + self.head_val_surv_b[:n_active].unsqueeze(1)
+            v_res = torch.einsum('noh,nbh->nbo', self.head_val_res_w[:n_active], hidden) + self.head_val_res_b[:n_active].unsqueeze(1)
+            v_soc = torch.einsum('noh,nbh->nbo', self.head_val_soc_w[:n_active], hidden) + self.head_val_soc_b[:n_active].unsqueeze(1)
+            return dir_logits, act_logits, value, v_surv, v_res, v_soc
+        return dir_logits, act_logits, value
 
-    def get_value(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Return value estimate only."""
-        hidden = self._encode(obs)
-        return self.value_head(hidden)
+    def forward(self, obs, agent_indices, return_aux=False):
+        """Full forward: encode + apply_heads."""
+        hidden = self.encode(obs)
+        return self.apply_heads(hidden, agent_indices, return_aux=return_aux)
 
-    def get_auxiliary_values(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Return auxiliary value estimates for decomposed reward streams."""
-        hidden = self._encode(obs)
-        return {
-            'survival': self.value_head_survival(hidden).squeeze(-1),
-            'resource': self.value_head_resource(hidden).squeeze(-1),
-            'social': self.value_head_social(hidden).squeeze(-1),
-        }
-
-    def get_action_and_value(
-        self,
-        obs: Dict[str, torch.Tensor],
-        direction: Optional[torch.Tensor] = None,
-        action_type: Optional[torch.Tensor] = None,
-        direction_mask: Optional[torch.Tensor] = None,
-        action_type_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Get direction, action type, log probability, entropy, and value.
-
-        Samples from two independent Categorical distributions.
-        log_prob = log_prob_direction + log_prob_action_type
-        entropy = entropy_direction + entropy_action_type
-
-        Args:
-            obs: Observation dictionary
-            direction: Optional pre-selected direction (for PPO update)
-            action_type: Optional pre-selected action type (for PPO update)
-            direction_mask: Optional [batch, 5] mask of valid directions
-            action_type_mask: Optional [batch, 5] mask of valid action types
-
-        Returns:
-            direction: [batch] selected direction (0-4)
-            action_type: [batch] selected action type (0-4)
-            log_prob: [batch] combined log probability
-            entropy: [batch] combined policy entropy
-            value: [batch] value estimate
-        """
-        hidden = self._encode(obs)
-
-        # Get logits for both heads
-        direction_logits = self.direction_head(hidden)
-        action_type_logits = self.action_type_head(hidden)
-        value = self.value_head(hidden)
+    def get_action_and_value(self, obs, agent_indices,
+                             direction=None, action_type=None,
+                             direction_mask=None, action_type_mask=None):
+        """Sample actions, compute log_prob, entropy, value. For rollouts."""
+        hidden = self.encode(obs)
+        dir_logits, act_logits, value = self.apply_heads(hidden, agent_indices)
 
         LARGE_NEG = -1e8
-
-        # Apply direction mask if provided
         if direction_mask is not None:
-            direction_logits = direction_logits.masked_fill(~direction_mask, LARGE_NEG)
-
-        # Apply action type mask if provided
+            dir_logits = dir_logits.masked_fill(~direction_mask, LARGE_NEG)
         if action_type_mask is not None:
-            action_type_logits = action_type_logits.masked_fill(~action_type_mask, LARGE_NEG)
+            act_logits = act_logits.masked_fill(~action_type_mask, LARGE_NEG)
 
-        # Create distributions
-        direction_dist = Categorical(logits=direction_logits)
-        action_type_dist = Categorical(logits=action_type_logits)
+        dir_dist = Categorical(logits=dir_logits)
+        act_dist = Categorical(logits=act_logits)
 
-        # Sample or use provided actions
         if direction is None:
-            direction = direction_dist.sample()
+            direction = dir_dist.sample()
         if action_type is None:
-            action_type = action_type_dist.sample()
+            action_type = act_dist.sample()
 
-        # Compute combined log probability and entropy
-        log_prob_dir = direction_dist.log_prob(direction)
-        log_prob_act = action_type_dist.log_prob(action_type)
-        log_prob = log_prob_dir + log_prob_act
-
-        entropy_dir = direction_dist.entropy()
-        entropy_act = action_type_dist.entropy()
-        entropy = entropy_dir + entropy_act
+        log_prob = dir_dist.log_prob(direction) + act_dist.log_prob(action_type)
+        entropy = dir_dist.entropy() + act_dist.entropy()
 
         return direction, action_type, log_prob, entropy, value.squeeze(-1)

@@ -15,7 +15,7 @@ from matplotlib.colors import LinearSegmentedColormap
 import argparse
 
 from core.config import Config
-from agents.network import ActorCritic
+from agents.network import SharedTrunkActorCritic
 
 
 def load_episode(path: str):
@@ -28,8 +28,11 @@ def load_model(checkpoint_path: str, config: Config, agent_id: int = 0):
     """Load trained model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    model = ActorCritic(config)
-    model.load_state_dict(ckpt['network_state_dicts'][agent_id])
+    model = SharedTrunkActorCritic(config)
+    if 'network_state_dict' in ckpt:
+        model.load_state_dict(ckpt['network_state_dict'])
+    else:
+        raise ValueError(f"Unknown checkpoint format. Keys: {ckpt.keys()}")
     model.eval()
     return model
 
@@ -147,17 +150,23 @@ def reconstruct_observation(step, ledger, config, agent_id: int = 0):
 def get_attention_weights(model, obs):
     """Get attention weights from the model."""
     with torch.no_grad():
-        # Get entity embeddings
-        tokens = model.encoder.entity_embed(obs['entity_tokens'])  # [1, max_entities, 64]
+        enc = model.encoder
+        my_tokens = obs['entity_tokens']  # [1, max_entities, token_dim]
+        f = enc.fourier_dim
+        fourier_proj = enc.fourier_embed(my_tokens[..., :f])
+        velocity_proj = enc.velocity_embed(my_tokens[..., f:f+2])
+        type_proj = enc.type_embed(my_tokens[..., f+2:f+4])
+        value_proj = enc.value_embed(my_tokens[..., f+4:f+5])
+        social_proj = enc.social_embed(my_tokens[..., f+5:f+9])
+        grouped = torch.cat([fourier_proj, velocity_proj, type_proj, value_proj, social_proj], dim=-1)
+        tokens = enc.entity_embed(grouped)
 
-        # Get attention weights
         attn_mask = ~obs['entity_mask']
-        _, attn_weights = model.encoder.entity_attention(
+        _, attn_weights = enc.entity_attention(
             tokens, tokens, tokens,
             key_padding_mask=attn_mask,
             average_attn_weights=True
         )
-        # attn_weights: [1, max_entities, max_entities]
 
         return attn_weights[0].numpy()  # [max_entities, max_entities]
 
@@ -183,12 +192,7 @@ def visualize_influence(episode_path: str, checkpoint_path: str, frame_idx: int 
 
     # Get action probabilities
     with torch.no_grad():
-        result = model(obs)
-        if len(result) == 4:
-            dir_logits, act_logits, value, aux_values = result
-        else:
-            dir_logits, act_logits, value = result
-            aux_values = None
+        dir_logits, act_logits, value = model.forward(obs, agent_indices=0)
         dir_probs = torch.softmax(dir_logits, dim=-1)[0].numpy()
         act_probs = torch.softmax(act_logits, dim=-1)[0].numpy()
 

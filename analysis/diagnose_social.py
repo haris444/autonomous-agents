@@ -7,7 +7,7 @@ and checks if the network responds differently (attacks enemies, cooperates with
 import torch
 import torch.nn.functional as F
 from core.config import Config
-from agents.network import ActorCritic
+from agents.network import SharedTrunkActorCritic
 
 
 def fourier_encode(dx, dy, device):
@@ -89,33 +89,23 @@ def create_synthetic_obs(config, other_agent_social, device):
 def get_action_probs(model, obs):
     """Get all action probabilities from the model."""
     with torch.no_grad():
-        features = model.encoder(
-            obs['entity_tokens'],
-            obs['entity_mask'],
-            obs['signals'],
-            obs['self_hp'],
-            obs['agent_id']
-        )
+        # Encode through shared trunk
+        hidden = model.encode(obs)
 
-        hidden = model.shared(features)
+        # Get logits via per-agent heads (agent 0)
+        dir_logits, act_logits, value = model.apply_heads(hidden, 0)
 
-        # Move probabilities
-        move_logits = model.move_head(hidden)
-        move_probs = F.softmax(move_logits, dim=-1).squeeze()
+        # Direction probabilities (UP, DOWN, LEFT, RIGHT, STAY)
+        direction_probs = F.softmax(dir_logits, dim=-1).squeeze()
 
-        # Interact type probabilities (ATTACK, GIVE, SIGNAL, COOPERATE, IDLE)
-        interact_type_logits = model.interact_type_head(hidden)
-        interact_type_probs = F.softmax(interact_type_logits, dim=-1).squeeze()
-
-        # Direction probabilities (for ATTACK and GIVE)
-        direction_logits = model.direction_head(hidden)
-        direction_probs = F.softmax(direction_logits, dim=-1).squeeze()
+        # Action type probabilities (MOVE, ATTACK, GIVE, SIGNAL, COOPERATE)
+        interact_type_probs = F.softmax(act_logits, dim=-1).squeeze()
 
     return {
-        'move': move_probs.cpu().numpy(),
+        'move': direction_probs.cpu().numpy(),
         'interact_type': interact_type_probs.cpu().numpy(),
         'direction': direction_probs.cpu().numpy(),
-        'features': features.squeeze().cpu()
+        'features': hidden.squeeze().cpu()
     }
 
 
@@ -145,8 +135,8 @@ def main():
     for path in checkpoint_paths:
         if path and os.path.exists(path):
             checkpoint = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dicts' in checkpoint:
-                state_dict = checkpoint['network_state_dicts'][0]
+            if 'network_state_dict' in checkpoint:
+                state_dict = checkpoint['network_state_dict']
             elif 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']
             else:
@@ -164,7 +154,7 @@ def main():
             config.__post_init__()
 
             # Now create model with correct config
-            model = ActorCritic(config).to(device)
+            model = SharedTrunkActorCritic(config).to(device)
             model.load_state_dict(state_dict)
             print(f"Loaded model from {path}")
             loaded = True
@@ -172,7 +162,7 @@ def main():
 
     if not loaded:
         print("No checkpoint found - using random weights (untrained)")
-        model = ActorCritic(config).to(device)
+        model = SharedTrunkActorCritic(config).to(device)
 
     model.eval()
 
@@ -441,8 +431,8 @@ if __name__ == '__main__':
     for path in checkpoint_paths:
         if path and os.path.exists(path):
             checkpoint = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dicts' in checkpoint:
-                state_dict = checkpoint['network_state_dicts'][0]
+            if 'network_state_dict' in checkpoint:
+                state_dict = checkpoint['network_state_dict']
             else:
                 state_dict = checkpoint
 
@@ -453,7 +443,7 @@ if __name__ == '__main__':
                 config.n_agents = state_dict['encoder.signal_encoder.0.weight'].shape[1]
 
             config.__post_init__()
-            model = ActorCritic(config).to(device)
+            model = SharedTrunkActorCritic(config).to(device)
             model.load_state_dict(state_dict)
             model.eval()
             print(f"Loaded: {path} (n_agents={config.n_agents})")
@@ -461,7 +451,7 @@ if __name__ == '__main__':
 
     if model is None:
         print("No checkpoint - using random weights")
-        model = ActorCritic(config).to(device)
+        model = SharedTrunkActorCritic(config).to(device)
         model.eval()
 
     # Run main analysis

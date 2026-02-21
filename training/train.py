@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt
 
 from core.config import Config
 from env.environment import GridWorld
-from agents.network import ActorCritic
-from agents.buffer import RolloutBuffer, SingleAgentBuffer
-from agents.ppo import PPO, IndependentPPO, VmapPPO, load_state_dict_flexible
+from agents.network import SharedTrunkActorCritic
+from agents.buffer import SingleAgentBuffer
+from agents.ppo import PPO
 from core.utils import set_seed, get_device
 from training.scenarios import CURRICULUM, THRESHOLDS
 from core.ledger import Ledger
@@ -252,19 +252,18 @@ def apply_scripted_partner(
 
 
 def save_pretrained(network, path: str, curriculum_phase: int = None):
-    """Save pretrained weights from a single network."""
-    data = {'state_dict': network.state_dict()}
+    """Save pretrained weights from the shared trunk network."""
+    data = {'network_state_dict': network.state_dict()}
     if curriculum_phase is not None:
         data['curriculum_phase'] = curriculum_phase
     torch.save(data, path)
     print(f"Saved pretrained weights to {path}")
 
 
-def load_pretrained(networks, path: str, env=None):
-    """Load pretrained weights into all networks. Handles both checkpoint and pretrained formats.
+def load_pretrained(network, path: str, env=None):
+    """Load pretrained weights into network.
 
     If env is provided and checkpoint has curriculum_phase, restores the phase.
-    Handles architecture mismatches by loading only compatible layers.
     """
     checkpoint = torch.load(path, weights_only=False)
 
@@ -274,20 +273,15 @@ def load_pretrained(networks, path: str, env=None):
                         f"Use a checkpoint file (e.g., final_model.pt or checkpoint_*.pt) instead.")
 
     # Handle different checkpoint formats
-    if 'network_state_dicts' in checkpoint:
-        # Full checkpoint format (from training)
-        state_dict = checkpoint['network_state_dicts'][0]
+    if 'network_state_dict' in checkpoint:
+        state_dict = checkpoint['network_state_dict']
     elif 'state_dict' in checkpoint:
-        # Pretrained format (from save_pretrained)
         state_dict = checkpoint['state_dict']
     else:
-        # Raw state dict
         state_dict = checkpoint
 
-    for i, net in enumerate(networks):
-        load_state_dict_flexible(net, state_dict)
-
-    print(f"Loaded pretrained weights from {path} into {len(networks)} networks")
+    network.load_state_dict(state_dict)
+    print(f"Loaded pretrained weights from {path}")
 
     # Restore curriculum phase if available
     if env is not None and 'curriculum_phase' in checkpoint:
@@ -312,7 +306,7 @@ def convert_obs_dict_to_batched(obs: Dict[int, Dict[str, torch.Tensor]], n_agent
     return stack_observations(obs, n_agents)
 
 
-def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.device) -> tuple:
+def test_direction_learning(model: 'SharedTrunkActorCritic', config: Config, device: torch.device) -> tuple:
     """
     Test if model moves toward food in all 4 directions.
 
@@ -408,7 +402,7 @@ def test_direction_learning(model: 'ActorCritic', config: Config, device: torch.
         for dx, dy, name, expected_dir in tests:
             obs = create_obs(dx, dy)
             # Factored action heads return direction and action type logits
-            direction_logits, action_type_logits, _ = model.forward(obs)
+            direction_logits, action_type_logits, _ = model.forward(obs, agent_indices=0)
             # Get direction probabilities
             dir_probs = F.softmax(direction_logits, dim=-1).squeeze()
 
@@ -455,32 +449,20 @@ def train(config: Config = None, visualize: bool = False,
     # Initialize components
     env = GridWorld(config, device)
 
-    # Vmap PPO: each agent has its own network, forward passes parallelized via vmap
-    multi_agent = VmapPPO(config, device)
+    # Shared trunk PPO: one network with per-agent heads
+    multi_agent = PPO(config, device)
 
     # Load pretrained weights if specified (also restores curriculum phase)
     if load_pretrained_path is not None:
-        load_pretrained(multi_agent.networks, load_pretrained_path, env=env)
+        load_pretrained(multi_agent.network, load_pretrained_path, env=env)
 
     # Sync curriculum phase to PPO (for clone mode in phases 6-8)
     if config.pretrain_mode and config.curriculum_enabled:
         multi_agent.set_curriculum_phase(env.get_curriculum_phase())
 
-    # Apply torch.compile() for faster forward passes (PyTorch 2.0+)
-    # NOTE: Disabled for debugging - may cause value function caching issues
-    # if hasattr(torch, 'compile'):
-    #     try:
-    #         n_to_compile = multi_agent.n_active
-    #         for i in range(n_to_compile):
-    #             multi_agent.networks[i] = torch.compile(multi_agent.networks[i], mode='reduce-overhead')
-    #         print(f"torch.compile() enabled for {n_to_compile} network(s) (reduce-overhead mode)")
-    #     except Exception as e:
-    #         print(f"torch.compile() unavailable: {e}")
-    print("torch.compile() DISABLED for debugging")
-
     # Per-agent buffers
     buffers = [SingleAgentBuffer(config, device, i) for i in range(config.n_agents)]
-    print(f"Using independent policies: {multi_agent.n_active} active of {config.n_agents} networks")
+    print(f"Shared trunk PPO: {multi_agent.n_active} active of {config.n_agents} agent heads")
 
     # Visualization components (lazy import to avoid matplotlib issues when not visualizing)
     renderer = None
@@ -583,9 +565,10 @@ def train(config: Config = None, visualize: bool = False,
                             'self_inventory': obs['self_inventory'][0:1],
                             'agent_id': torch.tensor([0], device=device)
                         }
-                        net = multi_agent.networks[0]
-                        feat = net._encode(obs_0)  # [1, 128]
-                        value = net.value_head(feat).item()
+                        net = multi_agent.network
+                        feat = net.encode(obs_0)  # [1, 128]
+                        _, _, value = net.apply_heads(feat, 0)
+                        value = value.item()
                         # Show first 8 features + value estimate
                         f8 = feat[0, :8].tolist()
                         print(f"  [Encoder] {rel.upper()}: feat[:8]=[{', '.join(f'{v:.2f}' for v in f8)}] V={value:.2f}")
@@ -801,29 +784,15 @@ def train(config: Config = None, visualize: bool = False,
 
             # Check hidden feature variance (first batch only)
             with torch.no_grad():
-                test_obs = {k: v[:16] for k, v in obs.items()}  # First 16 samples
-                net = multi_agent.networks[0]
-                # Get hidden features before value head
-                if hasattr(net, '_orig_mod'):
-                    # Handle compiled module
-                    encoder_out = net._orig_mod.encoder(
-                        test_obs['entity_tokens'][:1], test_obs['entity_mask'][:1],
-                        test_obs['signals'][:1], test_obs['self_hp'][:1],
-                        test_obs['self_inventory'][:1], test_obs['agent_id'][:1])
-                    hidden = net._orig_mod.shared(encoder_out)
-                else:
-                    encoder_out = net.encoder(
-                        test_obs['entity_tokens'][:1], test_obs['entity_mask'][:1],
-                        test_obs['signals'][:1], test_obs['self_hp'][:1],
-                        test_obs['self_inventory'][:1], test_obs['agent_id'][:1])
-                    hidden = net.shared(encoder_out)
+                test_obs = {k: v[:1] for k, v in obs.items()}
+                net = multi_agent.network
+                hidden = net.encode(test_obs)  # [1, 128]
                 print(f"  [Diag] Hidden: mean={hidden.mean().item():.3f}, std={hidden.std().item():.3f}, "
                       f"min={hidden.min().item():.3f}, max={hidden.max().item():.3f}")
 
         # === CURRICULUM DIRECTION TEST (diagnostic only, every 10 updates) ===
         if config.pretrain_mode and config.curriculum_enabled and update % 10 == 0:
-            net = multi_agent.networks[0]
-            num_correct, details = test_direction_learning(net, config, device)
+            num_correct, details = test_direction_learning(multi_agent.network, config, device)
             phase = env.get_curriculum_phase()
 
             # Print direction test results (diagnostic, not used for advancement)
@@ -895,10 +864,10 @@ def train(config: Config = None, visualize: bool = False,
             torch.save({
                 'update': update,
                 'global_step': global_step,
-                'network_state_dicts': [net.state_dict() for net in multi_agent.networks],
-                'optimizer_state_dicts': [opt.state_dict() for opt in multi_agent.optimizers],
+                'network_state_dict': multi_agent.network.state_dict(),
+                'optimizer_state_dict': multi_agent.optimizer.state_dict(),
                 'curriculum_phase': env.get_curriculum_phase() if hasattr(env, 'get_curriculum_phase') else 6,
-                'config': config
+                'config': config.to_dict(),
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
 
@@ -907,9 +876,10 @@ def train(config: Config = None, visualize: bool = False,
     os.makedirs(output_dir, exist_ok=True)
     final_path = f"{output_dir}/final_model.pt"
     torch.save({
-        'network_state_dicts': [net.state_dict() for net in multi_agent.networks],
+        'network_state_dict': multi_agent.network.state_dict(),
+        'optimizer_state_dict': multi_agent.optimizer.state_dict(),
         'curriculum_phase': env.get_curriculum_phase() if hasattr(env, 'get_curriculum_phase') else config.curriculum_phase,
-        'config': config
+        'config': config.to_dict(),
     }, final_path)
     print(f"Training complete! Saved {final_path}")
 
@@ -917,7 +887,7 @@ def train(config: Config = None, visualize: bool = False,
     if pretrain:
         pretrained_path = f"{output_dir}/pretrained.pt"
         curr_phase = env.get_curriculum_phase() if hasattr(env, 'get_curriculum_phase') else config.curriculum_phase
-        save_pretrained(multi_agent.networks[0], pretrained_path, curriculum_phase=curr_phase)
+        save_pretrained(multi_agent.network, pretrained_path, curriculum_phase=curr_phase)
 
     # Save training logs if visualizing
     if visualize and logger is not None:

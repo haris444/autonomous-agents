@@ -222,7 +222,7 @@ class SingleAgentBuffer:
     Rollout buffer for a single agent.
 
     Stores trajectories shaped [num_steps, ...] instead of [num_steps, n_agents, ...].
-    Used with IndependentPPO where each agent has its own network and buffer.
+    Used with single-env training where each agent has its own buffer.
     """
 
     def __init__(self, config: Config, device: torch.device, agent_id: int):

@@ -28,7 +28,7 @@ import torch
 from core.config import Config
 from env.environment import GridWorld
 from core.ledger import Ledger
-from agents.ppo import IndependentPPO
+from agents.ppo import PPO
 from training.scenarios import CoopFoodScenario
 from analysis.visualize import EpisodeRecorder, replay_episode
 
@@ -230,13 +230,8 @@ class ProbeResult:
 ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
 
 
-def load_checkpoint(path: str, device: torch.device) -> Tuple[IndependentPPO, Config]:
-    """Load a trained checkpoint and return (multi_agent, config, shared_weights).
-
-    Detects whether networks are truly independent (different weights per agent,
-    e.g. from train.py) or effectively shared (e.g. from train_vec.py coop phases
-    where only network[0] was trained).
-    """
+def load_checkpoint(path: str, device: torch.device) -> Tuple[PPO, Config]:
+    """Load a trained checkpoint and return (ppo, config)."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
     raw_cfg = ckpt['config']
@@ -245,72 +240,31 @@ def load_checkpoint(path: str, device: torch.device) -> Tuple[IndependentPPO, Co
     else:
         config = raw_cfg
 
-    multi_agent = IndependentPPO(config, device)
+    ppo = PPO(config, device)
+    ppo.network.load_state_dict(ckpt['network_state_dict'])
+    ppo.network.eval()
 
-    if 'network_state_dicts' in ckpt:
-        state_dicts = ckpt['network_state_dicts']
-        # Load each network's own weights
-        for i, sd in enumerate(state_dicts):
-            if i < len(multi_agent.networks):
-                multi_agent.networks[i].load_state_dict(sd)
-
-        # Detect if weights are actually different across networks
-        if len(state_dicts) >= 2:
-            # Compare a sample parameter between network 0 and network 1
-            key = next(iter(state_dicts[0]))
-            independent = not torch.equal(state_dicts[0][key], state_dicts[1][key])
-        else:
-            independent = False
-
-        shared_weights = not independent
-    elif 'model_state_dict' in ckpt:
-        # Legacy single-network format — shared by definition
-        multi_agent.networks[0].load_state_dict(ckpt['model_state_dict'])
-        shared_weights = True
-    else:
-        raise ValueError(f"Checkpoint has no recognizable weights key")
-
-    for net in multi_agent.networks:
-        net.eval()
-
-    mode = "independent" if not shared_weights else "shared"
     print(f"Loaded checkpoint: {path}")
-    print(f"  {config.n_agents} agents, {config.grid_size}x{config.grid_size} grid [{mode} weights]")
+    print(f"  {config.n_agents} agents, {config.grid_size}x{config.grid_size} grid")
     if 'curriculum_phase' in ckpt:
         print(f"  Phase {ckpt['curriculum_phase']}, ep {ckpt.get('episode', '?')}, "
               f"avg_return {ckpt.get('avg_return', 0):.1f}")
 
-    return multi_agent, config, shared_weights
+    return ppo, config
 
 
-def _get_actions(multi_agent, obs, dir_mask, act_mask, n_active, shared_weights):
-    """Get actions from the network (shared or independent path)."""
-    if shared_weights:
-        net = multi_agent.networks[0]
-        obs_batch = {k: v[:n_active] for k, v in obs.items()}
-        dirs, acts, _, _, _ = net.get_action_and_value(
-            obs_batch,
-            direction_mask=dir_mask[:n_active] if dir_mask is not None else None,
-            action_type_mask=act_mask[:n_active] if act_mask is not None else None,
-        )
-        if n_active < multi_agent.config.n_agents:
-            pad = multi_agent.config.n_agents - n_active
-            dirs = torch.cat([dirs, torch.full((pad,), 4, device=dirs.device, dtype=dirs.dtype)])
-            acts = torch.cat([acts, torch.zeros(pad, device=acts.device, dtype=acts.dtype)])
-        return dirs, acts
-    else:
-        multi_agent.set_n_active(n_active)
-        dirs, acts, _, _, _ = multi_agent.get_actions_and_values(obs, dir_mask, act_mask)
-        return dirs, acts
+def _get_actions(ppo, obs, dir_mask, act_mask):
+    """Get actions from the network."""
+    dirs, acts, _, _, _ = ppo.get_actions_and_values(obs, dir_mask, act_mask)
+    return dirs, acts
 
 
 def run_probe(
-    multi_agent: IndependentPPO,
+    ppo: PPO,
     config: Config,
     probe: ProbeConfig,
     device: torch.device,
     n_episodes: int = 50,
-    shared_weights: bool = False,
     record_best: bool = False,
 ) -> ProbeResult:
     """Run a single probe scenario over multiple episodes."""
@@ -321,8 +275,8 @@ def run_probe(
     base_scenario = CoopFoodScenario(distance=3, n_rich_food=probe.n_rich_food)
     n_active = probe.n_agents
 
-    multi_agent.set_n_active(n_active)
-    multi_agent.set_clone_mode(False)
+    ppo.set_n_active(n_active)
+    ppo.set_clone_mode(False)
 
     best_return = float('-inf')
     recorder = EpisodeRecorder(config) if record_best else None
@@ -361,9 +315,7 @@ def run_probe(
             dir_mask, act_mask = env.get_action_masks()
 
             with torch.no_grad():
-                dirs, acts = _get_actions(
-                    multi_agent, obs, dir_mask, act_mask, n_active, shared_weights
-                )
+                dirs, acts = _get_actions(ppo, obs, dir_mask, act_mask)
 
             # Record step before env.step
             if is_recording:
@@ -659,7 +611,7 @@ def run_all_probes(
     label: str = None,
 ) -> Dict[str, ProbeResult]:
     """Run all probes on a single checkpoint."""
-    multi_agent, config, shared_weights = load_checkpoint(checkpoint_path, device)
+    ppo, config = load_checkpoint(checkpoint_path, device)
 
     if label is None:
         label = os.path.basename(checkpoint_path)
@@ -668,9 +620,8 @@ def run_all_probes(
     for probe in ALL_PROBES:
         print(f"\n  Running probe: {probe.name} ({n_episodes} episodes)...")
         result = run_probe(
-            multi_agent, config, probe, device,
+            ppo, config, probe, device,
             n_episodes=n_episodes,
-            shared_weights=shared_weights,
             record_best=save_gifs_flag,
         )
         results[probe.name] = result

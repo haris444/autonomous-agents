@@ -4,7 +4,7 @@ import numpy as np
 from collections import Counter
 from core.config import Config
 from env.environment import GridWorld
-from agents.sac import IndependentSAC
+from agents.sac import SAC
 
 # Load latest checkpoint
 ckpt_path = 'results/runs/sac_phase11_lifesteal/checkpoint_ep16200.pt'
@@ -20,7 +20,7 @@ print('Config: grid=%d agents=%d predators=%d lifesteal=%.2f' % (
     config.grid_size, config.n_agents, config.n_predators, config.lifesteal_fraction))
 
 # Build SAC and load weights
-sac = IndependentSAC(config, device)
+sac = SAC(config, device)
 sac.load_state_dict(ckpt['sac_state'])
 print('SAC loaded successfully')
 

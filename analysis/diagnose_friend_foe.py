@@ -9,7 +9,7 @@ Uses the exact ally/enemy profiles from scenario priming to test if:
 import torch
 import torch.nn.functional as F
 from core.config import Config
-from agents.network import ActorCritic
+from agents.network import SharedTrunkActorCritic
 
 
 # Phase 9 profiles (normalized values, will be scaled by 5x)
@@ -92,17 +92,20 @@ def create_obs(config, social_profile, device):
 def analyze(model, obs_ally, obs_enemy):
     """Compare network outputs for ally vs enemy."""
     with torch.no_grad():
-        # Get encoder features
-        feat_ally = model._encode(obs_ally)
-        feat_enemy = model._encode(obs_enemy)
+        # Get hidden features from shared trunk
+        feat_ally = model.encode(obs_ally)
+        feat_enemy = model.encode(obs_enemy)
 
-        # Value estimates
-        val_ally = model.value_head(feat_ally).item()
-        val_enemy = model.value_head(feat_enemy).item()
+        # Get logits and values from per-agent heads (agent 0)
+        dir_ally, act_ally, val_ally_t = model.apply_heads(feat_ally, 0)
+        dir_enemy, act_enemy, val_enemy_t = model.apply_heads(feat_enemy, 0)
 
-        # Action probabilities
-        ally_interact = F.softmax(model.interact_type_head(feat_ally), dim=-1).squeeze()
-        enemy_interact = F.softmax(model.interact_type_head(feat_enemy), dim=-1).squeeze()
+        val_ally = val_ally_t.item()
+        val_enemy = val_enemy_t.item()
+
+        # Action type probabilities
+        ally_interact = F.softmax(act_ally, dim=-1).squeeze()
+        enemy_interact = F.softmax(act_enemy, dim=-1).squeeze()
 
         # Feature similarity
         feat_ally_norm = F.normalize(feat_ally, dim=1)
@@ -147,16 +150,17 @@ def main():
     for path in paths:
         if path and os.path.exists(path):
             ckpt = torch.load(path, map_location=device, weights_only=False)
-            state = ckpt.get('network_state_dicts', [ckpt])[0]
-            if isinstance(state, dict) and 'state_dict' in state:
-                state = state['state_dict']
+            if 'network_state_dict' in ckpt:
+                state = ckpt['network_state_dict']
+            else:
+                state = ckpt
 
             # Auto-detect n_agents
             if 'encoder.signal_encoder.0.weight' in state:
                 config.n_agents = state['encoder.signal_encoder.0.weight'].shape[1]
                 config.__post_init__()
 
-            model = ActorCritic(config).to(device)
+            model = SharedTrunkActorCritic(config).to(device)
             model.load_state_dict(state)
             model.eval()
             print(f"Loaded: {path}")
