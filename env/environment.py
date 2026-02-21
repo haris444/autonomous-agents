@@ -16,20 +16,11 @@ from typing import Dict, Tuple
 
 from core.config import Config
 from core.ledger import Ledger
-
-# Import scenarios module (lazy import to avoid circular dependency)
-# Scenarios are applied via apply_scenario() after reset()
-
-
-# Factored action space: Direction + Action Type
-# Direction head (5 outputs)
-DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
-
-# Action type head (5 outputs)
-ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
-
-# Direction deltas: UP, DOWN, LEFT, RIGHT, STAY
-DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]
+from core.constants import (
+    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY,
+    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE,
+    DIR_DELTAS,
+)
 
 
 class GridWorld:
@@ -71,10 +62,7 @@ class GridWorld:
         self.signals: torch.Tensor = None          # [n_agents] bool
         self.occupancy: torch.Tensor = None        # [grid_size, grid_size] -> agent_id or -1
 
-        # Episode tracking for warmup food boost
         self.episode_count = 0
-        self.warmup_episodes = 0  # Disabled: was 100x food spawn/reward, 10x episode length
-
         self.step_count = 0
 
         # Curriculum learning tracking
@@ -412,10 +400,8 @@ class GridWorld:
         dones = ~self.agent_alive
 
         # Episode ends if all agents dead or max steps reached
-        # Warmup episodes are 10x longer
         all_dead = ~self.agent_alive.any()
-        episode_length = self.config.max_steps_per_episode * (10 if self.episode_count <= self.warmup_episodes else 1)
-        max_steps = self.step_count >= episode_length
+        max_steps = self.step_count >= self.config.max_steps_per_episode
         episode_done = all_dead or max_steps
         if episode_done:
             dones = torch.ones(self.n_agents, device=self.device, dtype=torch.bool)
@@ -1033,9 +1019,7 @@ class GridWorld:
         # Poor food - check which alive agents are on poor food
         on_poor = self.poor_food[rows, cols] & self.agent_alive
 
-        # Explicit reward for picking up poor food (100x during warmup)
-        reward_multiplier = 100.0 if self.episode_count <= self.warmup_episodes else 1.0
-        food_rewards += on_poor.float() * self.config.r_small * reward_multiplier
+        food_rewards += on_poor.float() * self.config.r_small
 
         # Add poor food to INVENTORY (not HP directly)
         self.agent_inventory = self.agent_inventory + on_poor.float() * self.config.poor_food_value
@@ -1121,11 +1105,8 @@ class GridWorld:
         consumed_cols = rich_food_coords[consumed_food_indices, 1]
         self.rich_food[consumed_rows, consumed_cols] = False
 
-        # Return explicit reward for participating in rich food consumption (100x during warmup)
-        # Plus reciprocity bonus for cooperating with those who helped you
-        reward_multiplier = 100.0 if self.episode_count <= self.warmup_episodes else 1.0
         participated = (foods_per_agent > 0).float()
-        food_reward = participated * self.config.r_large * reward_multiplier
+        food_reward = participated * self.config.r_large
         return food_reward + reciprocity_bonus
 
     def _compute_intrinsic_coop_rewards(self, action_types: torch.Tensor) -> torch.Tensor:

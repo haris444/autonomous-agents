@@ -10,27 +10,19 @@ from core.config import Config
 from env.environment import GridWorld
 from agents.ppo import PPO
 from analysis.visualize import EpisodeRecorder, replay_episode
+from analysis.utils import load_ppo
 
 def visualize_checkpoint(checkpoint_path: str, output_name: str = "checkpoint_visualized"):
     print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path)
-
-    # Setup config
-    config = Config()
-    config.n_envs = 1  # Visualizing single env
-    config.grid_size = 8
-    config.n_agents = 8
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Initialize env and agent
-    env = GridWorld(config, device)
-    agent = PPO(config, device)
+    # Load checkpoint with embedded config
+    ppo, config, ckpt = load_ppo(checkpoint_path, device)
+    config.n_envs = 1  # Override for visualization (single env)
+    print(f"Model loaded (Episode {ckpt.get('episode', '?')}) for {config.n_agents} agents")
 
-    # Load model weights
-    state_dict = checkpoint['network_state_dict']
-    agent.network.load_state_dict(state_dict)
-    print(f"Model loaded (Episode {checkpoint['episode']}) for all {config.n_agents} agents")
+    # Initialize env
+    env = GridWorld(config, device)
 
     # Setup recorder
     recorder = EpisodeRecorder(config)
@@ -47,12 +39,12 @@ def visualize_checkpoint(checkpoint_path: str, output_name: str = "checkpoint_vi
             direction_mask, action_type_mask = env.get_action_masks()
 
             # Use single-env get_actions_and_values
-            directions, action_types, log_probs, _, values = agent.get_actions_and_values(
+            directions, action_types, log_probs, _, values = ppo.get_actions_and_values(
                 obs, direction_mask=direction_mask, action_type_mask=action_type_mask
             )
 
             # Calculate probabilities for visualization
-            dir_probs, act_probs = agent.get_action_probs(
+            dir_probs, act_probs = ppo.get_action_probs(
                 obs, direction_mask=direction_mask, action_type_mask=action_type_mask
             )
             action_probs = (dir_probs.cpu().numpy(), act_probs.cpu().numpy())
@@ -71,7 +63,7 @@ def visualize_checkpoint(checkpoint_path: str, output_name: str = "checkpoint_vi
             }
 
             # Get aux values
-            aux_values = agent.get_auxiliary_values(obs)
+            aux_values = ppo.get_auxiliary_values(obs)
             # aux_values is dict of tensors [n_agents], convert to dict of numpy
             aux_values_np = {k: v.cpu().numpy() for k, v in aux_values.items()}
 

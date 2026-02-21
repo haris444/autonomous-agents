@@ -9,12 +9,12 @@ import torch.nn.functional as F
 from typing import Dict, Tuple
 
 from core.config import Config
-from env.environment import GridWorld
 from core.ledger import Ledger
-
-# Factored action space constants (mirrored from environment.py)
-DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
-ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
+from core.constants import (
+    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY,
+    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE,
+)
+from env.environment import GridWorld
 
 
 class BatchedGridWorld:

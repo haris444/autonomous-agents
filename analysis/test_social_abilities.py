@@ -21,11 +21,15 @@ from enum import IntEnum
 import torch.nn.functional as F
 
 from core.config import Config
+from core.utils import get_device
+from core.constants import (
+    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE,
+    DIR_STAY,
+)
 from env.environment import GridWorld
 from env.batched_env import BatchedGridWorld
 from agents.network import SharedTrunkActorCritic
 from agents.ppo import PPO
-from core.utils import get_device
 
 
 # =============================================================================
@@ -112,9 +116,6 @@ class ScriptedAgent:
             direction: 0-4 (UP, DOWN, LEFT, RIGHT, STAY)
             action_type: 0-4 (MOVE, ATTACK, GIVE, SIGNAL, COOPERATE)
         """
-        ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
-        DIR_STAY = 4
-
         my_pos = env.agent_positions[self.agent_id]
         target_pos = env.agent_positions[self.target_id]
 

@@ -227,29 +227,17 @@ class ProbeResult:
 
 # ─── Main evaluation runner ──────────────────────────────────────────
 
-ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
+from core.constants import ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE
+from analysis.utils import load_ppo
 
 
 def load_checkpoint(path: str, device: torch.device) -> Tuple[PPO, Config]:
     """Load a trained checkpoint and return (ppo, config)."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    raw_cfg = ckpt['config']
-    if isinstance(raw_cfg, dict):
-        config = Config.from_dict(raw_cfg)
-    else:
-        config = raw_cfg
-
-    ppo = PPO(config, device)
-    ppo.network.load_state_dict(ckpt['network_state_dict'])
-    ppo.network.eval()
-
+    ppo, config, ckpt = load_ppo(path, device)
     print(f"Loaded checkpoint: {path}")
     print(f"  {config.n_agents} agents, {config.grid_size}x{config.grid_size} grid")
     if 'curriculum_phase' in ckpt:
-        print(f"  Phase {ckpt['curriculum_phase']}, ep {ckpt.get('episode', '?')}, "
-              f"avg_return {ckpt.get('avg_return', 0):.1f}")
-
+        print(f"  Phase {ckpt['curriculum_phase']}")
     return ppo, config
 
 

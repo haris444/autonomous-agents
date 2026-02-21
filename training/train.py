@@ -16,13 +16,18 @@ import torch
 import matplotlib.pyplot as plt
 
 from core.config import Config
+from core.ledger import Ledger
+from core.utils import set_seed, get_device
+from core.constants import (
+    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY,
+    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE,
+    DIR_DELTAS,
+)
 from env.environment import GridWorld
 from agents.network import SharedTrunkActorCritic
 from agents.buffer import SingleAgentBuffer
 from agents.ppo import PPO
-from core.utils import set_seed, get_device
 from training.scenarios import CURRICULUM, THRESHOLDS
-from core.ledger import Ledger
 
 
 def apply_scripted_partner(
@@ -49,12 +54,6 @@ def apply_scripted_partner(
         directions: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY
         action_types: 0=MOVE, 1=ATTACK, 2=GIVE, 3=SIGNAL, 4=COOPERATE
     """
-    # Direction constants
-    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
-    DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]  # UP, DOWN, LEFT, RIGHT, STAY
-    # Action type constants
-    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
-
     pos0 = env.agent_positions[0].float()
     directions = directions.clone()
     action_types = action_types.clone()
@@ -140,7 +139,7 @@ def apply_scripted_partner(
                                 primary_dir = DIR_LEFT if diff[1] < 0 else DIR_RIGHT
                                 fallback_dir = (DIR_UP if diff[0] < 0 else DIR_DOWN) if diff[0] != 0 else None
 
-                            delta = torch.tensor(DELTAS[primary_dir], device=pos_n.device, dtype=pos_n.dtype)
+                            delta = torch.tensor(DIR_DELTAS[primary_dir], device=pos_n.device, dtype=pos_n.dtype)
                             intended_pos = pos_n + delta
                             blocked = (intended_pos == pos0).all()
 
@@ -202,7 +201,7 @@ def apply_scripted_partner(
                         fallback_dir = (DIR_UP if diff[0] < 0 else DIR_DOWN) if diff[0] != 0 else None
 
                     # Check if primary direction is blocked by agent 0
-                    delta = torch.tensor(DELTAS[primary_dir], device=pos_a.device, dtype=pos_a.dtype)
+                    delta = torch.tensor(DIR_DELTAS[primary_dir], device=pos_a.device, dtype=pos_a.dtype)
                     intended_pos = pos_a + delta
                     blocked = (intended_pos == pos0).all()
 

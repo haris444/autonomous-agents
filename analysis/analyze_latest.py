@@ -1,28 +1,22 @@
 """Run 10 eval episodes with the latest SAC checkpoint and analyze agent personalities."""
+import argparse
 import torch
 import numpy as np
 from collections import Counter
-from core.config import Config
 from env.environment import GridWorld
-from agents.sac import SAC
+from analysis.utils import load_sac
 
-# Load latest checkpoint
-ckpt_path = 'results/runs/sac_phase11_lifesteal/checkpoint_ep16200.pt'
-ckpt = torch.load(ckpt_path, weights_only=False)
-print('Loaded:', ckpt_path)
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Evaluate SAC checkpoint and analyze agent personalities.')
+parser.add_argument('--checkpoint', default='results/runs/sac_phase11_lifesteal/checkpoint_ep16200.pt',
+                    help='Path to SAC checkpoint (default: %(default)s)')
+args = parser.parse_args()
 
-config = ckpt['config']
-if not isinstance(config, Config):
-    config = Config.from_dict(config) if isinstance(config, dict) else config
-
+# Load checkpoint using utility
+sac, config, ckpt = load_sac(args.checkpoint)
 device = torch.device('cpu')
-print('Config: grid=%d agents=%d predators=%d lifesteal=%.2f' % (
-    config.grid_size, config.n_agents, config.n_predators, config.lifesteal_fraction))
-
-# Build SAC and load weights
-sac = SAC(config, device)
-sac.load_state_dict(ckpt['sac_state'])
-print('SAC loaded successfully')
+print(f'Loaded: {args.checkpoint}')
+print(f'Config: grid={config.grid_size} agents={config.n_agents} predators={config.n_predators} lifesteal={config.lifesteal_fraction:.2f}')
 
 n_episodes = 10
 n_agents = config.n_agents

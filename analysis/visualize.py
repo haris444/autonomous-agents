@@ -18,11 +18,11 @@ import matplotlib.animation as animation
 import torch
 
 from core.config import Config
-
-# Factored action space constants (must match environment.py)
-DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY = 0, 1, 2, 3, 4
-ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE = 0, 1, 2, 3, 4
-DIR_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]  # UP, DOWN, LEFT, RIGHT, STAY
+from core.constants import (
+    DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_STAY,
+    ACT_MOVE, ACT_ATTACK, ACT_GIVE, ACT_SIGNAL, ACT_COOPERATE,
+    DIR_DELTAS,
+)
 
 
 def _get_target_from_direction(agent_pos, direction, grid_size):
