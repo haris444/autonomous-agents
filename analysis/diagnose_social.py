@@ -135,7 +135,9 @@ def main():
     for path in checkpoint_paths:
         if path and os.path.exists(path):
             checkpoint = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dict' in checkpoint:
+            if 'sac_state' in checkpoint:
+                state_dict = checkpoint['sac_state']['actor_state_dict']
+            elif 'network_state_dict' in checkpoint:
                 state_dict = checkpoint['network_state_dict']
             elif 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']
@@ -431,7 +433,9 @@ if __name__ == '__main__':
     for path in checkpoint_paths:
         if path and os.path.exists(path):
             checkpoint = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dict' in checkpoint:
+            if 'sac_state' in checkpoint:
+                state_dict = checkpoint['sac_state']['actor_state_dict']
+            elif 'network_state_dict' in checkpoint:
                 state_dict = checkpoint['network_state_dict']
             else:
                 state_dict = checkpoint
@@ -458,7 +462,7 @@ if __name__ == '__main__':
     main.__code__ = (lambda: None).__code__  # Skip main, we loaded manually
 
     # Run all tests
-    from diagnose_social import get_action_probs, create_synthetic_obs
+    from analysis.diagnose_social import get_action_probs, create_synthetic_obs
 
     # === Run scenario tests ===
     scenarios = {

@@ -150,7 +150,9 @@ def main():
     for path in paths:
         if path and os.path.exists(path):
             ckpt = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dict' in ckpt:
+            if 'sac_state' in ckpt:
+                state = ckpt['sac_state']['actor_state_dict']
+            elif 'network_state_dict' in ckpt:
                 state = ckpt['network_state_dict']
             else:
                 state = ckpt

@@ -81,7 +81,7 @@ class Config:
     sac_tau: float = 0.005                # Polyak averaging for target networks
     sac_alpha_init: float = 0.2           # Initial entropy coefficient
     sac_auto_alpha: bool = True           # Learn alpha automatically
-    sac_target_entropy_scale: float = 0.5 # target_entropy = -scale * log(1/|A|) per head
+    sac_target_entropy_scale: float = 0.1 # target_entropy = -scale * log(1/|A|) per head
     sac_gamma: float = 0.99              # Discount (SAC typically uses higher gamma)
     sac_buffer_size: int = 500_000        # Replay buffer capacity
     sac_batch_size: int = 256             # Minibatch size for SAC updates

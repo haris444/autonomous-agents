@@ -78,38 +78,22 @@ def create_synthetic_obs(config, food_pos, device):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default=None, help='Checkpoint path')
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    config = Config()
 
-    # Load trained model
-    model = SharedTrunkActorCritic(config).to(device)
-
-    # Try to load checkpoint - use the test model we just trained
-    import os
-    checkpoint_paths = [
-        'pretrain_test_unified/final_model.pt',
-        'pretrain_test_unified/pretrained.pt',
-    ]
-
-    loaded = False
-    for path in checkpoint_paths:
-        if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=device, weights_only=False)
-            if 'network_state_dict' in checkpoint:
-                state_dict = checkpoint['network_state_dict']
-            elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-            model.load_state_dict(state_dict)
-            print(f"Loaded model from {path}")
-            loaded = True
-            break
-
-    if not loaded:
-        print("No checkpoint found - using random weights (untrained)")
-
-    model.eval()
+    if args.model:
+        from analysis.utils import load_network
+        model, config, _ = load_network(args.model, device)
+        print(f"Loaded: {args.model} (n_agents={config.n_agents})")
+    else:
+        config = Config()
+        model = SharedTrunkActorCritic(config).to(device)
+        print("No checkpoint provided - using random weights (untrained)")
+        model.eval()
 
     # Test positions: food at different locations relative to agent
     # Format: (dy, dx) where positive dx = right, positive dy = down

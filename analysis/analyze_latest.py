@@ -13,8 +13,9 @@ parser.add_argument('--checkpoint', default='results/runs/sac_phase11_lifesteal/
 args = parser.parse_args()
 
 # Load checkpoint using utility
-sac, config, ckpt = load_sac(args.checkpoint)
-device = torch.device('cpu')
+from analysis.utils import get_device
+device = get_device()
+sac, config, ckpt = load_sac(args.checkpoint, device)
 print(f'Loaded: {args.checkpoint}')
 print(f'Config: grid={config.grid_size} agents={config.n_agents} predators={config.n_predators} lifesteal={config.lifesteal_fraction:.2f}')
 

@@ -29,7 +29,9 @@ def load_model(checkpoint_path: str, config: Config, agent_id: int = 0):
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     model = SharedTrunkActorCritic(config)
-    if 'network_state_dict' in ckpt:
+    if 'sac_state' in ckpt:
+        model.load_state_dict(ckpt['sac_state']['actor_state_dict'])
+    elif 'network_state_dict' in ckpt:
         model.load_state_dict(ckpt['network_state_dict'])
     else:
         raise ValueError(f"Unknown checkpoint format. Keys: {ckpt.keys()}")

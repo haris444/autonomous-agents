@@ -46,13 +46,19 @@ def load_sac(path: str, device: torch.device = None) -> tuple:
 
 
 def load_network(path: str, device: torch.device = None) -> tuple:
-    """Load just the SharedTrunkActorCritic network. Returns (network, config, ckpt_dict)."""
+    """Load just the SharedTrunkActorCritic network (auto-detects PPO/SAC).
+
+    Returns (network, config, ckpt_dict).
+    """
     if device is None:
         device = get_device()
     ckpt = torch.load(path, map_location=device, weights_only=False)
     config = load_config(ckpt)
     network = SharedTrunkActorCritic(config).to(device)
-    network.load_state_dict(ckpt['network_state_dict'])
+    if 'sac_state' in ckpt:
+        network.load_state_dict(ckpt['sac_state']['actor_state_dict'])
+    else:
+        network.load_state_dict(ckpt['network_state_dict'])
     network.eval()
     return network, config, ckpt
 
