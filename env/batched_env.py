@@ -418,6 +418,12 @@ class BatchedGridWorld:
             if hasattr(s, 'predator_ledger') and s.predator_ledger is not None:
                 self.predator_ledger[slot] = s.predator_ledger
 
+            # Disable predators if scenario says so
+            scenario_cfg = self._current_scenario.get_config() if self._current_scenario else None
+            if scenario_cfg is not None and not scenario_cfg.predators_active:
+                self.predator_alive[slot] = False
+                self.predator_hp[slot] = 0
+
     def _spawn_initial_food(self, mask: torch.Tensor):
         """Spawn food at full capacity for reset envs."""
         gs = self.grid_size

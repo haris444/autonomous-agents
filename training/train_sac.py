@@ -277,8 +277,9 @@ def train_sac(
         # === SAC UPDATE ===
         if (global_step >= config.sac_learning_starts
                 and env_step % config.sac_update_frequency == 0):
-            last_metrics = sac.update(replay_buffer, config.sac_batch_size)
-            update_count += 1
+            for _ in range(config.sac_utd_ratio):
+                last_metrics = sac.update(replay_buffer, config.sac_batch_size)
+                update_count += 1
 
         # === LOGGING (every 10 env steps) ===
         if env_step % 10 == 0 and env_step > 0:

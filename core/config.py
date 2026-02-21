@@ -86,7 +86,8 @@ class Config:
     sac_buffer_size: int = 500_000        # Replay buffer capacity
     sac_batch_size: int = 256             # Minibatch size for SAC updates
     sac_learning_starts: int = 5000       # Random actions before training starts
-    sac_update_frequency: int = 1         # Gradient steps per env step
+    sac_update_frequency: int = 1         # Do updates every N env steps
+    sac_utd_ratio: int = 1               # Gradient steps per update (UTD=utd_ratio/update_frequency)
     sac_target_update_interval: int = 1   # Steps between target network Polyak updates
 
     # Training

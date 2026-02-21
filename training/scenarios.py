@@ -31,6 +31,7 @@ class ScenarioConfig:
     clone_mode: bool = False          # Share networks between agents
     inject_social: bool = False       # Pre-inject social histories
     partner_mode: str = "learning"    # "learning" = normal, "always_coop" = scripted helper
+    predators_active: bool = False    # Whether predators should be active this phase
 
 
 def get_positions_at_distance(
@@ -376,6 +377,7 @@ class SocialScenario(Scenario):
         always_one_ally: bool = False,
         friend_foe: bool = False,
         n_rich_food: int = 0,
+        predators_active: bool = False,
     ):
         self.n_agents = n_agents
         self.inject_histories = inject_histories
@@ -386,13 +388,15 @@ class SocialScenario(Scenario):
         self.always_one_ally = always_one_ally
         self.friend_foe = friend_foe
         self.n_rich_food = n_rich_food
+        self.predators_active = predators_active
 
     def get_config(self) -> ScenarioConfig:
         return ScenarioConfig(
             n_active_agents=self.n_agents,
             clone_mode=self.clone_weights,
             inject_social=self.inject_histories,
-            partner_mode="scripted" if self.scripted_partners else "learning"
+            partner_mode="scripted" if self.scripted_partners else "learning",
+            predators_active=self.predators_active,
         )
 
     def setup(self, env: 'GridWorld') -> None:
@@ -537,14 +541,16 @@ class SocialScenario(Scenario):
 class MultiTeamScenario(Scenario):
     """Multi-team training with team-based social dynamics."""
 
-    def __init__(self, n_agents: int, num_teams: int = 2):
+    def __init__(self, n_agents: int, num_teams: int = 2, predators_active: bool = False):
         self.n_agents = n_agents
         self.num_teams = num_teams
+        self.predators_active = predators_active
 
     def get_config(self) -> ScenarioConfig:
         return ScenarioConfig(
             n_active_agents=self.n_agents, clone_mode=False,
-            inject_social=True, partner_mode="learning"
+            inject_social=True, partner_mode="learning",
+            predators_active=self.predators_active,
         )
 
     def setup(self, env: 'GridWorld') -> None:
@@ -641,10 +647,10 @@ def get_curriculum() -> dict:
         8: CoopFoodScenario(distance=3),
         # Low-HP cooperation (phase 9)
         9: CoopFoodLowHPScenario(distance=3, hp_fraction=0.5, n_rich_food=5),
-        # Social pretraining (phases 10-12)
-        10: SocialScenario(n_agents=2, inject_histories=True, scripted_partners=True, neutral_prob=0.5, n_rich_food=5),
-        11: SocialScenario(n_agents=3, scripted_partners=True, friend_foe=True, n_rich_food=5),
-        12: SocialScenario(n_agents=8, inject_histories=False, n_rich_food=5),
+        # Social pretraining (phases 10-12) — predators active
+        10: SocialScenario(n_agents=2, inject_histories=True, scripted_partners=True, neutral_prob=0.5, n_rich_food=5, predators_active=True),
+        11: SocialScenario(n_agents=3, scripted_partners=True, friend_foe=True, n_rich_food=5, predators_active=True),
+        12: SocialScenario(n_agents=8, inject_histories=False, n_rich_food=5, predators_active=True),
     }
 
 
