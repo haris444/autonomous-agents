@@ -1,0 +1,92 @@
+experiment:
+  name: "sac_h_strong_social_3pred"
+  description: "SAC with STRONG social rewards — 3 predators (dmg=5). Compare against G (+92.5)."
+
+# Environment
+grid_size: 8
+n_agents: 8
+max_hp: 100.0
+hp_decay_rate: 0.01
+attack_damage_fraction: 0.125
+lifesteal_fraction: 0.25
+max_steps_per_episode: 128
+
+# Action space
+n_directions: 5
+n_action_types: 5
+
+# Entity tokens
+max_food_tokens: 16
+fourier_bands: 4
+
+# Attention
+attention_embed_dim: 64
+attention_num_heads: 4
+group_embed_dim: 16
+
+# Food
+poor_food_value: 10.0
+rich_food_value: 30.0
+poor_food_spawn_rate: 0.000336
+rich_food_spawn_rate: 0.0084
+food_coverage_cap: 0.40
+
+# Rewards
+r_small: 10.0
+r_large: 20.0
+r_attack_mult: 0.1
+r_damage_taken: -1.0
+r_low_hp: 0.0
+r_survival: 0.0
+r_death: 0.0
+r_approach_food: 0.1
+r_ally_proximity: 0.0
+
+# STRONG LEDGER-BASED SOCIAL REWARDS (were 0.0 in baseline)
+r_reciprocity: 3.0
+r_betrayal: -5.0
+r_defense: 10.0
+r_food_share: 3.0
+r_revenge: 5.0
+
+# Non-ledger social rewards (unchanged from baseline)
+r_coop_attempt: 2.0
+r_hierarchy: 0.25
+
+# Social hierarchy — enemy kills weighted 2x
+hierarchy_food_weight: 1.0
+hierarchy_damage_weight: 1.0
+hierarchy_hp_weight: 1.0
+hierarchy_kill_weight: 2.0
+
+# SAC Hyperparameters
+sac_learning_rate: 0.001
+sac_tau: 0.01
+sac_alpha_init: 0.8
+sac_auto_alpha: true
+sac_target_entropy_scale: 0.1
+sac_gamma: 0.95
+sac_buffer_size: 500000
+sac_batch_size: 2048
+sac_learning_starts: 50000
+sac_update_frequency: 4
+sac_target_update_interval: 1
+
+# Training (Colab settings: 4 envs, 10M steps)
+total_timesteps: 5000000
+seed: 42
+n_envs: 4
+
+# Pretraining
+pretrain_mode: false
+curriculum_enabled: false
+
+# Predator — 3 predators with reduced damage (matches G config)
+n_predators: 3
+predator_hp_mult: 0.5
+predator_damage: 5.0
+predator_kill_reward: 5.0
+predator_respawn_steps: 20
+
+training:
+  output_dir: sac_h_strong_social_3pred

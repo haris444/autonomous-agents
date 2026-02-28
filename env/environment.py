@@ -805,7 +805,8 @@ class GridWorld:
                 # === Betrayal: Did A help ME (C) before? ===
                 food_from_a = self.ledger.tensor[a, c, Ledger.FOOD_GIVEN]
                 coop_with_a = self.ledger.tensor[a, c, Ledger.COOP_COUNT]
-                help_from_a = food_from_a + coop_with_a
+                defense_from_a = self.ledger.tensor[a, c, Ledger.DEFENSE_SCORE]
+                help_from_a = food_from_a + coop_with_a + defense_from_a
                 if help_from_a > 0:
                     # Penalty for attacking someone who helped you
                     betrayal_rewards[c] += help_from_a * self.config.r_betrayal
@@ -817,10 +818,14 @@ class GridWorld:
 
                 # C defended each of these victims B
                 if b_indices.numel() > 0:
-                    # Update defense scores and rewards for all (C, B) pairs
                     for b in b_indices:
-                        self.ledger.tensor[c, b, Ledger.DEFENSE_SCORE] += dmg
-                        defense_rewards[c] += dmg * self.config.r_defense
+                        self.ledger.tensor[c, b, Ledger.DEFENSE_SCORE] += dmg  # Always record
+                        # Only reward if B helped C before
+                        help_from_b = (self.ledger.tensor[b, c, Ledger.FOOD_GIVEN]
+                                       + self.ledger.tensor[b, c, Ledger.COOP_COUNT]
+                                       + self.ledger.tensor[b, c, Ledger.DEFENSE_SCORE])
+                        if help_from_b > 0:
+                            defense_rewards[c] += dmg * self.config.r_defense
 
         # === STEP 11: Compute rewards and damage taken ===
         # Attack rewards for agent-vs-agent (predator rewards already added above)
@@ -907,6 +912,14 @@ class GridWorld:
 
             # === STEP 6: Reward givers ===
             give_rewards[transfer_indices] = transfer_values * self.config.r_food_share
+
+            # === Reciprocity: bonus for giving food to someone who gave you food before ===
+            for idx in range(transfer_indices.numel()):
+                giver = transfer_indices[idx]
+                receiver = transfer_targets[idx]
+                food_from_receiver = self.ledger.tensor[receiver, giver, Ledger.FOOD_GIVEN]
+                if food_from_receiver > 0:
+                    give_rewards[giver] += food_from_receiver * self.config.r_reciprocity
 
             # === STEP 7: Update ledger ===
             flat_indices = transfer_indices * self.n_agents + transfer_targets
@@ -1088,16 +1101,6 @@ class GridWorld:
         coop_pairs = eligible_consumed @ eligible_consumed.T  # [N, N]
         coop_pairs.fill_diagonal_(0)  # No self-cooperation
 
-        # === Reciprocity bonus: reward cooperating with agents who helped you before ===
-        # Prior help from each agent BEFORE updating ledger (food given + prior coop count)
-        prior_food = self.ledger.tensor[:, :, Ledger.FOOD_GIVEN]  # [N, N]
-        prior_coop = self.ledger.tensor[:, :, Ledger.COOP_COUNT]  # [N, N]
-        prior_help = prior_food + prior_coop  # prior_help[i,j] = help agent i received from j
-
-        # For each agent, sum over partners: coop_pairs[i,j] * prior_help[i,j]
-        # This rewards cooperating with agents who previously helped you
-        reciprocity_bonus = (coop_pairs * prior_help).sum(dim=1) * self.config.r_reciprocity
-
         self.ledger.tensor[:, :, Ledger.COOP_COUNT] += coop_pairs
 
         # Remove consumed food
@@ -1107,7 +1110,7 @@ class GridWorld:
 
         participated = (foods_per_agent > 0).float()
         food_reward = participated * self.config.r_large
-        return food_reward + reciprocity_bonus
+        return food_reward
 
     def _compute_intrinsic_coop_rewards(self, action_types: torch.Tensor) -> torch.Tensor:
         """
